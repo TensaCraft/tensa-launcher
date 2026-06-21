@@ -1287,6 +1287,3 @@ def test_translation_files_are_valid_json():
         assert isinstance(data, dict)
         assert "autoupdate" in data
         assert "include_beta_updates" in data
-        assert "{status}" not in data["launcher_version_header_with_update"]
-        assert "Channel" not in data["launcher_update_channel_stable"]
-        assert "Канал" not in data["launcher_update_channel_stable"]

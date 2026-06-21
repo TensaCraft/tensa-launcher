@@ -110,9 +110,8 @@ def test_settings_page_builds(fake_app):
     assert isinstance(fake_app.footer.center_control, ft.Button)
     assert fake_app.header.title == "settings_title"
     expected_version_label = (
-        "launcher_version_header_with_update "
-        f"(launcher={fake_app.util.launcher_name}, version={fake_app.util.launcher_version}, "
-        "channel=launcher_update_channel_stable)"
+        "launcher_version_header "
+        f"(launcher={fake_app.util.launcher_name}, version={fake_app.util.launcher_version})"
     )
     assert fake_app.header.subtitle == ""
     assert fake_app.header.actions is not None
@@ -290,9 +289,8 @@ def test_settings_page_manual_update_check_opens_update_dialog(fake_app):
     assert shown == [{"version": "9.0.0", "changelog": "notes", "download_url": "https://example.com"}]
     assert page.launcher_update_status_label == "launcher_update_status_update_available (version=9.0.0)"
     expected_version_label = (
-        "launcher_version_header_with_update "
-        f"(launcher={fake_app.util.launcher_name}, version={fake_app.util.launcher_version}, "
-        "channel=launcher_update_channel_stable)"
+        "launcher_version_header "
+        f"(launcher={fake_app.util.launcher_name}, version={fake_app.util.launcher_version})"
     )
     assert fake_app.header.subtitle == ""
     assert fake_app.header.actions is not None

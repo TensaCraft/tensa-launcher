@@ -913,10 +913,9 @@ class SettingsPage:
 
     def _update_settings_header(self, *, refresh: bool = False) -> None:
         version_label = self.trans(
-            "launcher_version_header_with_update",
+            "launcher_version_header",
             launcher=self.app.util.launcher_name,
             version=self.app.util.launcher_version,
-            channel=self._launcher_update_channel_label(),
         )
         self.app.header.set_params(
             title=self.trans("settings_title"),
@@ -931,11 +930,6 @@ class SettingsPage:
         )
         if refresh:
             schedule_update(self.page)
-
-    def _launcher_update_channel_label(self) -> str:
-        if self.app.config.get("include_beta_updates", "no") == "yes":
-            return self.trans("launcher_update_channel_beta")
-        return self.trans("launcher_update_channel_stable")
 
     def _default_world_backups_dir(self) -> Path:
         return self._minecraft_dir() / "backups" / "worlds"
