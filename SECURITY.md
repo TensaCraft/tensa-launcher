@@ -8,7 +8,7 @@ TensaLauncher is supported through the latest stable release. Beta and prereleas
 
 Do not open public issues for vulnerabilities, credential leaks, or exploitable bugs.
 
-Use GitHub private vulnerability reporting when it is enabled for this repository. If private reporting is unavailable, contact the maintainers through the TensaCraft organization contact listed on GitHub.
+Use GitHub vulnerability reporting when it is enabled for this repository. If it is unavailable, contact the maintainers through the TensaCraft organization contact listed on GitHub.
 
 Please include:
 

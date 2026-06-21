@@ -103,7 +103,7 @@ See [docs/PRIVACY.md](docs/PRIVACY.md) for network services used by the launcher
 
 ## Security
 
-Please report vulnerabilities privately. See [SECURITY.md](SECURITY.md).
+Please report vulnerabilities through the channels listed in [SECURITY.md](SECURITY.md).
 
 ## License
 
