@@ -2,6 +2,7 @@ name: Build Installers
 
 env:
   BUILD_INSTALLER: ${{ (github.event_name == 'release' && github.event.release.prerelease != true) || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_installer == 'true' && github.event.inputs.prerelease != 'true') }}
+  SIGNPATH_READY: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' && vars.SIGNPATH_PROJECT_SLUG != '' && vars.SIGNPATH_SIGNING_POLICY_SLUG != '' && vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG != '' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -58,6 +59,7 @@ jobs:
             artifact_path: ./.build/windows/TensaLauncher.exe
 
     permissions:
+      actions: read
       contents: read
     timeout-minutes: ${{ matrix.timeout }}
 
@@ -107,6 +109,61 @@ jobs:
             $buildArgs += "--with-windows-installer"
           }
           python .tools/build.py @buildArgs
+
+      - name: Prepare Windows executables for SignPath
+        if: matrix.target == 'windows' && env.SIGNPATH_READY == 'true'
+        shell: pwsh
+        run: |
+          $signingInput = ".build/windows-signpath-input"
+          New-Item -ItemType Directory -Force -Path $signingInput | Out-Null
+          Copy-Item -LiteralPath ".build/windows/TensaLauncher.exe" -Destination "$signingInput/TensaLauncher.exe" -Force
+          if ("${{ env.BUILD_INSTALLER }}" -eq "true") {
+            Copy-Item -LiteralPath ".build/windows/TensaLauncherInstaller.exe" -Destination "$signingInput/TensaLauncherInstaller.exe" -Force
+          }
+
+      - name: Upload unsigned Windows executables for SignPath
+        id: upload-signpath-windows-input
+        if: matrix.target == 'windows' && env.SIGNPATH_READY == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: TensaLauncher-Windows-Unsigned-SignPath
+          path: ./.build/windows-signpath-input/*.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+          compression-level: 0
+
+      - name: Sign Windows executables with SignPath
+        if: matrix.target == 'windows' && env.SIGNPATH_READY == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-signpath-windows-input.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ./.build/windows-signpath-signed
+          wait-for-completion-timeout-in-seconds: 1800
+
+      - name: Replace Windows executables with signed artifacts
+        if: matrix.target == 'windows' && env.SIGNPATH_READY == 'true'
+        shell: pwsh
+        run: |
+          $signedRoot = Resolve-Path -LiteralPath ".build/windows-signpath-signed"
+          $expected = @("TensaLauncher.exe")
+          if ("${{ env.BUILD_INSTALLER }}" -eq "true") {
+            $expected += "TensaLauncherInstaller.exe"
+          }
+
+          foreach ($name in $expected) {
+            $signed = Get-ChildItem -LiteralPath $signedRoot -Recurse -File -Filter $name | Select-Object -First 1
+            if (-not $signed) {
+              throw "Signed executable was not returned by SignPath: $name"
+            }
+            Copy-Item -LiteralPath $signed.FullName -Destination ".build/windows/$name" -Force
+          }
 
       - name: Smoke Windows packaged runtime
         if: matrix.target == 'windows'

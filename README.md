@@ -93,7 +93,7 @@ Official release artifacts are built by GitHub Actions from this repository and 
 
 ## Code Signing Policy
 
-This project is prepared for free Windows code signing through SignPath.io with a certificate provided by SignPath Foundation after the repository is public and accepted by SignPath Foundation.
+Free code signing provided by SignPath.io, certificate by SignPath Foundation, after the project is accepted by SignPath Foundation.
 
 See [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) for the project policy and release-signing rules.
 

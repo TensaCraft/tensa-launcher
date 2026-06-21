@@ -14,6 +14,34 @@ For SignPath-enabled release builds:
 - Signing requests must be approved by a trusted project maintainer.
 - Locally built artifacts are development builds and must not be represented as official signed releases.
 
+## GitHub Actions Integration
+
+The Windows release workflow is wired for automatic SignPath signing. When SignPath credentials are configured, every Windows `.exe` built by `.github/workflows/build.yml` is uploaded to SignPath, signed, copied back into `.build/windows/`, smoke-tested, and then published as the GitHub Release asset.
+
+Required GitHub repository secret:
+
+- `SIGNPATH_API_TOKEN`
+
+Required GitHub repository variables:
+
+- `SIGNPATH_ORGANIZATION_ID`
+- `SIGNPATH_PROJECT_SLUG`
+- `SIGNPATH_SIGNING_POLICY_SLUG`
+- `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`
+
+Recommended SignPath values:
+
+- project slug: `tensa-launcher`
+- signing policy slug: `release-signing`
+- artifact configuration slug: `windows-exes`
+
+The SignPath artifact configuration should treat the GitHub artifact as a ZIP file and sign every `.exe` at the artifact root. The current Windows build can include:
+
+- `TensaLauncher.exe`
+- `TensaLauncherInstaller.exe`
+
+The source/build policy is stored in `.signpath/policies/tensa-launcher/release-signing.yml`.
+
 ## Team Roles
 
 - Committers and reviewers: TensaCraft repository collaborators with write or maintain access.
@@ -25,4 +53,4 @@ The launcher uses network services for Minecraft authentication, modpack metadat
 
 ## Unsigned Builds
 
-Until SignPath release signing is enabled, Windows artifacts may be unsigned. Unsigned builds are still produced from the public release workflow and attached to GitHub Releases.
+Until the SignPath Foundation project is approved and the required GitHub secret/variables are configured, Windows artifacts are produced unsigned. After configuration, the same release workflow automatically publishes the signed `.exe` files.
