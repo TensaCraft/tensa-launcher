@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "4.2.1-beta.1"
+__version__ = "4.2.2"
 APP_NAME = "TensaLauncher"
 PRODUCT_NAME = "TensaLauncher"
 COMPANY_NAME = "Tensa"
