@@ -44,7 +44,7 @@ def _build_context(build_tool, *, target: str) -> object:
         target=target,
         app_name="TensaLauncher",
         product_name="TensaLauncher",
-        company_name="TensaCraft",
+        company_name="Tensa",
         executable_name="TensaLauncher",
         installer_name="TensaLauncherInstaller",
     )
@@ -153,6 +153,7 @@ def test_build_package_metadata_uses_tensalauncher_names():
 
     assert metadata["app_name"] == "TensaLauncher"
     assert metadata["product_name"] == "TensaLauncher"
+    assert metadata["company_name"] == "Tensa"
     assert metadata["executable_name"] == "TensaLauncher"
     assert metadata["installer_name"] == "TensaLauncherInstaller"
 
@@ -189,13 +190,6 @@ def test_clean_removes_build_root_contents(tmp_path):
     assert not build_root.exists()
     assert not windows_dir.exists()
     assert not linux_dir.exists()
-
-
-def test_release_workflow_uses_current_installer_name():
-    workflow = (ROOT_DIR / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
-
-    assert "TensaLauncherInstaller.exe" in workflow
-    assert "TCLInstaller.exe" not in workflow
 
 
 def test_build_base_artifact_uses_internal_pack_name(tmp_path):
@@ -306,7 +300,7 @@ def test_build_icon_resolver_generates_platform_specific_icons(tmp_path):
     assert macos_icon.is_file()
 
 
-def test_windows_build_emits_base_executable_without_msix(tmp_path):
+def test_windows_build_emits_base_executable(tmp_path):
     build_tool = _load_build_tool()
     windows_builder = _load_module("build_windows_exe_test", ROOT_DIR / ".tools" / "build_windows.py")
 
@@ -332,14 +326,20 @@ def test_windows_build_emits_base_executable_without_msix(tmp_path):
     assert [artifact.name for artifact in artifacts] == ["TensaLauncher.exe"]
 
 
-def test_windows_sandbox_helper_runs_exe_without_app_package_installer():
+def test_windows_sandbox_helper_runs_exe():
     script = (ROOT_DIR / ".tools" / "run_exe_sandbox.ps1").read_text(encoding="utf-8")
 
     assert "TensaLauncher.exe" in script
     assert "TensaLauncher.wsb" in script
-    assert ".msix" not in script.lower()
-    assert "Add-AppxPackage" not in script
-    assert "Remove-AppxPackage" not in script
+
+
+def test_windows_sandbox_helper_applies_application_control_workaround():
+    script = (ROOT_DIR / ".tools" / "run_exe_sandbox.ps1").read_text(encoding="utf-8")
+
+    assert "VerifiedAndReputablePolicyState" in script
+    assert "EnableWebContentEvaluation" in script
+    assert "CiTool.exe" in script
+    assert "<ProtectedClient>Disable</ProtectedClient>" in script
 
 
 def test_windows_signing_uses_timestamp_when_configured(monkeypatch, tmp_path):

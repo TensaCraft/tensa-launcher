@@ -26,7 +26,6 @@ EXCLUDED_WALK_ROOTS = {
     ROOT / ".dev",
     ROOT / ".build",
     ROOT / ".idea",
-    ROOT / ".codex",
 }
 
 

@@ -69,7 +69,7 @@ def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name
         f"""\
         #define MyAppName "{exe_path.stem}"
         #define MyAppVersion "*"
-        #define MyAppPublisher "TensaCraft"
+        #define MyAppPublisher "Tensa"
         #define MyAppURL "https://tensa.co.ua/"
         #define MyAppExeName "{exe_path.name}"
         #define MyAppIconName "{icon_name}"

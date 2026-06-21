@@ -37,7 +37,7 @@ BUILD_DIR = ROOT_DIR / "build"
 PYPROJECT_FILE = ROOT_DIR / "pyproject.toml"
 FLET_RELEASE_BASE_URL = flet_client.FLET_RELEASE_BASE_URL
 DEFAULT_APP_NAME = "TensaLauncher"
-DEFAULT_COMPANY_NAME = "TensaCraft"
+DEFAULT_COMPANY_NAME = "Tensa"
 DEFAULT_INSTALLER_NAME = "TensaLauncherInstaller"
 
 
@@ -359,7 +359,7 @@ def _flet_pack_metadata_options(ctx: BuildContext) -> list[str]:
         "--company-name",
         ctx.company_name,
         "--copyright",
-        "TensaCraft",
+        ctx.company_name,
     ]
 
 

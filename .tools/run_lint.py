@@ -16,6 +16,8 @@ LINT_TARGETS = [
     ".tools/flet_client.py",
     ".tools/release_notes.py",
     ".tools/python_runtime.py",
+    ".tools/pre_commit.py",
+    ".tools/run_codeql.py",
     ".tools/run_tests.py",
     ".tools/run_lint.py",
     ".tools/run_typecheck.py",

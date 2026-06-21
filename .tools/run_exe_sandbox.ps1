@@ -75,6 +75,103 @@ Copy-Item -LiteralPath $resolvedExe -Destination (Join-Path $payloadDir "TensaLa
 
 $runnerScript = @'
 $ErrorActionPreference = "Stop"
+
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Restart-AsAdmin {
+    $argsText = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $process = Start-Process -FilePath "powershell.exe" -ArgumentList $argsText -Verb RunAs -Wait -PassThru
+    exit $process.ExitCode
+}
+
+function Start-ProcessSafe {
+    param(
+        [string] $FilePath,
+        [string[]] $Arguments = @(),
+        [int] $TimeoutSeconds = 5
+    )
+
+    try {
+        $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden -ErrorAction Stop
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        return $process.ExitCode -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Disable-SandboxApplicationControl {
+    $ciPolicyArgs = @(
+        "add",
+        "HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy",
+        "/v",
+        "VerifiedAndReputablePolicyState",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "0",
+        "/f"
+    )
+    Start-ProcessSafe -FilePath "reg.exe" -Arguments $ciPolicyArgs -TimeoutSeconds 5 | Out-Null
+
+    $machineSmartScreenArgs = @(
+        "add",
+        "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
+        "/v",
+        "SmartScreenEnabled",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "Off",
+        "/f"
+    )
+    Start-ProcessSafe -FilePath "reg.exe" -Arguments $machineSmartScreenArgs -TimeoutSeconds 5 | Out-Null
+
+    $appHostArgs = @(
+        "add",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\AppHost",
+        "/v",
+        "EnableWebContentEvaluation",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "0",
+        "/f"
+    )
+    Start-ProcessSafe -FilePath "reg.exe" -Arguments $appHostArgs -TimeoutSeconds 5 | Out-Null
+
+    $userSmartScreenArgs = @(
+        "add",
+        "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer",
+        "/v",
+        "SmartScreenEnabled",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "Off",
+        "/f"
+    )
+    Start-ProcessSafe -FilePath "reg.exe" -Arguments $userSmartScreenArgs -TimeoutSeconds 5 | Out-Null
+
+    $ciTool = Join-Path $env:WINDIR "System32\CiTool.exe"
+    if (Test-Path -LiteralPath $ciTool) {
+        Start-ProcessSafe -FilePath $ciTool -Arguments @("-r") -TimeoutSeconds 3 | Out-Null
+    }
+}
+
+if (-not (Test-Admin)) {
+    Restart-AsAdmin
+}
+
+Disable-SandboxApplicationControl
+
 $source = Join-Path $PSScriptRoot "TensaLauncher.exe"
 $workDir = Join-Path $env:USERPROFILE "Desktop\TensaLauncherRun"
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
@@ -95,6 +192,9 @@ Write-TextFile -Path (Join-Path $payloadDir "Run.cmd") -Value $runnerCmd
 $escapedPayloadDir = [System.Security.SecurityElement]::Escape($payloadDir)
 $wsb = @"
 <Configuration>
+  <Networking>Enable</Networking>
+  <ProtectedClient>Disable</ProtectedClient>
+  <ClipboardRedirection>Enable</ClipboardRedirection>
   <MappedFolders>
     <MappedFolder>
       <HostFolder>$escapedPayloadDir</HostFolder>
