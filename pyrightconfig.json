@@ -1,0 +1,32 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.13",
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false,
+  "reportUnknownLambdaType": false,
+  "reportUnusedCallResult": false,
+  "include": [
+    ".tools/build.py",
+    ".tools/build_linux.py",
+    ".tools/build_macos.py",
+    ".tools/flet_client.py",
+    ".tools/python_runtime.py",
+    ".tools/build_windows.py",
+    ".tools/smoke_packaged.py",
+    "launcher/app.py",
+    "launcher/application/setup_wizard.py",
+    "launcher/core/async_downloader.py",
+    "launcher/core/updater.py",
+    "launcher/main.py",
+    "launcher/pages/setup_wizard.py",
+    "launcher/platform/paths.py",
+    "launcher/platform/system.py",
+    "launcher/ui/controls/button.py",
+    "launcher/ui/controls/icon.py",
+    "launcher/ui/layout/column.py",
+    "launcher/ui/layout/row.py"
+  ]
+}

@@ -1,0 +1,284 @@
+name: Build Installers
+
+env:
+  BUILD_INSTALLER: ${{ (github.event_name == 'release' && github.event.release.prerelease != true) || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_installer == 'true' && github.event.inputs.prerelease != 'true') }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Mark as prerelease'
+        type: boolean
+        default: false
+      draft:
+        description: 'Create as draft'
+        type: boolean
+        default: false
+      build_installer:
+        description: 'Also build Windows installer (TensaLauncherInstaller.exe)'
+        type: boolean
+        default: true
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux
+            runner: ubuntu-latest
+            python_version: "3.13"
+            timeout: 30
+            artifact_name: TensaLauncher-Linux
+            artifact_path: |
+              ./.build/linux/TensaLauncher
+              ./.build/linux/TensaLauncher-x86_64.AppImage
+          - target: macos
+            runner: macos-latest
+            python_version: "3.13"
+            timeout: 45
+            artifact_name: TensaLauncher-macOS
+            artifact_path: ./.build/macos/TensaLauncher.dmg
+          - target: windows
+            runner: windows-latest
+            python_version: "3.13"
+            timeout: 45
+            artifact_name: TensaLauncher-Windows
+            artifact_path: ./.build/windows/TensaLauncher.exe
+
+    permissions:
+      contents: read
+    timeout-minutes: ${{ matrix.timeout }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python_version }}
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
+
+      - name: Install create-dmg utility
+        if: matrix.target == 'macos'
+        run: brew install create-dmg
+
+      - name: Install Inno Setup
+        if: matrix.target == 'windows' && env.BUILD_INSTALLER == 'true'
+        run: choco install innosetup
+
+      - name: Build Linux artifact
+        if: matrix.target == 'linux'
+        run: python .tools/build.py --target linux
+
+      - name: Smoke Linux packaged runtime
+        if: matrix.target == 'linux'
+        run: |
+          python .tools/smoke_packaged.py --target linux --artifact ./.build/linux/TensaLauncher --artifact ./.build/linux/TensaLauncher-x86_64.AppImage
+
+      - name: Build macOS artifact
+        if: matrix.target == 'macos'
+        run: python .tools/build.py --target macos
+
+      - name: Smoke macOS packaged runtime
+        if: matrix.target == 'macos'
+        run: |
+          python .tools/smoke_packaged.py --target macos --artifact ./.build/macos/TensaLauncher.app
+
+      - name: Build Windows artifact
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          $buildArgs = @("--target", "windows")
+          if ("${{ env.BUILD_INSTALLER }}" -eq "true") {
+            $buildArgs += "--with-windows-installer"
+          }
+          python .tools/build.py @buildArgs
+
+      - name: Smoke Windows packaged runtime
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          python .tools/smoke_packaged.py --target windows --artifact ./.build/windows/TensaLauncher.exe
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+          compression-level: 0
+
+      - name: Upload Windows installer artifact
+        if: matrix.target == 'windows' && env.BUILD_INSTALLER == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: TensaLauncher-Installer
+          path: ./.build/windows/TensaLauncherInstaller.exe
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+          compression-level: 0
+
+  upload-to-release:
+    name: Publish/Update GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+      actions: write
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout (fetch tags)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Restore Linux executable bits
+        shell: bash
+        run: |
+          chmod +x artifacts/TensaLauncher-Linux/TensaLauncher
+          chmod +x artifacts/TensaLauncher-Linux/TensaLauncher-x86_64.AppImage
+
+      - name: Compute release metadata
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "TAG=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+            echo "NAME=${{ github.event.release.name }}" >> "$GITHUB_ENV"
+            echo "DRAFT=false" >> "$GITHUB_ENV"
+            echo "PRERELEASE=${{ github.event.release.prerelease }}" >> "$GITHUB_ENV"
+          else
+            python .tools/release_meta.py --github-env >> "$GITHUB_ENV"
+            echo "DRAFT=${{ inputs.draft }}" >> "$GITHUB_ENV"
+            echo "PRERELEASE=${{ inputs.prerelease }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Create tag if missing (workflow_dispatch)
+        if: ${{ github.event_name != 'release' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
+          else
+            echo "Creating tag $TAG..."
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--tag "$TAG" --output RELEASE_NOTES.md)
+          if [ "$PRERELEASE" != "true" ]; then
+            args+=(--stable-release --github-repo "$GITHUB_REPOSITORY")
+          fi
+          python .tools/release_notes.py "${args[@]}"
+          cat RELEASE_NOTES.md
+
+      - name: Compose release asset list
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            artifacts/TensaLauncher-Linux/TensaLauncher
+            artifacts/TensaLauncher-Linux/TensaLauncher-x86_64.AppImage
+            artifacts/TensaLauncher-macOS/TensaLauncher.dmg
+            artifacts/TensaLauncher-Windows/TensaLauncher.exe
+          )
+
+          if [ "${BUILD_INSTALLER}" = "true" ]; then
+            files+=(artifacts/TensaLauncher-Installer/TensaLauncherInstaller.exe)
+          fi
+
+          {
+            echo 'RELEASE_FILES<<EOF'
+            printf '%s\n' "${files[@]}"
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release and upload assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.NAME }}
+          draft: ${{ env.DRAFT }}
+          prerelease: ${{ env.PRERELEASE }}
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+          files: ${{ env.RELEASE_FILES }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete temporary workflow artifacts from this run
+        if: always()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          owner_repo = os.environ["GITHUB_REPOSITORY"]
+          owner, repo = owner_repo.split("/", 1)
+          run_id = os.environ["GITHUB_RUN_ID"]
+          token = os.environ["GITHUB_TOKEN"]
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "tensalauncher-ci",
+          }
+
+          list_url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts?per_page=100"
+          req = urllib.request.Request(list_url, headers=headers)
+          with urllib.request.urlopen(req) as response:
+              payload = json.load(response)
+
+          artifacts = payload.get("artifacts", [])
+          if not artifacts:
+              print("No temporary workflow artifacts to delete.")
+          for artifact in artifacts:
+              artifact_id = artifact["id"]
+              delete_url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts/{artifact_id}"
+              delete_req = urllib.request.Request(delete_url, headers=headers, method="DELETE")
+              with urllib.request.urlopen(delete_req):
+                  pass
+              print(f"Deleted artifact: {artifact.get('name')} (id={artifact_id})")
+          PY

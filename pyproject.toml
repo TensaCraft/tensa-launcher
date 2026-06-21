@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensalauncher"
+dynamic = ["version"]
+description = "TensaLauncher desktop launcher"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "cryptography==49.0.0",
+    "flet==0.85.3",
+    "flet-desktop==0.85.3",
+    "minecraft-launcher-lib==8.0",
+    "pyobjc-framework-AVFoundation==12.2.1; platform_system == 'Darwin'",
+    "requests==2.34.2",
+    "transliterate==1.10.2",
+]
+
+[project.optional-dependencies]
+build = [
+    "flet-cli==0.85.3",
+    "pillow==12.2.0",
+    "pyinstaller==6.21.0",
+]
+dev = [
+    "pillow==12.2.0",
+    "pyright==1.1.410",
+    "pytest==9.1.1",
+    "ruff==0.15.18",
+]
+
+[project.scripts]
+tensalauncher = "launcher.main:launch"
+tcl = "launcher.main:launch"
+tl = "launcher.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["launcher*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "launcher.__version__"}
+
+[tool.setuptools.package-data]
+launcher = [
+    "assets/*.ico",
+    "assets/*.png",
+    "assets/*.icns",
+    "assets/img/*",
+    "assets/langs/*.json",
+    "assets/sounds/*",
+    "assets/updater/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+extend-exclude = [
+    "build",
+    "dist",
+    ".build",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
