@@ -26,8 +26,8 @@ WINDOWS_CREATE_NEW_CONSOLE = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 class AutoUpdater:
 
-    UPDATE_CHECK_URL = "https://gigabait.uk/api/mods/launcher/update"
-    UPDATE_BETA_CHECK_URL = "https://gigabait.uk/api/mods/launcher/update-beta"
+    GITHUB_RELEASES_URL = "https://api.github.com/repos/TensaCraft/tensa-launcher/releases"
+    GITHUB_API_VERSION = "2022-11-28"
     _SCRIPT_ROOT = Path(__file__).resolve().parent.parent / "assets" / "updater"
     _PLATFORM_SUFFIXES = {'windows': '.exe', 'macos': '.dmg'}
     DOWNLOAD_CHUNK_SIZE = 262144
@@ -40,7 +40,13 @@ class AutoUpdater:
         self.appimage_path = self._resolve_appimage_path()
         self._temp_dir = Path(tempfile.gettempdir())
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": f"TensaLauncher/{self.current_version}"})
+        self._session.headers.update(
+            {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": self.GITHUB_API_VERSION,
+                "User-Agent": f"TensaLauncher/{self.current_version}",
+            }
+        )
 
     @staticmethod
     def _resolve_appimage_path() -> Optional[Path]:
@@ -75,125 +81,207 @@ class AutoUpdater:
             return 'unknown'
 
     @staticmethod
-    def _normalize_version(value: str | None) -> tuple[int, ...]:
+    def _normalize_version_tag(value: str | None) -> str:
         raw = str(value or "").strip()
+        if len(raw) > 1 and raw[0].lower() == "v" and raw[1].isdigit():
+            return raw[1:]
+        return raw
+
+    @classmethod
+    def _parse_version(cls, value: str | None) -> tuple[tuple[int, ...], tuple[int | str, ...]]:
+        raw = cls._normalize_version_tag(value)
         if not raw:
-            return ()
-        parts: list[int] = []
-        for token in raw.replace("-", ".").split("."):
+            return (), ()
+
+        without_build = raw.split("+", 1)[0]
+        base, separator, prerelease = without_build.partition("-")
+        base_parts: list[int] = []
+        for token in base.split("."):
             digits = "".join(ch for ch in token if ch.isdigit())
-            if digits:
-                parts.append(int(digits))
-            else:
-                parts.append(0)
-        return tuple(parts)
+            base_parts.append(int(digits) if digits else 0)
+
+        prerelease_parts: list[int | str] = []
+        if separator:
+            for token in prerelease.replace("-", ".").split("."):
+                if not token:
+                    continue
+                prerelease_parts.append(int(token) if token.isdigit() else token.lower())
+
+        return tuple(base_parts), tuple(prerelease_parts)
+
+    @staticmethod
+    def _compare_prerelease(left: tuple[int | str, ...], right: tuple[int | str, ...]) -> int:
+        if not left and not right:
+            return 0
+        if not left:
+            return 1
+        if not right:
+            return -1
+
+        for left_part, right_part in zip_longest(left, right, fillvalue=None):
+            if left_part is None:
+                return -1
+            if right_part is None:
+                return 1
+            if left_part == right_part:
+                continue
+            if isinstance(left_part, int) and isinstance(right_part, int):
+                return 1 if left_part > right_part else -1
+            if isinstance(left_part, int):
+                return -1
+            if isinstance(right_part, int):
+                return 1
+            return 1 if left_part > right_part else -1
+
+        return 0
 
     @classmethod
     def _is_newer_version(cls, latest: str | None, current: str | None) -> bool:
-        latest_parts = cls._normalize_version(latest)
-        current_parts = cls._normalize_version(current)
-        if not latest_parts:
+        latest_base, latest_prerelease = cls._parse_version(latest)
+        current_base, current_prerelease = cls._parse_version(current)
+        if not latest_base:
             return False
-        for left, right in zip_longest(latest_parts, current_parts, fillvalue=0):
+        for left, right in zip_longest(latest_base, current_base, fillvalue=0):
             if left > right:
                 return True
             if left < right:
                 return False
-        return False
 
-    def _update_check_url(self) -> str:
-        beta_enabled = self.app.config.get("include_beta_updates", "no") == "yes"
-        return self.UPDATE_BETA_CHECK_URL if beta_enabled else self.UPDATE_CHECK_URL
+        return cls._compare_prerelease(latest_prerelease, current_prerelease) > 0
 
-    def _update_check_urls(self) -> list[str]:
-        beta_enabled = self.app.config.get("include_beta_updates", "no") == "yes"
-        if beta_enabled:
-            return [self.UPDATE_BETA_CHECK_URL, self.UPDATE_CHECK_URL]
-        return [self.UPDATE_CHECK_URL]
+    def _include_beta_updates(self) -> bool:
+        return self.app.config.get("include_beta_updates", "no") == "yes"
 
-    def _extract_download_urls(self, data: dict[str, Any]) -> list[str]:
-        urls: list[str] = []
+    def _github_releases(self) -> list[dict[str, Any]]:
+        try:
+            response = self._session.get(self.GITHUB_RELEASES_URL, params={"per_page": 100}, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            self.logger.warning(f"Failed to check for updates: {exc}")
+            return []
+        except Exception as exc:
+            self.logger.error(f"Unexpected error checking updates: {exc}")
+            return []
 
-        raw_download = data.get("download")
-        nested_download: dict[str, Any] = raw_download if isinstance(raw_download, dict) else {}
-        api_download_urls = data.get("download_urls")
-        if isinstance(api_download_urls, list):
-            urls.extend(str(url) for url in api_download_urls if str(url).strip())
+        if not isinstance(data, list):
+            self.logger.warning("GitHub releases endpoint returned unexpected payload")
+            return []
 
-        for candidate in (nested_download.get("url"), data.get("download_url"), data.get("file_url")):
-            if candidate:
-                urls.append(str(candidate))
+        return [release for release in data if isinstance(release, dict)]
 
-        deduped: list[str] = []
-        for url in urls:
-            if url not in deduped:
-                deduped.append(url)
-        return deduped
+    def _release_allowed_for_channel(self, release: dict[str, Any]) -> bool:
+        if release.get("draft"):
+            return False
+        if self._include_beta_updates():
+            return True
+        return not bool(release.get("prerelease"))
 
-    def _update_info_from_payload(self, data: dict[str, Any]) -> Optional[Dict[str, Any]]:
-        payload_platform = self._normalize_platform(str(data.get("platform") or ""))
+    def _preferred_github_asset_names(self) -> tuple[str, ...]:
         current_platform = self._normalize_platform(self.platform)
-        if payload_platform and payload_platform != current_platform:
-            self.logger.warning(
-                f"Update endpoint returned mismatched platform '{payload_platform}' for '{current_platform}'"
-            )
+        if current_platform == "windows":
+            return ("TensaLauncher.exe",)
+        if current_platform == "macos":
+            return ("TensaLauncher.dmg",)
+        if current_platform == "linux":
+            if self.appimage_path is not None:
+                return ("TensaLauncher-x86_64.AppImage", "TensaLauncher.AppImage")
+            return ("TensaLauncher",)
+        return ()
+
+    def _select_github_asset(self, release: dict[str, Any]) -> Optional[dict[str, Any]]:
+        raw_assets = release.get("assets")
+        if not isinstance(raw_assets, list):
             return None
 
-        latest_version = str(data.get('version') or '').strip() or None
+        assets = [asset for asset in raw_assets if isinstance(asset, dict)]
+        assets_by_name = {
+            str(asset.get("name") or "").lower(): asset
+            for asset in assets
+            if str(asset.get("browser_download_url") or "").strip()
+        }
+        for asset_name in self._preferred_github_asset_names():
+            asset = assets_by_name.get(asset_name.lower())
+            if asset is not None:
+                return asset
+
+        current_platform = self._normalize_platform(self.platform)
+        for asset in assets:
+            name = str(asset.get("name") or "")
+            url = str(asset.get("browser_download_url") or "").strip()
+            if not url:
+                continue
+
+            lower_name = name.lower()
+            if current_platform == "windows" and lower_name.endswith(".exe") and "installer" not in lower_name:
+                return asset
+            if current_platform == "macos" and lower_name.endswith(".dmg"):
+                return asset
+            if current_platform == "linux":
+                if self.appimage_path is not None and lower_name.endswith(".appimage"):
+                    return asset
+                if self.appimage_path is None and lower_name == "tensalauncher":
+                    return asset
+
+        return None
+
+    @staticmethod
+    def _github_asset_hash(asset: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+        digest = str(asset.get("digest") or "").strip()
+        if ":" not in digest:
+            return None, None
+
+        algorithm, expected_hash = (part.strip().lower() for part in digest.split(":", 1))
+        if not algorithm or not expected_hash:
+            return None, None
+
+        try:
+            hashlib.new(algorithm)
+        except ValueError:
+            return None, None
+        return expected_hash, algorithm
+
+    def _update_info_from_github_release(self, release: dict[str, Any]) -> Optional[Dict[str, Any]]:
+        latest_version = self._normalize_version_tag(release.get("tag_name") or release.get("name"))
         if not latest_version:
-            self.logger.warning("Update endpoint returned payload without version")
+            self.logger.warning("GitHub release payload did not provide a tag name")
             return None
 
         if not self._is_newer_version(latest_version, self.current_version):
             return None
 
-        download_urls = self._extract_download_urls(data)
-        if not download_urls:
-            self.logger.warning("Update endpoint did not provide download URLs")
+        asset = self._select_github_asset(release)
+        if asset is None:
+            self.logger.warning(
+                f"GitHub release {latest_version} does not provide a {self.platform} launcher asset"
+            )
             return None
 
-        changelog = (
-            data.get('notes')
-            or data.get('changelog')
-            or data.get('description')
-            or data.get('release_notes')
-            or ''
-        )
+        download_url = str(asset.get("browser_download_url") or "").strip()
+        if not download_url:
+            self.logger.warning(f"GitHub release {latest_version} selected an asset without download URL")
+            return None
+
+        expected_hash, expected_hash_algorithm = self._github_asset_hash(asset)
+        channel = "beta" if release.get("prerelease") else "stable"
         return {
-            'version': latest_version,
-            'channel': data.get('channel'),
-            'changelog': changelog,
-            'download_url': download_urls[0],
-            'download_urls': download_urls,
-            'download_hash': data.get('file_hash') or (data.get('download') or {}).get('file_hash'),
-            'download_hash_algorithm': data.get('file_hash_algorithm') or (data.get('download') or {}).get('file_hash_algorithm'),
-            'download_file_name': data.get('file_name') or (data.get('download') or {}).get('file_name'),
+            "version": latest_version,
+            "channel": channel,
+            "changelog": release.get("body") or release.get("name") or "",
+            "download_url": download_url,
+            "download_urls": [download_url],
+            "download_hash": expected_hash,
+            "download_hash_algorithm": expected_hash_algorithm,
+            "download_file_name": asset.get("name"),
         }
-
-    def _check_update_url(self, url: str, params: dict[str, str]) -> Optional[Dict[str, Any]]:
-        try:
-            response = self._session.get(url, params=params, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as exc:
-            self.logger.warning(f"Failed to check for updates: {exc}")
-            return None
-        except Exception as exc:
-            self.logger.error(f"Unexpected error checking updates: {exc}")
-            return None
-
-        if not isinstance(data, dict):
-            self.logger.warning("Update endpoint returned unexpected payload")
-            return None
-
-        return self._update_info_from_payload(data)
 
     def check_for_updates(self) -> Optional[Dict[str, Any]]:
         self.logger.info(f"Checking for updates (current version: {self.current_version})")
-        params = {"platform": self.platform, "current_version": self.current_version}
         best_update: Optional[Dict[str, Any]] = None
-        for url in self._update_check_urls():
-            update = self._check_update_url(url, params)
+        for release in self._github_releases():
+            if not self._release_allowed_for_channel(release):
+                continue
+            update = self._update_info_from_github_release(release)
             if update is None:
                 continue
             if best_update is None or self._is_newer_version(update.get("version"), best_update.get("version")):

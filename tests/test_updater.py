@@ -1,30 +1,76 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
-
-import requests
 
 from launcher import __version__
 from launcher.core.updater import AutoUpdater
+
+
+class GitHubResponse:
+    def __init__(self, payload: object, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            msg = f"{self.status_code} error"
+            raise RuntimeError(msg)
+
+    def json(self):
+        return self._payload
+
+
+def app_stub(version: str = __version__, include_beta_updates: str = "no"):
+    return SimpleNamespace(
+        util=SimpleNamespace(launcher_version=version),
+        log=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
+        config=SimpleNamespace(
+            get=lambda key, default=None: include_beta_updates if key == "include_beta_updates" else default
+        ),
+    )
+
+
+def github_release(
+    tag_name: str,
+    *,
+    prerelease: bool,
+    assets: list[dict[str, str]],
+    body: str = "Release notes",
+    draft: bool = False,
+) -> dict:
+    return {
+        "tag_name": tag_name,
+        "name": tag_name,
+        "body": body,
+        "draft": draft,
+        "prerelease": prerelease,
+        "assets": assets,
+    }
+
+
+def github_asset(name: str, url: str, digest: str | None = "sha256:abcdef") -> dict[str, str]:
+    asset = {"name": name, "browser_download_url": url}
+    if digest:
+        asset["digest"] = digest
+    return asset
 
 
 def test_updater_uses_semantic_version_comparison():
     assert AutoUpdater._is_newer_version("4.0.0", "3.1.5") is True
     assert AutoUpdater._is_newer_version("3.10.0", "3.9.9") is True
     assert AutoUpdater._is_newer_version("3.1.5", "3.1.5") is False
+    assert AutoUpdater._is_newer_version("4.2.0", "4.2.0-beta.1") is True
+    assert AutoUpdater._is_newer_version("4.2.0-beta.1", "4.2.0") is False
 
 
-def test_updater_switches_to_beta_endpoint_when_enabled():
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version=__version__),
-        log=SimpleNamespace(info=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "yes" if key == "include_beta_updates" else default),
-    )
+def test_updater_uses_github_releases_endpoint_and_headers():
+    updater = AutoUpdater(app_stub())
 
-    updater = AutoUpdater(app)
-
-    assert updater._update_check_url() == updater.UPDATE_BETA_CHECK_URL
+    assert updater.GITHUB_RELEASES_URL == "https://api.github.com/repos/TensaCraft/tensa-launcher/releases"
+    assert updater._session.headers["Accept"] == "application/vnd.github+json"
+    assert updater._session.headers["X-GitHub-Api-Version"] == "2022-11-28"
 
 
 def test_updater_detects_darwin_as_macos(monkeypatch):
@@ -33,94 +79,145 @@ def test_updater_detects_darwin_as_macos(monkeypatch):
     assert AutoUpdater._detect_platform() == "macos"
 
 
-def test_updater_rejects_payload_when_platform_mismatches(monkeypatch):
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version=__version__),
-        log=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "no"),
+def test_updater_stable_channel_ignores_github_prereleases():
+    app = app_stub(version="4.0.0", include_beta_updates="no")
+    updater = AutoUpdater(app)
+    updater.platform = "windows"
+    calls: list[dict] = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append({"url": url, "params": params, "timeout": timeout})
+        return GitHubResponse(
+            [
+                github_release(
+                    "v4.2.0-beta.1",
+                    prerelease=True,
+                    assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher-beta.exe")],
+                ),
+                github_release(
+                    "v4.1.0",
+                    prerelease=False,
+                    assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher.exe")],
+                ),
+            ]
+        )
+
+    updater._session.get = fake_get
+
+    update = updater.check_for_updates()
+
+    assert update is not None
+    assert update["version"] == "4.1.0"
+    assert update["channel"] == "stable"
+    assert update["download_url"] == "https://example.com/TensaLauncher.exe"
+    assert calls == [{"url": updater.GITHUB_RELEASES_URL, "params": {"per_page": 100}, "timeout": 5}]
+
+
+def test_updater_beta_channel_accepts_github_prereleases():
+    app = app_stub(version="4.0.0", include_beta_updates="yes")
+    updater = AutoUpdater(app)
+    updater.platform = "windows"
+
+    updater._session.get = lambda *args, **kwargs: GitHubResponse(
+        [
+            github_release(
+                "v4.2.0-beta.1",
+                prerelease=True,
+                assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher-beta.exe")],
+            ),
+            github_release(
+                "v4.1.0",
+                prerelease=False,
+                assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher.exe")],
+            ),
+        ]
     )
 
+    update = updater.check_for_updates()
+
+    assert update is not None
+    assert update["version"] == "4.2.0-beta.1"
+    assert update["channel"] == "beta"
+    assert update["download_url"] == "https://example.com/TensaLauncher-beta.exe"
+
+
+def test_updater_beta_channel_prefers_final_release_over_same_version_prerelease():
+    app = app_stub(version="4.1.0", include_beta_updates="yes")
     updater = AutoUpdater(app)
+    updater.platform = "windows"
 
-    class Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "version": "4.0.0",
-                "channel": "stable",
-                "platform": "macos",
-                "download_url": "https://gigabait.uk/api/mods/launcher/update/macos?version=4.0.0&channel=stable",
-            }
-
-    monkeypatch.setattr("launcher.core.updater.requests.get", lambda *args, **kwargs: Response())
-    assert updater.check_for_updates() is None
-
-
-def test_updater_accepts_macos_payload_for_macos_platform():
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version="4.0.30"),
-        log=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "no"),
+    updater._session.get = lambda *args, **kwargs: GitHubResponse(
+        [
+            github_release(
+                "v4.2.0-beta.1",
+                prerelease=True,
+                assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher-beta.exe")],
+            ),
+            github_release(
+                "v4.2.0",
+                prerelease=False,
+                assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher.exe")],
+            ),
+        ]
     )
 
+    update = updater.check_for_updates()
+
+    assert update is not None
+    assert update["version"] == "4.2.0"
+    assert update["channel"] == "stable"
+    assert update["download_url"] == "https://example.com/TensaLauncher.exe"
+
+
+def test_updater_selects_windows_launcher_asset_and_digest():
+    app = app_stub(version="4.1.0")
     updater = AutoUpdater(app)
+    updater.platform = "windows"
+
+    update = updater._update_info_from_github_release(
+        github_release(
+            "v4.2.0",
+            prerelease=False,
+            assets=[
+                github_asset("TensaLauncherInstaller.exe", "https://example.com/TensaLauncherInstaller.exe"),
+                github_asset(
+                    "TensaLauncher.exe",
+                    "https://example.com/TensaLauncher.exe",
+                    "sha256:1234567890abcdef",
+                ),
+            ],
+        )
+    )
+
+    assert update is not None
+    assert update["download_url"] == "https://example.com/TensaLauncher.exe"
+    assert update["download_file_name"] == "TensaLauncher.exe"
+    assert update["download_hash_algorithm"] == "sha256"
+    assert update["download_hash"] == "1234567890abcdef"
+
+
+def test_updater_selects_platform_specific_github_assets():
+    updater = AutoUpdater(app_stub(version="4.1.0"))
+    release = github_release(
+        "v4.2.0",
+        prerelease=False,
+        assets=[
+            github_asset("TensaLauncher", "https://example.com/TensaLauncher"),
+            github_asset("TensaLauncher-x86_64.AppImage", "https://example.com/TensaLauncher.AppImage"),
+            github_asset("TensaLauncher.dmg", "https://example.com/TensaLauncher.dmg"),
+            github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher.exe"),
+        ],
+    )
+
     updater.platform = "macos"
+    assert updater._update_info_from_github_release(release)["download_file_name"] == "TensaLauncher.dmg"
 
-    update = updater._update_info_from_payload(
-        {
-            "version": "4.1.2",
-            "channel": "stable",
-            "platform": "macos",
-            "download_url": "https://example.com/TensaLauncher.dmg",
-        }
-    )
+    updater.platform = "linux"
+    updater.appimage_path = Path("/tmp/TensaLauncher.AppImage")
+    assert updater._update_info_from_github_release(release)["download_file_name"] == "TensaLauncher-x86_64.AppImage"
 
-    assert update is not None
-    assert update["download_url"] == "https://example.com/TensaLauncher.dmg"
-
-
-def test_updater_accepts_macos_payload_for_legacy_macosx_platform():
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version="4.0.30"),
-        log=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "no"),
-    )
-
-    updater = AutoUpdater(app)
-    updater.platform = "macosx"
-
-    update = updater._update_info_from_payload(
-        {
-            "version": "4.1.2",
-            "channel": "stable",
-            "platform": "macos",
-            "download_url": "https://example.com/TensaLauncher.dmg",
-        }
-    )
-
-    assert update is not None
-    assert update["download_url"] == "https://example.com/TensaLauncher.dmg"
-
-
-def test_updater_prefers_download_metadata_from_api_payload():
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version=__version__),
-        log=SimpleNamespace(info=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "yes" if key == "include_beta_updates" else default),
-    )
-
-    updater = AutoUpdater(app)
-    urls = updater._extract_download_urls(
-        {
-            "platform": "windows",
-            "channel": "beta",
-            "download": {"url": "https://gigabait.uk/api/mods/launcher/update-beta/windows?version=4.0.0&channel=beta"},
-        }
-    )
-
-    assert urls == ["https://gigabait.uk/api/mods/launcher/update-beta/windows?version=4.0.0&channel=beta"]
+    updater.appimage_path = None
+    assert updater._update_info_from_github_release(release)["download_file_name"] == "TensaLauncher"
 
 
 def test_updater_uses_product_named_temp_file_when_download_name_missing(tmp_path):
@@ -141,48 +238,23 @@ def test_updater_uses_product_named_temp_file_when_download_name_missing(tmp_pat
 
 
 def test_updater_beta_channel_selects_newer_stable_release(monkeypatch):
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version="4.0.7"),
-        log=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "yes" if key == "include_beta_updates" else default),
-    )
-
-    updater = AutoUpdater(app)
+    updater = AutoUpdater(app_stub(version="4.0.7", include_beta_updates="yes"))
     updater.platform = "windows"
-    calls: list[str] = []
 
-    class Response:
-        def __init__(self, payload: dict):
-            self._payload = payload
-            self.status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return self._payload
-
-    def fake_get(url, params=None, timeout=None):
-        calls.append(url)
-        if url == updater.UPDATE_BETA_CHECK_URL:
-            return Response(
-                {
-                    "version": "4.0.8",
-                    "channel": "beta",
-                    "platform": "windows",
-                    "download_url": "https://example.com/TensaLauncher-beta.exe",
-                }
-            )
-        return Response(
-            {
-                "version": "4.0.9",
-                "channel": "stable",
-                "platform": "windows",
-                "download_url": "https://example.com/TensaLauncher-stable.exe",
-            }
-        )
-
-    updater._session.get = fake_get
+    updater._session.get = lambda *args, **kwargs: GitHubResponse(
+        [
+            github_release(
+                "v4.0.8-beta.1",
+                prerelease=True,
+                assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher-beta.exe")],
+            ),
+            github_release(
+                "v4.0.9",
+                prerelease=False,
+                assets=[github_asset("TensaLauncher.exe", "https://example.com/TensaLauncher-stable.exe")],
+            ),
+        ]
+    )
 
     update = updater.check_for_updates()
 
@@ -190,52 +262,13 @@ def test_updater_beta_channel_selects_newer_stable_release(monkeypatch):
     assert update["version"] == "4.0.9"
     assert update["channel"] == "stable"
     assert update["download_url"] == "https://example.com/TensaLauncher-stable.exe"
-    assert calls == [updater.UPDATE_BETA_CHECK_URL, updater.UPDATE_CHECK_URL]
 
 
-def test_updater_falls_back_to_stable_when_beta_channel_unavailable(monkeypatch):
-    app = SimpleNamespace(
-        util=SimpleNamespace(launcher_version="4.0.7"),
-        log=SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
-        config=SimpleNamespace(get=lambda key, default=None: "yes" if key == "include_beta_updates" else default),
-    )
+def test_updater_returns_none_when_github_releases_payload_is_unexpected():
+    updater = AutoUpdater(app_stub(version="4.0.7", include_beta_updates="yes"))
+    updater._session.get = lambda *args, **kwargs: GitHubResponse({"message": "unexpected"})
 
-    updater = AutoUpdater(app)
-    calls: list[str] = []
-
-    class Response:
-        def __init__(self, payload: dict, status_code: int = 200):
-            self._payload = payload
-            self.status_code = status_code
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise requests.HTTPError(f"{self.status_code} error")
-
-        def json(self):
-            return self._payload
-
-    def fake_get(url, params=None, timeout=None):
-        calls.append(url)
-        if url == updater.UPDATE_BETA_CHECK_URL:
-            return Response({"message": "Launcher not found."}, status_code=404)
-        return Response(
-            {
-                "version": "4.0.9",
-                "channel": "stable",
-                "platform": updater.platform,
-                "download_url": "https://example.com/TensaLauncher-stable.exe",
-            }
-        )
-
-    updater._session.get = fake_get
-
-    update = updater.check_for_updates()
-
-    assert update is not None
-    assert update["version"] == "4.0.9"
-    assert update["channel"] == "stable"
-    assert calls == [updater.UPDATE_BETA_CHECK_URL, updater.UPDATE_CHECK_URL]
+    assert updater.check_for_updates() is None
 
 
 def test_updater_runs_download_and_prepare_off_ui_thread(monkeypatch):
