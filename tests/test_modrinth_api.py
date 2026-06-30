@@ -33,3 +33,27 @@ def test_modrinth_download_reports_byte_progress(monkeypatch, tmp_path: Path):
     assert target.read_bytes() == b"abcdefghij"
     assert events[0] == (0, 10, "pack.zip")
     assert events[-1] == (10, 10, "pack.zip")
+
+
+def test_modrinth_get_version_by_id_returns_payload(monkeypatch):
+    calls = []
+
+    class FakeVersionResponse:
+        def raise_for_status(self):
+            calls.append("raise")
+
+        def json(self):
+            return {"id": "dependency-version", "project_id": "dependency-project"}
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeVersionResponse()
+
+    monkeypatch.setattr("launcher.core.api.modrinth.requests.get", fake_get)
+
+    payload = ModrinthAPI.get_version_by_id("dependency-version")
+
+    assert payload == {"id": "dependency-version", "project_id": "dependency-project"}
+    assert calls[0][0] == "https://api.modrinth.com/v2/version/dependency-version"
+    assert calls[0][1]["timeout"] == ModrinthAPI.REQUEST_TIMEOUT
+    assert "raise" in calls

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict
 
 import flet as ft
 
 from launcher import ui
-from launcher.core.api import ModrinthAPI
-from launcher.ui.core.page_runtime import run_blocking, run_task, schedule_update
+from launcher.application.modrinth_mods import ModrinthInstallCandidate
+from launcher.ui.core.page_runtime import run_task, schedule_update
 
 
 class ModsManagerInstalledMixin:
@@ -163,16 +162,27 @@ class ModsManagerInstalledMixin:
                 operation.fail(final_message, notify=False)
                 return
 
-            mod_path = Path(mod["path"])
-            if mod_path.exists():
-                mod_path.unlink()
-
-            await run_blocking(ModrinthAPI.download_mod_file, install_file.url, str(mod_path))
+            project = {
+                "project_id": mod.get("modrinth_project_id") or latest_version.get("project_id") or mod.get("id"),
+                "slug": mod.get("modrinth_project_slug") or mod.get("slug"),
+                "project_type": "mod",
+                "title": mod.get("modrinth_project_title") or mod.get("name") or mod.get("filename"),
+            }
+            candidate = ModrinthInstallCandidate(
+                project=project,
+                version_data=latest_version,
+                install_file=install_file,
+                action="replace",
+                dependency_type="selected",
+                installed_item=mod,
+            )
+            await self._download_modrinth_candidate(candidate, {"directory": self.mods_dir, "key": "mods"})
             self.app.feedback.info(self.trans("mod_updated", name=mod.get("name", mod["filename"])))
             final_message = self.trans("update_complete")
             finish_level = "success"
             mod["update_available"] = False
             self._rebuild_installed_mods()
+            self._refresh_visible_modrinth_search_results()
 
         except Exception as exc:
             import traceback

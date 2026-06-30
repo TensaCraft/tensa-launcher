@@ -6,8 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import flet as ft
+import pytest
 
-from launcher.application.modrinth_mods import ModInstallFile
+from launcher.application.modrinth_mods import (
+    ModInstallFile,
+    ModrinthDependencyIssue,
+    ModrinthDependencyPlan,
+    ModrinthInstallCandidate,
+)
 from launcher.application.installed_components import InstalledComponent
 from launcher.application.version_creation import VersionCreateOption
 from launcher.pages.activity import ActivityPage, ActivityPanel
@@ -65,6 +71,49 @@ def _flatten_controls(control) -> list:
 
 async def _run_blocking_immediately(fn, *args, **kwargs):
     return fn(*args, **kwargs)
+
+
+def _modrinth_candidate(
+    project_id: str,
+    title: str,
+    filename: str,
+    *,
+    url: str | None = None,
+    action: str = "install",
+    version_id: str | None = None,
+    version_number: str = "1.0.0",
+    installed_item: dict | None = None,
+    dependency_type: str = "selected",
+) -> ModrinthInstallCandidate:
+    return ModrinthInstallCandidate(
+        project={"project_id": project_id, "slug": project_id, "project_type": "mod", "title": title},
+        version_data={"id": version_id or f"{project_id}-version", "version_number": version_number},
+        install_file=ModInstallFile(url or f"https://example.com/{filename}", filename, version_number),
+        action=action,
+        dependency_type=dependency_type,
+        installed_item=installed_item,
+    )
+
+
+def _modrinth_plan(
+    main: ModrinthInstallCandidate,
+    *,
+    install: list[ModrinthInstallCandidate] | None = None,
+    replace: list[ModrinthInstallCandidate] | None = None,
+    optional: list[ModrinthInstallCandidate] | None = None,
+    optional_issues: list[ModrinthDependencyIssue] | None = None,
+    issues: list[ModrinthDependencyIssue] | None = None,
+) -> ModrinthDependencyPlan:
+    return ModrinthDependencyPlan(
+        main=main,
+        dependencies_to_install=install or [],
+        dependencies_to_replace=replace or [],
+        already_satisfied=[],
+        optional_dependencies=optional or [],
+        skipped_embedded=[],
+        blocking_issues=issues or [],
+        optional_dependency_issues=optional_issues or [],
+    )
 
 
 def test_navigation_shell_builds(fake_app):
@@ -2279,6 +2328,32 @@ def test_mods_manager_action_buttons_use_neutral_state_colors(fake_app):
     ]
 
 
+def test_mods_manager_search_result_card_includes_open_on_site_action(fake_app):
+    cards = ModsManagerCards(fake_app)
+    opened = []
+
+    card = cards.search_result_card(
+        {
+            "project_id": "sodium-project",
+            "slug": "sodium",
+            "project_type": "mod",
+            "title": "Sodium",
+            "downloads": 1200,
+        },
+        installed=False,
+        update_available=False,
+        on_install=lambda _e: None,
+        on_open_site=lambda _e: opened.append("open"),
+    )
+
+    actions = card.content.controls[2].controls
+    assert actions[0].icon == ft.Icons.OPEN_IN_NEW_ROUNDED
+
+    actions[0].on_click(None)
+
+    assert opened == ["open"]
+
+
 def test_mods_manager_modrinth_install_uses_alerts_without_progress_dialog(fake_app, monkeypatch):
     version = fake_app.versions.all()[0]
     version.client = "fabric"
@@ -2292,15 +2367,16 @@ def test_mods_manager_modrinth_install_uses_alerts_without_progress_dialog(fake_
 
     page = ModsManagerPage(fake_app, version)
     page._switch_content_tab("resourcepacks")
-    fake_app.modrinth_mods.find_latest_version = lambda *_args, **_kwargs: {
-        "id": "version-id",
-        "version_number": "1.0.0",
-        "files": [],
-    }
-    fake_app.modrinth_mods.select_primary_file = lambda _version_data: ModInstallFile(
+    main = _modrinth_candidate(
+        "faithful-project",
+        "Faithful",
+        "faithful.zip",
         url="https://example.com/faithful.zip",
-        filename="faithful.zip",
-        version_number="1.0.0",
+        version_id="version-id",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main)
+    fake_app.modrinth_mods.find_latest_version = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Modrinth content installs should use dependency plans")
     )
 
     def fake_download(_url, download_path, *, progress_callback=None):
@@ -2327,6 +2403,477 @@ def test_mods_manager_modrinth_install_uses_alerts_without_progress_dialog(fake_
     assert infos[0] == "installing_resourcepack (name=Faithful)"
     assert infos[-1] == "resourcepack_installed (name=Faithful)"
     assert page.content_installing is False
+
+
+def test_mods_manager_modrinth_install_refreshes_visible_search_result_status(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    mod = {
+        "project_id": "main-project",
+        "slug": "main",
+        "project_type": "mod",
+        "title": "Main",
+        "latest_version": "main-version",
+        "downloads": 10,
+    }
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main)
+
+    def fake_download(_url, download_path, *, progress_callback=None):
+        Path(download_path).write_bytes(b"jar")
+        return download_path
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file", fake_download)
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page.after_show()
+    page.current_inner_tab = "modrinth"
+    page.search_result_items = [mod]
+    page.search_results_container.controls = [page._create_search_result_card(mod)]
+
+    page._install_mod(mod)
+
+    buttons = [control for control in _flatten_controls(page.search_results_container) if isinstance(control, ft.Button)]
+    assert buttons[-1].content == "installed"
+    assert buttons[-1].disabled is True
+
+
+def test_mods_manager_modrinth_dependency_plan_requires_confirmation(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    dep = _modrinth_candidate(
+        "dep-project",
+        "Dependency",
+        "dep.jar",
+        url="https://example.com/dep.jar",
+        version_id="dep-version",
+        version_number="2.0.0",
+        dependency_type="required",
+    )
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, install=[dep])
+
+    downloads = []
+    monkeypatch.setattr(
+        "launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file",
+        lambda *args, **kwargs: downloads.append(args),
+    )
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    page._install_mod({"project_id": "main-project", "slug": "main", "title": "Main"})
+
+    assert downloads == []
+    assert page.modrinth_dependency_dialog is not None
+    assert getattr(page.modrinth_dependency_dialog, "open", False)
+
+
+def test_mods_manager_modrinth_confirmed_dependency_install_downloads_dependencies_before_main(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    dep = _modrinth_candidate(
+        "dep-project",
+        "Dependency",
+        "dep.jar",
+        url="https://example.com/dep.jar",
+        version_id="dep-version",
+        version_number="2.0.0",
+        dependency_type="required",
+    )
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, install=[dep])
+
+    downloads = []
+
+    def fake_download(url, download_path, *, progress_callback=None):
+        downloads.append((url, Path(download_path).name))
+        Path(download_path).write_bytes(b"jar")
+        return download_path
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file", fake_download)
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    page._install_mod({"project_id": "main-project", "slug": "main", "title": "Main"})
+    page.modrinth_dependency_dialog.actions[0].on_click(None)
+
+    assert [url for url, _filename in downloads] == [
+        "https://example.com/dep.jar",
+        "https://example.com/main.jar",
+    ]
+    assert (mods_dir / "dep.jar").exists()
+    assert (mods_dir / "main.jar").exists()
+
+
+def test_mods_manager_modrinth_optional_dependency_checkbox_installs_selected_optional(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    optional = _modrinth_candidate(
+        "optional-project",
+        "Optional Dependency",
+        "optional.jar",
+        url="https://example.com/optional.jar",
+        version_id="optional-version",
+        version_number="1.2.0",
+        dependency_type="optional",
+    )
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, optional=[optional])
+
+    downloads = []
+    opened_urls = []
+
+    def fake_download(url, download_path, *, progress_callback=None):
+        downloads.append((url, Path(download_path).name))
+        Path(download_path).write_bytes(b"jar")
+        return download_path
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file", fake_download)
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.auth.device_ui = SimpleNamespace(open_url=lambda url: opened_urls.append(url) or True)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    page._install_mod({"project_id": "main-project", "slug": "main", "title": "Main"})
+
+    controls = _flatten_controls(page.modrinth_dependency_dialog.content)
+    checkboxes = [control for control in controls if isinstance(control, ft.Checkbox)]
+    open_buttons = [
+        control
+        for control in controls
+        if isinstance(control, ft.IconButton) and control.icon == ft.Icons.OPEN_IN_NEW_ROUNDED
+    ]
+
+    assert len(checkboxes) == 1
+    assert "Optional Dependency" in checkboxes[0].label
+    assert "1.2.0" in checkboxes[0].label
+    assert open_buttons
+
+    open_buttons[0].on_click(None)
+    checkboxes[0].value = True
+    page.modrinth_dependency_dialog.actions[0].on_click(None)
+
+    assert opened_urls == ["https://modrinth.com/mod/optional-project"]
+    assert [url for url, _filename in downloads] == [
+        "https://example.com/optional.jar",
+        "https://example.com/main.jar",
+    ]
+    assert (mods_dir / "optional.jar").exists()
+    assert (mods_dir / "main.jar").exists()
+
+
+def test_mods_manager_modrinth_dependency_replacement_removes_old_file(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    old_path = mods_dir / "dep-old.jar"
+    old_path.write_bytes(b"old")
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    dep = _modrinth_candidate(
+        "dep-project",
+        "Dependency",
+        "dep-new.jar",
+        url="https://example.com/dep-new.jar",
+        action="replace",
+        version_id="dep-new",
+        version_number="2.0.0",
+        installed_item={"path": str(old_path), "filename": "dep-old.jar", "modrinth_project_id": "dep-project"},
+        dependency_type="required",
+    )
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, replace=[dep])
+
+    def fake_download(_url, download_path, *, progress_callback=None):
+        Path(download_path).write_bytes(b"new")
+        return download_path
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file", fake_download)
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    page._install_mod({"project_id": "main-project", "slug": "main", "title": "Main"})
+    page.modrinth_dependency_dialog.actions[0].on_click(None)
+
+    assert not old_path.exists()
+    assert (mods_dir / "dep-new.jar").exists()
+    assert (mods_dir / "main.jar").exists()
+
+
+def test_mods_manager_modrinth_dependency_replacement_keeps_old_file_when_download_fails(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    old_path = mods_dir / "dep-old.jar"
+    old_path.write_bytes(b"old")
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    dep = _modrinth_candidate(
+        "dep-project",
+        "Dependency",
+        "dep-new.jar",
+        url="https://example.com/dep-new.jar",
+        action="replace",
+        version_id="dep-new",
+        version_number="2.0.0",
+        installed_item={"path": str(old_path), "filename": "dep-old.jar", "modrinth_project_id": "dep-project"},
+        dependency_type="required",
+    )
+
+    def fake_download(_url, _download_path, *, progress_callback=None):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file", fake_download)
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    context = {"directory": mods_dir, "key": "mods"}
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        asyncio.run(page._download_modrinth_candidate(dep, context))
+
+    assert old_path.exists()
+    assert old_path.read_bytes() == b"old"
+    assert not (mods_dir / "dep-new.jar").exists()
+
+
+def test_mods_manager_modrinth_blocking_dependency_issue_downloads_nothing(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    issue = ModrinthDependencyIssue(
+        "required_file_only",
+        "A required dependency is listed only as external.jar.",
+        file_name="external.jar",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, issues=[issue])
+
+    downloads = []
+    monkeypatch.setattr(
+        "launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file",
+        lambda *args, **kwargs: downloads.append(args),
+    )
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    page._install_mod({"project_id": "main-project", "slug": "main", "title": "Main"})
+
+    assert downloads == []
+    assert page.modrinth_dependency_dialog is not None
+    assert [getattr(action, "content", "") for action in page.modrinth_dependency_dialog.actions] == ["close"]
+
+
+def test_mods_manager_modrinth_dependency_dialog_uses_specific_issue_message(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    main = _modrinth_candidate(
+        "main-project",
+        "Main",
+        "main.jar",
+        url="https://example.com/main.jar",
+        version_id="main-version",
+    )
+    issue = ModrinthDependencyIssue(
+        "dependency_incompatible",
+        "Required dependency dep-project is not compatible with this build.",
+        project_id="dep-project",
+    )
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, issues=[issue])
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.is_busy = lambda: False
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+    fake_app.page.run_task = _run_task_immediately
+
+    page = ModsManagerPage(fake_app, version)
+    page._switch_content_tab("mods")
+    page._install_mod({"project_id": "main-project", "slug": "main", "title": "Main"})
+
+    assert "Required dependency dep-project is not compatible with this build." in _flatten_text_values(
+        page.modrinth_dependency_dialog.content
+    )
+
+
+def test_mods_manager_update_mod_records_latest_modrinth_metadata(fake_app, monkeypatch):
+    version = fake_app.versions.all()[0]
+    version.client = "fabric"
+    version.loader = "fabric"
+
+    version_root = fake_app.util.minecraft_dir / "versions" / version.version_id
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    version.path = str(version_root)
+    old_path = mods_dir / "main.jar"
+    old_path.write_bytes(b"old")
+    monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
+
+    project = {
+        "project_id": "main-project",
+        "slug": "main",
+        "project_type": "mod",
+        "title": "Main",
+    }
+    old_file = ModInstallFile("https://example.com/main-old.jar", "main.jar", "1.0.0")
+    old_version = {"id": "old-version", "version_number": "1.0.0"}
+    fake_app.content.record_modrinth_content(version, "mods", old_path, project, old_version, old_file)
+
+    latest_version = {
+        "id": "new-version",
+        "project_id": "main-project",
+        "version_number": "2.0.0",
+        "files": [{"filename": "main.jar", "url": "https://example.com/main-new.jar", "primary": True}],
+    }
+    mod = fake_app.content.apply_modrinth_metadata(version, fake_app.content.scan_installed_mods(mods_dir))[0]
+    mod["name"] = "Main"
+    mod["version"] = "1.0.0"
+    mod["update_available"] = True
+    mod["latest_version"] = latest_version
+
+    def fake_download(_url, download_path, *, progress_callback=None):
+        Path(download_path).write_bytes(b"new")
+        return download_path
+
+    monkeypatch.setattr("launcher.pages.mods_manager_search.ModrinthAPI.download_mod_file", fake_download)
+    monkeypatch.setattr("launcher.pages.mods_manager_search.run_blocking", _run_blocking_immediately)
+    fake_app.feedback.info = lambda *_args, **_kwargs: None
+    fake_app.feedback.warning = lambda *_args, **_kwargs: None
+
+    page = ModsManagerPage(fake_app, version)
+    page.after_show()
+    page._create_backup = lambda _mod: True
+    operation = SimpleNamespace(fail=lambda *_args, **_kwargs: None, finish=lambda *_args, **_kwargs: None)
+
+    asyncio.run(page._update_mod_async(mod, operation))
+
+    updated = fake_app.content.apply_modrinth_metadata(version, fake_app.content.scan_installed_mods(mods_dir))[0]
+    assert updated["modrinth_version_id"] == "new-version"
+    assert updated["modrinth_version_number"] == "2.0.0"
+    assert old_path.read_bytes() == b"new"
 
 
 def test_mods_manager_installed_tab_does_not_auto_check_mod_updates(fake_app, monkeypatch):

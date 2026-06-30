@@ -117,6 +117,49 @@ def test_warning_alert_adds_send_report_action(fake_app):
     assert report["metadata"]["action"] == "launch"
 
 
+def test_warning_alert_adds_discord_support_action_with_report_context(fake_app):
+    captured = {"dialogs": [], "opened_urls": []}
+    fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)
+    fake_app.auth.device_ui = type(
+        "DeviceUi",
+        (),
+        {"open_url": lambda _self, url: captured["opened_urls"].append(url) or True},
+    )()
+
+    alert = Alert(fake_app)
+
+    alert._show_alert_impl(
+        "Minecraft exited",
+        is_warning=True,
+        report_title="Launch failed",
+        report_metadata={"screen": "game", "action": "launch"},
+    )
+
+    warning_dialog = captured["dialogs"][0]
+    discord_action = next(action for action in warning_dialog.actions if action.content == "open_discord_support")
+    discord_action.on_click(None)
+
+    assert captured["opened_urls"] == ["https://discord.gg/8GR7Smy9s"]
+
+
+def test_warning_alert_omits_discord_support_action_without_report_context(fake_app):
+    captured = {"dialogs": []}
+    fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)
+    fake_app.auth.device_ui = type(
+        "DeviceUi",
+        (),
+        {"open_url": lambda _self, _url: True},
+    )()
+
+    alert = Alert(fake_app)
+
+    alert._show_alert_impl("You have not set a default profile", is_warning=True)
+
+    warning_dialog = captured["dialogs"][0]
+    action_labels = [getattr(action, "content", None) for action in warning_dialog.actions]
+    assert "open_discord_support" not in action_labels
+
+
 def test_warning_alert_omits_report_action_without_report_context(fake_app):
     captured = {"dialogs": []}
     fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)

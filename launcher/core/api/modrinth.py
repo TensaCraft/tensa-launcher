@@ -51,6 +51,13 @@ class ModrinthAPI:
         return response.json()
 
     @staticmethod
+    def get_version_by_id(version_id):
+        url = f"{ModrinthAPI.BASE_URL}/version/{version_id}"
+        response = requests.get(url, timeout=ModrinthAPI.REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
     def download_mrpack(version, download_path):
         if 'files' not in version:
             raise Exception("The 'version' object does not contain 'files'. Check the version structure.")

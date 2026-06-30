@@ -315,7 +315,15 @@ class ModsManagerCards:
             padding=self.app.theme.padding_md,
         )
 
-    def search_result_card(self, mod: dict[str, Any], *, installed: bool, update_available: bool = False, on_install) -> ui.Container:
+    def search_result_card(
+        self,
+        mod: dict[str, Any],
+        *,
+        installed: bool,
+        update_available: bool = False,
+        on_install,
+        on_open_site=None,
+    ) -> ui.Container:
         mod_name = mod.get("title", "Unknown")
         mod_author = mod.get("author", "Unknown")
         mod_description = mod.get("description", "")
@@ -361,15 +369,29 @@ class ModsManagerCards:
                         spacing=4,
                         expand=True,
                     ),
-                    ui.Button(
-                        text=(
-                            self.trans("update_modrinth_content")
-                            if update_available
-                            else self.trans("installed") if installed else self.trans("install")
-                        ),
-                        on_click=on_install if not installed or update_available else None,
-                        icon=ft.Icons.UPDATE if update_available else ft.Icons.CHECK if installed else ft.Icons.DOWNLOAD,
-                        disabled=installed and not update_available,
+                    ui.Row(
+                        [
+                            ui.IconButton(
+                                icon=ft.Icons.OPEN_IN_NEW_ROUNDED,
+                                tooltip=self.trans("open_on_site"),
+                                width=self.app.theme.button_height_for_size("sm"),
+                                height=self.app.theme.button_height_for_size("sm"),
+                                icon_size=self.app.theme.icon_size_sm,
+                                on_click=on_open_site,
+                            ),
+                            ui.Button(
+                                text=(
+                                    self.trans("update_modrinth_content")
+                                    if update_available
+                                    else self.trans("installed") if installed else self.trans("install")
+                                ),
+                                on_click=on_install if not installed or update_available else None,
+                                icon=ft.Icons.UPDATE if update_available else ft.Icons.CHECK if installed else ft.Icons.DOWNLOAD,
+                                disabled=installed and not update_available,
+                            ),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 ],
                 spacing=12,

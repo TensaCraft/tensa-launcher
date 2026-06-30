@@ -17,6 +17,8 @@ from ..theme import current_theme
 from .alert_dialog import AlertDialog
 from .snackbar import SnackBar
 
+DISCORD_SUPPORT_URL = "https://discord.gg/8GR7Smy9s"
+
 
 class Alert:
     def __init__(self, app):
@@ -69,6 +71,7 @@ class Alert:
                 )
                 if report_action is not None:
                     dialog_actions.append(report_action)
+                dialog_actions.append(self._build_discord_support_action())
             dialog_actions.extend(self._normalize_actions(actions))
             dialog_actions = [
                 *dialog_actions,
@@ -172,6 +175,55 @@ class Alert:
         if isinstance(actions, (list, tuple)):
             return list(actions)
         return [actions]
+
+    def _open_external_url(self, url: str) -> bool:
+        auth = getattr(self.app, "auth", None)
+        device_ui = getattr(auth, "device_ui", None)
+        opener = getattr(device_ui, "open_url", None)
+        if callable(opener):
+            try:
+                if opener(url):
+                    return True
+            except Exception as exc:
+                self.app.log.warning(f"Device URL opener failed: {exc!r}")
+
+        page = getattr(self.app, "page", None)
+        launch_url = getattr(page, "launch_url", None)
+        if not callable(launch_url):
+            return False
+        try:
+            if inspect.iscoroutinefunction(launch_url):
+                run_task(page, launch_url, url)
+                return True
+            result = launch_url(url)
+            if inspect.isawaitable(result):
+
+                async def _await_launch_url() -> Any:
+                    return await result
+
+                run_task(page, _await_launch_url)
+            return True
+        except Exception as exc:
+            self.app.log.warning(f"Page URL opener failed: {exc!r}")
+            return False
+
+    def _build_discord_support_action(self) -> ft.Control:
+        def open_discord(_event=None) -> None:
+            if self._open_external_url(DISCORD_SUPPORT_URL):
+                return
+            self.show_alert(
+                self.app.trans("discord_support_open_failed"),
+                is_warning=True,
+                allow_report=False,
+            )
+
+        return Button(
+            text=self.app.trans("open_discord_support"),
+            icon=ft.Icons.FORUM_OUTLINED,
+            variant="outline",
+            tone="neutral",
+            on_click=open_discord,
+        )
 
     def _build_report_action(
         self,

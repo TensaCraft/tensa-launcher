@@ -72,6 +72,7 @@ class ModsManagerPage(
         self.screenshots_loaded = False
         self.screenshots_container: ft.ListView | None = None
         self.screenshot_preview_dialog: ft.AlertDialog | None = None
+        self.modrinth_dependency_dialog: ft.AlertDialog | None = None
         self.version_settings_page: VersionSettingsPage | None = None
         self.delete_directory_toggle: ft.Container | None = None
         self.delete_backups_toggle: ft.Container | None = None
@@ -87,6 +88,7 @@ class ModsManagerPage(
         self.inner_tab_buttons = None
         self.filter_info_container = None
         self.minecraft_version_select = None
+        self.search_result_items: list[Dict] = []
 
         self.search_state = CatalogState(limit=self.app.theme.modpacks_per_page)
         self._is_active = False
@@ -685,6 +687,7 @@ class ModsManagerPage(
 
     def _reset_search_results(self, *, clear_query: bool = False) -> None:
         self.search_state.cancel()
+        self.search_result_items = []
         if clear_query:
             self.search_state.query = ""
             self.search_state.offset = 0
