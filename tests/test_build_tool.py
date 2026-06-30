@@ -145,6 +145,35 @@ def test_python_runtime_reexec_preserves_child_exit_and_output_path(monkeypatch)
     assert calls["env"][runtime.REEXEC_ENV] == "1"
 
 
+def test_typecheck_uses_current_python_for_import_resolution(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT_DIR / ".tools"))
+    typecheck_tool = _load_module("run_typecheck_test", ROOT_DIR / ".tools" / "run_typecheck.py")
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr(typecheck_tool.sys, "executable", "/repo/.venv/bin/python")
+
+    def fake_run(cmd, *, cwd):
+        calls.append((cmd, cwd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(typecheck_tool.subprocess, "run", fake_run)
+
+    assert typecheck_tool.main() == 0
+    assert calls == [
+        (
+            [
+                "/repo/.venv/bin/python",
+                "-m",
+                "pyright",
+                "--project",
+                "pyrightconfig.json",
+                "--pythonpath",
+                "/repo/.venv/bin/python",
+            ],
+            typecheck_tool.ROOT,
+        )
+    ]
+
+
 def test_build_package_metadata_uses_tensalauncher_names():
     build_tool = _load_build_tool()
     ctx = _build_context(build_tool, target="windows")

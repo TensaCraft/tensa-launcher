@@ -12,7 +12,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main() -> int:
     completed = subprocess.run(
-        [sys.executable, "-m", "pyright", "--project", "pyrightconfig.json"],
+        [
+            sys.executable,
+            "-m",
+            "pyright",
+            "--project",
+            "pyrightconfig.json",
+            "--pythonpath",
+            sys.executable,
+        ],
         cwd=ROOT,
     )
     return int(completed.returncode)
