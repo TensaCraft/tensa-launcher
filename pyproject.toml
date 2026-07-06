@@ -22,11 +22,11 @@ dependencies = [
 [project.optional-dependencies]
 build = [
     "flet-cli==0.85.3",
-    "pillow==12.2.0",
+    "pillow==12.3.0",
     "pyinstaller==6.21.0",
 ]
 dev = [
-    "pillow==12.2.0",
+    "pillow==12.3.0",
     "pyright==1.1.411",
     "pytest==9.1.1",
     "ruff==0.15.20",
