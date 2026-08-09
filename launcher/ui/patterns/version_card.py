@@ -99,7 +99,7 @@ class VersionCard:
         action_button.on_hover = on_button_hover
 
         def wrapped_on_click(e):
-            _play_click_sound()
+            _play_click_sound((e,))
             on_launch_start()
 
             async def run_click_after_paint():

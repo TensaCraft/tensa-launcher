@@ -5,9 +5,7 @@ import hashlib
 import os
 import platform
 import shutil
-import subprocess
 import sys
-import tempfile
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -17,19 +15,17 @@ import requests
 from launcher.core.pending_update import (
     clear_pending_update_marker,
     pending_update_marker_path,
+    resume_pending_update_if_needed,
     write_pending_update_marker,
 )
 from launcher.models.logger import Logger
 
-WINDOWS_CREATE_NEW_CONSOLE = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-
 
 class AutoUpdater:
-
     GITHUB_RELEASES_URL = "https://api.github.com/repos/TensaCraft/tensa-launcher/releases"
     GITHUB_API_VERSION = "2022-11-28"
     _SCRIPT_ROOT = Path(__file__).resolve().parent.parent / "assets" / "updater"
-    _PLATFORM_SUFFIXES = {'windows': '.exe', 'macos': '.dmg'}
+    _PLATFORM_SUFFIXES = {"windows": ".exe", "macos": ".dmg"}
     DOWNLOAD_CHUNK_SIZE = 262144
 
     def __init__(self, app):
@@ -38,7 +34,7 @@ class AutoUpdater:
         self.logger = getattr(app, "log", Logger())
         self.platform = self._detect_platform()
         self.appimage_path = self._resolve_appimage_path()
-        self._temp_dir = Path(tempfile.gettempdir())
+        self._temp_dir = pending_update_marker_path().parent
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -71,14 +67,14 @@ class AutoUpdater:
     @classmethod
     def _detect_platform(cls) -> str:
         system = platform.system()
-        if system == 'Windows':
-            return 'windows'
-        elif system == 'Linux':
-            return 'linux'
-        elif system == 'Darwin':
-            return 'macos'
+        if system == "Windows":
+            return "windows"
+        elif system == "Linux":
+            return "linux"
+        elif system == "Darwin":
+            return "macos"
         else:
-            return 'unknown'
+            return "unknown"
 
     @staticmethod
     def _normalize_version_tag(value: str | None) -> str:
@@ -252,9 +248,7 @@ class AutoUpdater:
 
         asset = self._select_github_asset(release)
         if asset is None:
-            self.logger.warning(
-                f"GitHub release {latest_version} does not provide a {self.platform} launcher asset"
-            )
+            self.logger.warning(f"GitHub release {latest_version} does not provide a {self.platform} launcher asset")
             return None
 
         download_url = str(asset.get("browser_download_url") or "").strip()
@@ -297,7 +291,7 @@ class AutoUpdater:
     def _download_suffix(self) -> str:
         if self.platform == "linux" and self.appimage_path is not None:
             return ".AppImage"
-        return self._PLATFORM_SUFFIXES.get(self.platform, '')
+        return self._PLATFORM_SUFFIXES.get(self.platform, "")
 
     @staticmethod
     def _sanitize_file_component(value: str | None) -> str:
@@ -307,13 +301,11 @@ class AutoUpdater:
     def _download_paths(self, update_info: Dict[str, Any], suffix: str) -> tuple[Path, Path]:
         version = self._sanitize_file_component(update_info.get("version"))
         raw_file_name = str(update_info.get("download_file_name") or "").strip()
-        base_name = (
-            self._sanitize_file_component(raw_file_name)
-            if raw_file_name
-            else f"tensalauncher-update-{self.platform}-{version}"
-        )
-        if suffix and not base_name.endswith(suffix):
-            base_name = f"{base_name}{suffix}"
+        if raw_file_name:
+            sanitized = Path(self._sanitize_file_component(raw_file_name))
+            base_name = f"{sanitized.stem}-{version}{sanitized.suffix or suffix}"
+        else:
+            base_name = f"tensalauncher-update-{self.platform}-{version}{suffix}"
         final_path = self._temp_dir / base_name
         partial_path = final_path.with_name(f"{final_path.name}.part")
         return final_path, partial_path
@@ -373,7 +365,7 @@ class AutoUpdater:
     @staticmethod
     def _calculate_hash(file_path: Path, algorithm: str) -> str:
         hasher = hashlib.new(algorithm)
-        with open(file_path, 'rb') as handle:
+        with open(file_path, "rb") as handle:
             while True:
                 chunk = handle.read(8192)
                 if not chunk:
@@ -391,6 +383,8 @@ class AutoUpdater:
         last_error: Optional[Exception] = None
         for url in urls:
             try:
+                if not expected_hash or not expected_hash_algorithm:
+                    partial_path.unlink(missing_ok=True)
                 self.logger.info(f"Downloading update from {url}")
                 temp_path = self._stream_download(url, partial_path, progress_callback=progress_callback)
                 if expected_hash and expected_hash_algorithm:
@@ -443,16 +437,14 @@ class AutoUpdater:
 
         if download_path:
             operation.update(self.app.trans("update_applying"), progress=100, total=100)
-            update_cmd = await asyncio.to_thread(self.prepare_update, download_path)
-            if update_cmd:
+            update_marker = await asyncio.to_thread(self.prepare_update, download_path)
+            if update_marker:
                 operation.finish(show_success=False)
                 self.app.feedback.confirm(
                     title=self.app.trans("update_ready_title"),
                     question=self.app.trans("update_ready_message"),
                     callback=lambda confirmed: (
-                        self.execute_update(update_cmd)
-                        if confirmed
-                        else clear_pending_update_marker(self._temp_dir)
+                        self.execute_update(update_marker) if confirmed else clear_pending_update_marker(self._temp_dir)
                     ),
                 )
             else:
@@ -462,135 +454,96 @@ class AutoUpdater:
             operation.finish(show_success=False)
             self.app.feedback.warning(self.app.trans("update_download_failed"))
 
-    def execute_update(self, update_cmd: str) -> None:
-        """Run prepared updater command and close launcher."""
-        if self.platform == "windows":
-            subprocess.Popen([update_cmd], shell=True, creationflags=WINDOWS_CREATE_NEW_CONSOLE)
-        else:
-            subprocess.Popen(update_cmd, shell=True, start_new_session=True)
+    def execute_update(self, update_marker: Path) -> None:
+        """Resume a validated pending update and close the launcher."""
+        expected_marker = pending_update_marker_path(self._temp_dir)
+        if update_marker.resolve() != expected_marker.resolve():
+            self.logger.error(f"Refusing unexpected pending update marker: {update_marker}")
+            return
+
+        resumed = resume_pending_update_if_needed(
+            self.logger,
+            temp_dir=self._temp_dir,
+            platform_name=self.platform,
+        )
+        if not resumed:
+            self.logger.error("Prepared launcher update could not be resumed")
+            return
         self.app.stop()
 
-    def _copy_updater_asset(
+    def _prepare_pending_update(
         self,
-        source_name: str,
-        target_name: Optional[str] = None,
-        make_executable: bool = False,
+        *,
+        platform_name: str,
+        source: Path,
+        target: Path,
+        updater_asset_name: str,
     ) -> Optional[Path]:
-        source_path = self._SCRIPT_ROOT / source_name
-        if not source_path.exists():
-            self.logger.error(f"Update script not found: {source_path}")
+        updater_asset = self._SCRIPT_ROOT / updater_asset_name
+        if not updater_asset.is_file():
+            self.logger.error(f"Update script not found: {updater_asset}")
             return None
 
-        destination = self._temp_dir / (target_name or source_name)
-        shutil.copy2(source_path, destination)
-        if make_executable:
-            destination.chmod(0o755)
-        return destination
-
-    @staticmethod
-    def _format_nohup_command(script_path: Path, *args: str) -> str:
-        quoted_args = " ".join(f'"{arg}"' for arg in args)
-        return f'nohup "{script_path}" {quoted_args} > /dev/null 2>&1 &'
-
-    def apply_update_windows(self, new_binary_path: Path) -> Optional[str]:
-        """Підготовка оновлення для Windows. Повертає шлях до батч-файлу"""
         try:
-            current_exe = Path(sys.executable)
-            current_pid = os.getpid()
-
-            batch_path = self._copy_updater_asset("windows_update.bat", "tensalauncher_update.bat")
-            if not batch_path:
-                return None
-
-            launcher_bat = self._temp_dir / "tensalauncher_start_update.bat"
-            marker_path = pending_update_marker_path(self._temp_dir)
-            launcher_script = (
-                '@echo off\n'
-                f'call "{batch_path}" "{new_binary_path}" "{current_exe}" {current_pid} "{marker_path}"\n'
-            )
-            launcher_bat.write_text(launcher_script, encoding='ascii')
-            write_pending_update_marker(
+            marker_path = write_pending_update_marker(
                 temp_dir=self._temp_dir,
-                platform_name="windows",
-                command=launcher_bat,
-                updater_script=batch_path,
-                source=new_binary_path,
-                target=current_exe,
+                platform_name=platform_name,
+                command=updater_asset,
+                updater_script=updater_asset,
+                source=source,
+                target=target,
             )
-
-            self.logger.info(f"Update ready. Script: {batch_path}")
-            return str(launcher_bat)
-
+            self.logger.info(f"Update ready. Marker: {marker_path}")
+            return marker_path
         except Exception as exc:
-            self.logger.error(f"Failed to prepare Windows update: {exc}")
+            self.logger.error(f"Failed to prepare {platform_name} update: {exc}")
             return None
 
-    def apply_update_macos(self, dmg_path: Path) -> Optional[str]:
-        """Підготовка оновлення для macOS. Повертає шлях до скрипта"""
-        try:
-            current_pid = os.getpid()
+    def apply_update_windows(self, new_binary_path: Path) -> Optional[Path]:
+        """Prepare a validated pending Windows update."""
+        return self._prepare_pending_update(
+            platform_name="windows",
+            source=new_binary_path,
+            target=Path(sys.executable),
+            updater_asset_name="windows_update.bat",
+        )
 
-            # Знаходимо .app bundle
-            current_app = Path(sys.executable)
-            while current_app.suffix != '.app' and current_app != current_app.parent:
-                current_app = current_app.parent
+    def apply_update_macos(self, dmg_path: Path) -> Optional[Path]:
+        """Prepare a validated pending macOS update."""
+        current_app = Path(sys.executable)
+        while current_app.suffix != ".app" and current_app != current_app.parent:
+            current_app = current_app.parent
 
-            if current_app.suffix != '.app':
-                self.logger.error("Could not find .app bundle")
-                return None
-
-            script_path = self._copy_updater_asset("macos_update.sh", "tensalauncher_update.sh", make_executable=True)
-            if not script_path:
-                return None
-
-            cmd = self._format_nohup_command(
-                script_path,
-                str(dmg_path),
-                str(current_app),
-                str(current_pid),
-            )
-
-            self.logger.info(f"Update ready. Script: {script_path}")
-            return cmd
-
-        except Exception as exc:
-            self.logger.error(f"Failed to prepare macOS update: {exc}")
+        if current_app.suffix != ".app":
+            self.logger.error("Could not find .app bundle")
             return None
 
-    def apply_update_linux(self, new_binary_path: Path) -> Optional[str]:
-        """Підготовка оновлення для Linux. Повертає шлях до скрипта"""
-        try:
-            current_binary = self.appimage_path or Path(sys.executable)
-            current_pid = os.getpid()
+        return self._prepare_pending_update(
+            platform_name="macos",
+            source=dmg_path,
+            target=current_app,
+            updater_asset_name="macos_update.sh",
+        )
 
-            script_path = self._copy_updater_asset("linux_update.sh", "tensalauncher_update.sh", make_executable=True)
-            if not script_path:
-                return None
+    def apply_update_linux(self, new_binary_path: Path) -> Optional[Path]:
+        """Prepare a validated pending Linux update."""
+        return self._prepare_pending_update(
+            platform_name="linux",
+            source=new_binary_path,
+            target=self.appimage_path or Path(sys.executable),
+            updater_asset_name="linux_update.sh",
+        )
 
-            cmd = self._format_nohup_command(
-                script_path,
-                str(new_binary_path),
-                str(current_binary),
-                str(current_pid),
-            )
-
-            self.logger.info(f"Update ready. Script: {script_path}")
-            return cmd
-
-        except Exception as exc:
-            self.logger.error(f"Failed to prepare Linux update: {exc}")
-            return None
-
-    def prepare_update(self, new_binary_path: Path) -> Optional[str]:
-        """Підготовка оновлення. Повертає команду для запуску оновлювача"""
-        if not getattr(sys, 'frozen', False):
+    def prepare_update(self, new_binary_path: Path) -> Optional[Path]:
+        """Prepare a pending update marker for the current platform."""
+        if not getattr(sys, "frozen", False):
             self.logger.warning("Cannot apply update: running in development mode")
             return None
 
         handlers = {
-            'windows': self.apply_update_windows,
-            'linux': self.apply_update_linux,
-            'macos': self.apply_update_macos,
+            "windows": self.apply_update_windows,
+            "linux": self.apply_update_linux,
+            "macos": self.apply_update_macos,
         }
         handler = handlers.get(self.platform)
         if not handler:

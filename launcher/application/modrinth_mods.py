@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import string
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
+from launcher.application.mod_identity import ModIdentityService, ModMatch
 from launcher.core.api.modrinth import ModrinthAPI
 
 
@@ -13,6 +16,9 @@ class ModInstallFile:
     url: str
     filename: str
     version_number: str = ""
+    size: int = 0
+    file_hash: str = ""
+    hash_algorithm: str = ""
 
 
 @dataclass(slots=True)
@@ -24,6 +30,7 @@ class ModrinthInstallCandidate:
     dependency_type: str = "selected"
     requested_by: tuple[str, ...] = ()
     installed_item: dict[str, Any] | None = None
+    installed_match: ModMatch | None = None
 
     @property
     def project_id(self) -> str:
@@ -117,6 +124,9 @@ class ModrinthDependencyPlan:
 class ModrinthModsService:
     LOADER_SCOPED_PROJECT_TYPES = {"mod"}
     FABRIC_API_PROJECT_ID = "P7dR8mSH"
+
+    def __init__(self, identity: ModIdentityService | None = None) -> None:
+        self.identity = identity or ModIdentityService()
 
     @staticmethod
     def get_loader_name(version) -> str | None:
@@ -268,12 +278,68 @@ class ModrinthModsService:
         if not files:
             return None
 
-        mod_file = next((file for file in files if file.get("primary", False)), files[0])
-        return ModInstallFile(
-            url=mod_file["url"],
-            filename=mod_file["filename"],
-            version_number=version_data.get("version_number", ""),
+        ordered_files = sorted(
+            (file for file in files if isinstance(file, dict)),
+            key=lambda file: not bool(file.get("primary")),
         )
+        for mod_file in ordered_files:
+            install_file = ModrinthModsService._validated_install_file(mod_file, version_data)
+            if install_file is not None:
+                return install_file
+        return None
+
+    @staticmethod
+    def _validated_install_file(
+        mod_file: dict[str, Any],
+        version_data: dict[str, Any],
+    ) -> ModInstallFile | None:
+        url = str(mod_file.get("url") or "").strip()
+        filename = str(mod_file.get("filename") or "").strip()
+        size = mod_file.get("size")
+        if not ModrinthModsService._is_secure_download_url(url):
+            return None
+        if not filename or "\x00" in filename:
+            return None
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            return None
+
+        hashes = mod_file.get("hashes")
+        if not isinstance(hashes, dict):
+            return None
+        hash_algorithm, file_hash = ModrinthModsService._strongest_supported_hash(hashes)
+        if not file_hash:
+            return None
+
+        return ModInstallFile(
+            url=url,
+            filename=filename,
+            version_number=str(version_data.get("version_number") or ""),
+            size=size,
+            file_hash=file_hash,
+            hash_algorithm=hash_algorithm,
+        )
+
+    @staticmethod
+    def _is_secure_download_url(url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            _ = parsed.port
+        except ValueError:
+            return False
+        return bool(
+            parsed.scheme.lower() == "https"
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        )
+
+    @staticmethod
+    def _strongest_supported_hash(hashes: dict[str, Any]) -> tuple[str, str]:
+        for algorithm, digest_length in (("sha512", 128), ("sha1", 40)):
+            digest = str(hashes.get(algorithm) or "").strip().lower()
+            if len(digest) == digest_length and all(char in string.hexdigits for char in digest):
+                return algorithm, digest
+        return "", ""
 
     @staticmethod
     def is_installed(installed_mods: list[dict[str, Any]], project: dict[str, Any]) -> bool:
@@ -281,39 +347,23 @@ class ModrinthModsService:
 
     @staticmethod
     def find_installed(installed_mods: list[dict[str, Any]], project: dict[str, Any]) -> dict[str, Any] | None:
-        project_id = project.get("project_id")
-        project_slug = ModrinthModsService._normalize_identifier(project.get("slug"))
-        project_name = ModrinthModsService._normalize_identifier(project.get("title"))
-        candidates = {value for value in (project_slug, project_name) if value}
+        match = ModIdentityService.match_project(installed_mods, project)
+        return match.item if isinstance(match.item, dict) else None
 
-        for mod in installed_mods:
-            if project_id and project_id in {mod.get("id"), mod.get("modrinth_project_id")}:
-                return mod
+    def match_installed(
+        self,
+        installed_items: list[dict[str, Any]],
+        project: dict[str, Any],
+    ) -> ModMatch:
+        return self.identity.match_project(installed_items, project)
 
-            installed_values = {
-                ModrinthModsService._normalize_identifier(mod.get("name")),
-                ModrinthModsService._normalize_identifier(mod.get("filename")),
-            }
-            for installed_value in installed_values:
-                if not installed_value:
-                    continue
-                if any(
-                    installed_value == candidate or installed_value.startswith(f"{candidate}-")
-                    for candidate in candidates
-                ):
-                    return mod
-
-        return None
+    @staticmethod
+    def owns_installed_item(installed_item: dict[str, Any] | None, project_id: str) -> bool:
+        return ModIdentityService.owns_item(installed_item, project_id)
 
     @staticmethod
     def _normalize_identifier(value: Any) -> str:
-        text = str(value or "").strip().lower()
-        if text.endswith(".disabled"):
-            text = text[:-9]
-        for suffix in (".jar", ".zip"):
-            if text.endswith(suffix):
-                text = text[: -len(suffix)]
-        return "-".join(part for part in text.replace("_", "-").split() if part)
+        return ModIdentityService.normalize_identifier(value)
 
     def filter_compatible_versions(
         self,
@@ -519,29 +569,10 @@ class ModrinthModsService:
                 exact_version = ModrinthAPI.get_version_by_id(version_id)
             except Exception:
                 exact_version = None
-            if exact_version is not None:
-                project_id = project_id or str(exact_version.get("project_id") or "")
-                if self.filter_compatible_versions(
-                    [exact_version],
-                    version,
-                    project_type=project_type,
-                    game_version=game_version,
-                ):
-                    version_data = exact_version
-            if version_data is None and project_id:
-                version_data = self._select_newest_version(
-                    self._get_compatible_versions_safely(
-                        project_id,
-                        version,
-                        project_type=project_type,
-                        game_version=game_version,
-                    )
-                )
-            if version_data is None:
-                code = "dependency_resolution_failed" if exact_version is None else "dependency_incompatible"
+            if not isinstance(exact_version, dict) or str(exact_version.get("id") or "") != version_id:
                 issues.append(
                     self._issue_for_dependency(
-                        code,
+                        "dependency_resolution_failed",
                         dependency,
                         requested_by,
                         blocking=blocking,
@@ -550,6 +581,40 @@ class ModrinthModsService:
                     )
                 )
                 return None
+
+            exact_project_id = str(exact_version.get("project_id") or "")
+            if not exact_project_id or (project_id and exact_project_id != project_id):
+                issues.append(
+                    self._issue_for_dependency(
+                        "dependency_project_mismatch",
+                        dependency,
+                        requested_by,
+                        blocking=blocking,
+                        project_id=project_id or exact_project_id or None,
+                        version_id=version_id,
+                    )
+                )
+                return None
+
+            project_id = exact_project_id
+            if not self.filter_compatible_versions(
+                [exact_version],
+                version,
+                project_type=project_type,
+                game_version=game_version,
+            ):
+                issues.append(
+                    self._issue_for_dependency(
+                        "dependency_incompatible",
+                        dependency,
+                        requested_by,
+                        blocking=blocking,
+                        project_id=project_id,
+                        version_id=version_id,
+                    )
+                )
+                return None
+            version_data = exact_version
         elif project_id:
             versions = self._get_compatible_versions_safely(
                 project_id,
@@ -577,6 +642,19 @@ class ModrinthModsService:
                     requested_by,
                     file_name=file_name or None,
                     blocking=blocking,
+                )
+            )
+            return None
+
+        if version_data is None:
+            issues.append(
+                self._issue_for_dependency(
+                    "dependency_resolution_failed",
+                    dependency,
+                    requested_by,
+                    blocking=blocking,
+                    project_id=project_id or None,
+                    version_id=version_id or None,
                 )
             )
             return None
@@ -644,9 +722,10 @@ class ModrinthModsService:
             project,
             fallback_project_id=str(version_data.get("project_id") or ""),
         )
-        installed_item = self.find_installed(installed_items, normalized_project)
+        installed_match = self.match_installed(installed_items, normalized_project)
+        installed_item = installed_match.item if isinstance(installed_match.item, dict) else None
         action = self._candidate_action(
-            installed_item,
+            installed_match,
             version_data,
             version,
             project_type=project_type,
@@ -660,18 +739,22 @@ class ModrinthModsService:
             dependency_type=dependency_type,
             requested_by=requested_by,
             installed_item=installed_item,
+            installed_match=installed_match,
         )
 
     def _candidate_action(
         self,
-        installed_item: dict[str, Any] | None,
+        installed_match: ModMatch,
         candidate_version: dict[str, Any],
         version,
         *,
         project_type: str,
         game_version: str | None,
     ) -> str:
+        installed_item = installed_match.item
         if installed_item is None:
+            return "install"
+        if not installed_match.owned:
             return "install"
         if not installed_item.get("enabled", True):
             return "replace"
@@ -712,8 +795,8 @@ class ModrinthModsService:
             if not project_id:
                 continue
             project = self._load_project(project_id)
-            installed_item = self.find_installed(installed_items, project)
-            if installed_item is None and project_id not in planned_project_ids:
+            installed_match = self.match_installed(installed_items, project)
+            if not installed_match.owned and project_id not in planned_project_ids:
                 continue
             issues.append(
                 self._issue_for_dependency(

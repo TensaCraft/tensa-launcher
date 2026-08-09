@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import threading
+from types import SimpleNamespace
 
 import flet as ft
 

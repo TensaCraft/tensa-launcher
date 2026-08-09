@@ -88,6 +88,8 @@ class MinecraftProfileBuilder:
     @staticmethod
     def is_token_fresh(profile: dict[str, Any], *, leeway: int = 300) -> bool:
         exp = profile.get("expires_at")
+        if exp is None:
+            return False
         try:
             exp_int = int(exp)
         except (TypeError, ValueError):

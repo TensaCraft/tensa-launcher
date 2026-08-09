@@ -10,7 +10,6 @@ from .palette import UiPalette
 from .scale import UiScale
 from .tokens import UiTokens
 
-
 _CURRENT_THEME: "UiTheme | None" = None
 
 

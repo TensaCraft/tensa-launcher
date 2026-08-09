@@ -4,6 +4,7 @@ import minecraft_launcher_lib
 
 from launcher.application.feedback import OperationHandle
 from launcher.core.versions import Version
+
 from .base import BaseLoader
 
 
@@ -29,10 +30,13 @@ class MinecraftLoader(BaseLoader):
         else:
             self._feedback_operation = operation
         try:
-            self._install_minecraft_if_needed(version.version, operation=operation)
+            minecraft_version = str(version.version or "").strip()
+            if not minecraft_version:
+                raise ValueError("Minecraft version is missing")
+            self._install_minecraft_if_needed(minecraft_version, operation=operation)
 
             version.path = str(self.get_game_path(version.version_id))
-            version.loader = version.version
+            version.loader = minecraft_version
             version.client = self.get_name()
             version.save()
 

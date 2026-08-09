@@ -681,6 +681,23 @@ def test_launch_passes_assets_dir_to_flet(monkeypatch, tmp_path: Path):
     assert captured["view"] == ft.AppView.FLET_APP_HIDDEN
 
 
+def test_resource_service_prefers_flet_assets_dir(monkeypatch, tmp_path: Path):
+    from launcher.platform.resources import ResourceService
+
+    assets_dir = tmp_path / "flet-assets"
+    image_dir = assets_dir / "img"
+    image_dir.mkdir(parents=True)
+    background = image_dir / "bg.png"
+    background.write_bytes(b"png")
+
+    monkeypatch.setenv("FLET_ASSETS_DIR", str(assets_dir))
+
+    service = ResourceService(path_service=None)
+
+    assert service.get_resource_path("assets", "img", "bg.png") == background
+    assert service.get_background_path() == background
+
+
 def test_launch_retries_flet_client_cache_race_once(monkeypatch, tmp_path: Path):
     from launcher.main import launch
 
@@ -1132,7 +1149,7 @@ def test_state_store_restores_saved_minecraft_dir_from_config(monkeypatch, tmp_p
     monkeypatch.setattr("launcher.state.Auth", lambda _app: "auth")
     monkeypatch.setattr("launcher.state.Profiles", lambda _app, **_kwargs: "profiles")
     monkeypatch.setattr("launcher.state.AutoUpdater", lambda _app: "updater")
-    monkeypatch.setattr("launcher.state.Versions", SimpleNamespace(_instance=None, instance=lambda: "versions"))
+    monkeypatch.setattr("launcher.state.Versions", lambda **_kwargs: "versions")
     monkeypatch.setattr("launcher.core.Launcher", FakeLauncher)
 
     state = StateStore.build(fake_app)
@@ -1184,7 +1201,7 @@ def test_state_store_repairs_saved_runtime_package_minecraft_dir(monkeypatch, tm
     monkeypatch.setattr("launcher.state.Auth", lambda _app: "auth")
     monkeypatch.setattr("launcher.state.Profiles", lambda _app, **_kwargs: "profiles")
     monkeypatch.setattr("launcher.state.AutoUpdater", lambda _app: "updater")
-    monkeypatch.setattr("launcher.state.Versions", SimpleNamespace(_instance=None, instance=lambda: "versions"))
+    monkeypatch.setattr("launcher.state.Versions", lambda **_kwargs: "versions")
     monkeypatch.setattr("launcher.core.Launcher", FakeLauncher)
 
     state = StateStore.build(fake_app)
@@ -1199,10 +1216,7 @@ def test_versions_store_uses_configured_state_and_minecraft_dirs(tmp_path: Path)
     version_dir = minecraft_dir / "games" / "demo"
     version_dir.mkdir(parents=True)
 
-    Versions._instance = None
-    Versions.configure(storage_dir=state_root, minecraft_dir=minecraft_dir)
-
-    store = Versions.instance()
+    store = Versions(storage_dir=state_root, minecraft_dir=minecraft_dir)
     store.add(Version("demo", {"name": "Demo", "path": "games/demo"}))
 
     assert (state_root / "versions.json").is_file()
@@ -1239,9 +1253,9 @@ def test_state_files_use_app_state_dir_not_package_dir(monkeypatch, tmp_path: Pa
         },
     )
 
-    Versions._instance = None
-    Versions.configure(storage_dir=state_root, minecraft_dir=minecraft_dir)
-    Versions.instance().add(Version("demo", {"name": "Demo", "path": "games/demo"}))
+    Versions(storage_dir=state_root, minecraft_dir=minecraft_dir).add(
+        Version("demo", {"name": "Demo", "path": "games/demo"})
+    )
 
     monkeypatch.setattr(
         LauncherPaths,

@@ -246,9 +246,8 @@ class SystemService:
 
     def check_connection(self, timeout: float = 2.0) -> bool:
         try:
-            socket.setdefaulttimeout(timeout)
             host = socket.gethostbyname(CONNECTION_TEST_HOST)
-            with socket.create_connection((host, CONNECTION_TEST_PORT), timeout):
+            with socket.create_connection((host, CONNECTION_TEST_PORT), timeout=timeout):
                 return True
         except OSError:
             return False

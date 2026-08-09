@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import re
 import sys
 import threading
 from pathlib import Path
@@ -20,6 +21,16 @@ class LauncherReportService:
     REQUEST_TIMEOUT = 15
     INLINE_LOG_LIMIT_BYTES = 1024 * 1024
     FILE_TAIL_LIMIT_BYTES = 256 * 1024
+    _SECRET_PATTERNS = (
+        re.compile(r"(?i)(authorization\s*:\s*bearer\s+)([^\s]+)"),
+        re.compile(r"(?i)(--accessToken\s+)([^\s]+)"),
+        re.compile(
+            r"""(?ix)
+            (["']?(?:access[_-]?token|refresh[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["']?)
+            ([^"',\s}]+)
+            """
+        ),
+    )
 
     def __init__(self, app, session: Optional[requests.Session] = None) -> None:
         self.app = app
@@ -108,7 +119,8 @@ class LauncherReportService:
             merged_metadata.update(self._sanitize_metadata(metadata))
 
         log_text = log if log is not None else self.collect_log_text(attachments=attachments)
-        log_text = self._truncate_utf8(log_text or message or title, self.INLINE_LOG_LIMIT_BYTES)
+        log_text = self._redact_text(log_text or message or title)
+        log_text = self._truncate_utf8(log_text, self.INLINE_LOG_LIMIT_BYTES)
 
         contact = self._report_contact()
         if contact:
@@ -120,8 +132,8 @@ class LauncherReportService:
             "platform": self._platform_name(),
             "launcher_version": str(getattr(getattr(self.app, "util", None), "launcher_version", "")),
             "os": platform.platform(),
-            "title": str(title or "Launcher report"),
-            "message": str(message or ""),
+            "title": self._redact_text(str(title or "Launcher report")),
+            "message": self._redact_text(str(message or "")),
             "log": log_text,
             "metadata": merged_metadata,
         }
@@ -131,12 +143,19 @@ class LauncherReportService:
 
     def collect_log_text(self, *, attachments: Optional[Iterable[str | Path]] = None) -> str:
         parts: list[str] = []
+        included: set[Path] = set()
+        for attachment in attachments or ():
+            attachment_path = Path(attachment).resolve(strict=False)
+            if attachment_path in included:
+                continue
+            included.add(attachment_path)
+            self._append_file_tail(parts, f"diagnostic file: {attachment_path.name}", attachment_path)
+
         launcher_log = getattr(Logger, "log_file", None)
         if launcher_log:
-            self._append_file_tail(parts, "launcher app.log", Path(launcher_log))
-
-        for attachment in attachments or ():
-            self._append_file_tail(parts, f"diagnostic file: {attachment}", Path(attachment))
+            launcher_path = Path(launcher_log).resolve(strict=False)
+            if launcher_path not in included:
+                self._append_file_tail(parts, "launcher app.log", launcher_path)
 
         return "\n\n".join(part for part in parts if part).strip()
 
@@ -144,7 +163,7 @@ class LauncherReportService:
         text = self._read_tail(path, self.FILE_TAIL_LIMIT_BYTES)
         if not text:
             return
-        parts.append(f"--- {label} ({path}) ---\n{text}")
+        parts.append(f"--- {label} ---\n{text}")
 
     @staticmethod
     def _read_tail(path: Path, limit_bytes: int) -> str:
@@ -192,11 +211,14 @@ class LauncherReportService:
         for key, value in metadata.items():
             if value is None:
                 continue
-            if isinstance(value, (str, int, float, bool)):
+            if isinstance(value, str):
+                sanitized[str(key)] = LauncherReportService._redact_text(value)
+                continue
+            if isinstance(value, (int, float, bool)):
                 sanitized[str(key)] = value
                 continue
             if isinstance(value, Path):
-                sanitized[str(key)] = value.as_posix()
+                sanitized[str(key)] = LauncherReportService._redact_text(value.as_posix())
                 continue
             if isinstance(value, (list, tuple)):
                 sanitized[str(key)] = [LauncherReportService._sanitize_value(item) for item in value]
@@ -213,10 +235,12 @@ class LauncherReportService:
 
     @staticmethod
     def _sanitize_value(value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, float, bool)):
+        if value is None or isinstance(value, (int, float, bool)):
             return value
+        if isinstance(value, str):
+            return LauncherReportService._redact_text(value)
         if isinstance(value, Path):
-            return value.as_posix()
+            return LauncherReportService._redact_text(value.as_posix())
         if isinstance(value, (list, tuple)):
             return [LauncherReportService._sanitize_value(item) for item in value]
         if isinstance(value, dict):
@@ -225,7 +249,18 @@ class LauncherReportService:
                 for key, child_value in value.items()
                 if child_value is not None
             }
-        return str(value)
+        return LauncherReportService._redact_text(str(value))
+
+    @classmethod
+    def _redact_text(cls, text: str) -> str:
+        redacted = text
+        home = str(Path.home())
+        for value in {home, home.replace("\\", "/")}:
+            if value:
+                redacted = re.sub(re.escape(value), "<USER_HOME>", redacted, flags=re.IGNORECASE)
+        for pattern in cls._SECRET_PATTERNS:
+            redacted = pattern.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
+        return redacted
 
     @staticmethod
     def _truncate_utf8(text: str, limit_bytes: int) -> str:

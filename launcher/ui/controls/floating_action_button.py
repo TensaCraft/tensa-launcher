@@ -4,8 +4,8 @@ from typing import Any
 
 import flet as ft
 
-from ..core.flet_compat import filter_control_kwargs
 from ..core.click_sound import wrap_click_handler
+from ..core.flet_compat import filter_control_kwargs
 from ..theme import current_theme
 
 

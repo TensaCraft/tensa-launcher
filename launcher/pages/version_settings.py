@@ -10,6 +10,7 @@ from launcher.application.java_runtime import JavaRuntimeService
 from launcher.application.memory_preferences import MemoryPreferencesService
 from launcher.application.version_options import VersionOptionsPayload
 from launcher.core import util
+from launcher.pages.mod_diagnostics import ModDiagnosticsController
 from launcher.ui.core.page_runtime import schedule_update
 
 
@@ -21,7 +22,15 @@ class VersionSettingsPage:
         ("arguments", "version_section_arguments", ft.Icons.TERMINAL_OUTLINED),
     )
 
-    def __init__(self, app, version_key: str, *, embedded: bool = False, on_saved=None, initial_tab: str = "general"):
+    def __init__(
+        self,
+        app,
+        version_key: str,
+        *,
+        embedded: bool = False,
+        on_saved=None,
+        initial_tab: str = "general",
+    ):
         self.app = app
         self.page = app.page
         self.version = app.versions.get(version_key)
@@ -33,6 +42,18 @@ class VersionSettingsPage:
         self.active_tab = self._normalize_tab(initial_tab)
         self.footer_save_button = self._build_save_button()
 
+        self._configure_shell(version_key)
+        if not self.version:
+            self._build_missing_version_content()
+            return
+
+        self._build_initial_controls()
+        self._build_icon_controls()
+        self._build_diagnostic_controls()
+        self._expand_controls()
+        self.content = self._build_content()
+
+    def _configure_shell(self, version_key: str) -> None:
         title_value = (self.version.name if self.version else None) or version_key
         if not self.embedded:
             self.app.header.set_params(
@@ -46,31 +67,43 @@ class VersionSettingsPage:
                 right_btn=False,
             )
 
-        if not self.version:
-            self.content = ui.Container(
-                content=ui.Text(
-                    self.app.trans("version_not_found"),
-                    color=self.app.theme.text_color,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                alignment=ft.Alignment.CENTER,
-            )
-            if not self.embedded:
-                self.app.feedback.warning(self.app.trans("version_not_found"))
-            return
+    def _build_missing_version_content(self) -> None:
+        self.content = ui.Container(
+            content=ui.Text(
+                self.app.trans("version_not_found"),
+                color=self.app.theme.text_color,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            alignment=ft.Alignment.CENTER,
+        )
+        if not self.embedded:
+            self.app.feedback.warning(self.app.trans("version_not_found"))
 
+    def _build_initial_controls(self) -> None:
         jvm_arguments = list(self.version.jvm_args())
-        xmx, xms = self.app.version_options.parse_jvm_arguments(jvm_arguments)
-        custom_args = self.app.version_options.extract_custom_arguments(jvm_arguments)
+        max_ram_gb, _min_ram_gb = self.app.version_options.parse_jvm_arguments(jvm_arguments)
+        custom_arguments = tuple(self.app.version_options.extract_custom_arguments(jvm_arguments))
         self.memory_limits = MemoryPreferencesService.detect_limits()
-
-        loader_items = [
-            {"text": loader.get("id"), "key": loader.get("id")}
+        loader_ids = tuple(
+            loader.get("id")
             for loader in minecraft_launcher_lib.utils.get_installed_versions(
                 str(self._minecraft_dir())
             )
-        ]
+        )
+        selected_java_path = self.version.options.get("executablePath", "")
+        server_config = (self.version.options or {}).get("server") or {}
+        self._build_name_control()
+        self._build_memory_controls(max_ram_gb)
+        self._build_java_controls(selected_java_path)
+        self._build_loader_control(loader_ids)
+        self._build_server_controls(
+            str(server_config.get("host", "")),
+            str(server_config["port"]) if server_config.get("port") is not None else "",
+        )
+        self._build_gpu_control((self.version.options or {}).get("gpuMode", "dgpu"))
+        self._build_argument_controls(custom_arguments)
 
+    def _build_name_control(self) -> None:
         self.name = ui.build_field(
             self.app,
             ui.FieldSpec(
@@ -83,12 +116,13 @@ class VersionSettingsPage:
             on_change=lambda _e: None,
         )
 
+    def _build_memory_controls(self, initial_max_ram_gb: int | None) -> None:
         default_max_ram = MemoryPreferencesService.normalize_max_ram_gb(
             self.app.config.get("default_max_ram_gb"),
             limits=self.memory_limits,
         )
         max_ram_gb = MemoryPreferencesService.normalize_max_ram_gb(
-            xmx,
+            initial_max_ram_gb,
             limits=self.memory_limits,
             default=default_max_ram,
         )
@@ -112,10 +146,10 @@ class VersionSettingsPage:
             slider=self.max_ram_slider,
         )
 
+    def _build_java_controls(self, selected_java_path: Any) -> None:
         available_java_versions = JavaPreferencesService.normalize_entries(
             self.app.config.get(JavaPreferencesService.CUSTOM_CONFIG_KEY, [])
         )
-        selected_java_path = self.version.options.get("executablePath", "")
         java_options = [{"text": self.app.trans("java_launcher_default"), "key": self.AUTO_JAVA_VALUE}] + [
             {"text": ver, "key": path}
             for java_ver in available_java_versions
@@ -155,6 +189,8 @@ class VersionSettingsPage:
             size=self.app.theme.text_size_sm,
         )
 
+    def _build_loader_control(self, loader_ids: tuple[Any, ...]) -> None:
+        loader_items = [{"text": loader_id, "key": loader_id} for loader_id in loader_ids]
         self.loaders_select = ui.build_field(
             self.app,
             ui.FieldSpec(
@@ -168,15 +204,14 @@ class VersionSettingsPage:
             on_change=lambda _e: None,
         )
 
-        # ---------- NEW: server quick-start fields ----------
-        server_cfg = (self.version.options or {}).get("server") or {}
+    def _build_server_controls(self, server_host: str, server_port: str) -> None:
         self.server_host = ui.build_field(
             self.app,
             ui.FieldSpec(
                 type="textfield",
                 key="server_host",
                 label=self.app.trans("server_host_label") or "Server host",
-                value=str(server_cfg.get("host", "")),
+                value=server_host,
                 width=None,
             ),
             on_change=lambda _e: None,
@@ -187,16 +222,14 @@ class VersionSettingsPage:
                 type="textfield",
                 key="server_port",
                 label=self.app.trans("server_port_label") or "Port",
-                value=str(server_cfg.get("port", "")) if server_cfg.get("port") is not None else "",
+                value=server_port,
                 width=None,
                 props={"input_filter": ft.NumbersOnlyInputFilter()},
             ),
             on_change=lambda _e: None,
         )
-        # ----------------------------------------------------
 
-        # ---------- NEW: GPU mode selector ----------
-        gpu_mode_value = (self.version.options or {}).get("gpuMode", "dgpu")
+    def _build_gpu_control(self, gpu_mode: Any) -> None:
         gpu_mode_options = [
             {"text": self.app.trans("gpu_mode_auto") or "Auto", "key": "auto"},
             {"text": self.app.trans("gpu_mode_integrated") or "Integrated (iGPU)", "key": "igpu"},
@@ -208,14 +241,14 @@ class VersionSettingsPage:
                 type="dropdown",
                 key="gpu_mode",
                 label=self.app.trans("gpu_mode_label") or "GPU mode",
-                value=gpu_mode_value,
+                value=gpu_mode,
                 options=gpu_mode_options,
                 width=None,
             ),
             on_change=lambda _e: None,
         )
-        # --------------------------------------------
 
+    def _build_argument_controls(self, custom_arguments: tuple[str, ...]) -> None:
         preset_options, self._preset_args = self.app.version_options.build_preset_options(self.app.trans)
         self.jvm_preset_select = ui.build_field(
             self.app,
@@ -236,7 +269,7 @@ class VersionSettingsPage:
                 type="textfield",
                 key="custom_args",
                 label="",
-                value="\n".join(custom_args),
+                value="\n".join(custom_arguments),
                 props={
                     "multiline": True,
                     "min_lines": self.app.theme.jvm_args_min_lines,
@@ -261,6 +294,7 @@ class VersionSettingsPage:
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
+    def _build_icon_controls(self) -> None:
         self.file_picker = ui.FilePicker(page=self.page, on_result=self.on_file_picker_result)
 
         self.selected_file_text = self.app.trans("select_icon")
@@ -274,6 +308,7 @@ class VersionSettingsPage:
             height=self.app.theme.input_height,
         )
 
+    def _build_diagnostic_controls(self) -> None:
         self.open_instance_button = self._diagnostic_button(
             "open_version_folder",
             ft.Icons.FOLDER_OPEN,
@@ -312,7 +347,10 @@ class VersionSettingsPage:
             width=None,
             on_click=lambda _e: self._open_version_report_dialog(),
         )
+        self.mod_diagnostics = ModDiagnosticsController(self.app, self.version, self._version_root)
+        self.scan_mods_button = self.mod_diagnostics.button
 
+    def _expand_controls(self) -> None:
         self.layout.expand_controls(
             self.name,
             self.java_select,
@@ -333,12 +371,17 @@ class VersionSettingsPage:
             self.open_latest_crash_button,
             self.open_launch_log_button,
             self.send_version_report_button,
+            self.scan_mods_button,
         )
-
-        self.content = self._build_content()
 
     def view(self):
         return self.content
+
+    def before_hide(self) -> None:
+        if not self.version:
+            return
+        self.mod_diagnostics.dispose()
+        self.file_picker.dispose()
 
     def _build_save_button(self) -> ft.Control:
         return ui.Button(
@@ -482,6 +525,7 @@ class VersionSettingsPage:
                     self.layout.wrap_control(self.open_latest_crash_button, {"sm": 12, "md": 6, "lg": 4}),
                     self.layout.wrap_control(self.open_launch_log_button, {"sm": 12, "md": 6, "lg": 4}),
                     self.layout.wrap_control(self.send_version_report_button, {"sm": 12, "md": 6, "lg": 4}),
+                    self.layout.wrap_control(self.scan_mods_button, {"sm": 12, "md": 6, "lg": 4}),
                 ],
             )
         )

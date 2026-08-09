@@ -7,19 +7,22 @@ from typing import Dict, Optional
 import flet as ft
 
 from launcher import ui
+from launcher.application.modrinth_content_install import (
+    ModrinthContentBackupError,
+    ModrinthContentGameRunning,
+    ModrinthContentInstallBusy,
+    ModrinthContentInstaller,
+)
 from launcher.application.modrinth_mods import (
     ModrinthDependencyIssue,
     ModrinthDependencyPlan,
     ModrinthInstallCandidate,
 )
-from launcher.core.api import ModrinthAPI
 from launcher.ui.core.page_runtime import (
     close_dialog,
     invoke_on_ui,
     run_blocking,
-    run_task,
     schedule_update,
-    show_dialog,
 )
 
 
@@ -156,28 +159,37 @@ class ModsManagerSearchMixin:
 
     def _get_modrinth_install_state(self, project: Dict) -> dict[str, bool]:
         installed_items = self.installed_items.get(self.current_content_key, [])
-        installed_item = self.app.modrinth_mods.find_installed(installed_items, project)
-        update_available = bool(
-            installed_item
-            and installed_item.get("modrinth_version_id")
-            and project.get("latest_version")
-            and installed_item.get("modrinth_version_id") != project.get("latest_version")
-        )
-        return {"installed": installed_item is not None, "update_available": update_available}
+        match = self.app.modrinth_mods.match_installed(installed_items, project)
+        installed_item = match.item
+        update_available = bool(installed_item and installed_item.get("update_available"))
+        return {
+            "installed": match.owned,
+            "update_available": match.owned and update_available,
+        }
 
     def _install_mod(self, mod: Dict):
         if self.content_installing or self.app.feedback.is_busy():
             self.app.feedback.info(self.trans("installation_already_running"))
             return
         context = self._content_context()
+        self._schedule_modrinth_install(
+            self.trans(context["config"]["installing_key"], name=mod.get("title", "content")),
+            self._install_mod_async,
+            mod,
+            context,
+        )
+
+    def _schedule_modrinth_install(self, message: str, handler, *args):
         self.content_installing = True
-        self.app.feedback.info(self.trans(context["config"]["installing_key"], name=mod.get("title", "content")))
+        self.app.feedback.info(message)
         try:
-            run_task(self.page, self._install_mod_async, mod, context)
+            task = self._run_session_task(handler, *args)
         except Exception:
             self.content_installing = False
             self.app.feedback.warning(self.trans("installation_failed"))
             raise
+        if task is None:
+            self.content_installing = False
 
     async def _install_mod_async(self, mod: Dict, context: dict | None = None):
         context = context or self._content_context()
@@ -235,311 +247,73 @@ class ModsManagerSearchMixin:
             f"{main.version_number} for MC {game_version} {loader or ''}"
         )
 
-        for candidate in plan.install_order_with_optional(selected_optional_dependencies):
-            await self._download_modrinth_candidate(candidate, context)
+        await self._install_modrinth_candidates_transaction(
+            plan.install_order_with_optional(selected_optional_dependencies),
+            context,
+        )
 
         self.app.feedback.info(
             self.trans(context["config"]["installed_key"], name=main.title)
         )
-        self._rebuild_installed_content(context["key"])
+        if context["key"] == "mods":
+            await self._refresh_installed_mods_after_mutation()
+        else:
+            self._rebuild_installed_content(context["key"])
         self._refresh_visible_modrinth_search_results()
 
     async def _download_modrinth_candidate(self, candidate: ModrinthInstallCandidate, context: dict) -> Path | None:
         if candidate.action == "satisfied":
             return None
+        installed = await self._install_modrinth_candidates_transaction([candidate], context)
+        return installed.get(candidate.project_id)
 
-        target_dir = context["directory"]
-        if target_dir is None:
-            self.app.feedback.warning(self.trans("content_directory_unavailable"))
-            return None
-
-        destination = target_dir / candidate.install_file.filename
-        temporary_destination = destination.with_name(f".{destination.name}.download")
-        if temporary_destination.exists():
-            temporary_destination.unlink()
-        installed_item = candidate.installed_item
-        try:
-            await run_blocking(
-                ModrinthAPI.download_mod_file,
-                candidate.install_file.url,
-                str(temporary_destination),
-            )
-            temporary_destination.replace(destination)
-            if installed_item and installed_item.get("path"):
-                old_path = Path(installed_item["path"])
-                if old_path.exists() and old_path != destination:
-                    old_path.unlink()
-        except Exception:
-            if temporary_destination.exists():
-                temporary_destination.unlink()
-            raise
-        self.app.content.record_modrinth_content(
-            self.version,
-            context["key"],
-            destination,
-            candidate.project,
-            candidate.version_data,
-            candidate.install_file,
+    async def _install_modrinth_candidates_transaction(
+        self,
+        candidates: list[ModrinthInstallCandidate],
+        context: dict,
+    ) -> dict[str, Path]:
+        return await run_blocking(
+            self._install_modrinth_candidates_transaction_worker,
+            candidates,
+            context,
         )
-        return destination
+
+    def _install_modrinth_candidates_transaction_worker(
+        self,
+        candidates: list[ModrinthInstallCandidate],
+        context: dict,
+    ) -> dict[str, Path]:
+        target_dir = context.get("directory")
+        if target_dir is None:
+            raise FileNotFoundError(self.trans("content_directory_unavailable"))
+        installer = ModrinthContentInstaller(
+            self.app.content,
+            self.app.modrinth_mods,
+            instance_operations=getattr(self.app, "instance_operations", None),
+        )
+        try:
+            return installer.install(
+                self.version,
+                candidates,
+                content_key=context["key"],
+                target_dir=Path(target_dir),
+            )
+        except ModrinthContentInstallBusy as exc:
+            raise RuntimeError(
+                self.trans("instance_operation_busy", version=self.version.name)
+            ) from exc
+        except ModrinthContentGameRunning as exc:
+            raise RuntimeError(
+                self.trans("instance_game_running", version=self.version.name)
+            ) from exc
+        except ModrinthContentBackupError as exc:
+            raise RuntimeError(self.trans("backup_failed")) from exc
 
     def _warn_modrinth_plan_failure(self, plan: ModrinthDependencyPlan):
         if plan.blocking_issues:
             self.app.feedback.warning(self._format_modrinth_dependency_issue(plan.blocking_issues[0]))
             return
         self.app.feedback.warning(self.trans("installation_failed"))
-
-    def _show_modrinth_dependency_plan_dialog(self, plan: ModrinthDependencyPlan, context: dict):
-        theme = self.app.theme
-        main_name = plan.main.title if plan.main is not None else self.trans("modrinth_content_tab")
-        optional_options: list[tuple[ModrinthInstallCandidate, ft.Checkbox]] = []
-        content_controls: list[ft.Control] = [
-            ui.Text(
-                self.trans("modrinth_dependencies_message", name=main_name),
-                color=theme.text_secondary,
-                size=theme.text_size_sm,
-            )
-        ]
-
-        if plan.dependencies_to_install:
-            content_controls.extend(
-                self._modrinth_dependency_candidate_section(
-                    "modrinth_dependencies_to_install",
-                    plan.dependencies_to_install,
-                    replace=False,
-                )
-            )
-        if plan.dependencies_to_replace:
-            content_controls.extend(
-                self._modrinth_dependency_candidate_section(
-                    "modrinth_dependencies_to_replace",
-                    plan.dependencies_to_replace,
-                    replace=True,
-                )
-            )
-        if plan.already_satisfied:
-            content_controls.extend(
-                self._modrinth_dependency_candidate_section(
-                    "modrinth_dependencies_satisfied",
-                    plan.already_satisfied,
-                    replace=False,
-                )
-            )
-        if plan.optional_dependencies:
-            content_controls.extend(
-                self._modrinth_optional_dependency_section(
-                    plan.optional_dependencies,
-                    optional_options,
-                )
-            )
-        if plan.optional_dependency_issues:
-            content_controls.extend(
-                self._modrinth_dependency_issue_section(
-                    "modrinth_dependencies_optional_unavailable",
-                    plan.optional_dependency_issues,
-                )
-            )
-        if plan.skipped_embedded:
-            content_controls.extend(
-                self._modrinth_dependency_issue_section(
-                    "modrinth_dependencies_embedded",
-                    plan.skipped_embedded,
-                )
-            )
-        if plan.blocking_issues:
-            content_controls.extend(
-                self._modrinth_dependency_issue_section(
-                    "modrinth_dependencies_blocked",
-                    plan.blocking_issues,
-                )
-            )
-
-        actions: list[ft.Control] = []
-        if plan.can_install:
-            actions.append(
-                ui.Button(
-                    text=self.trans("modrinth_dependencies_install"),
-                    icon=ft.Icons.DOWNLOAD,
-                    on_click=lambda _e: self._confirm_modrinth_dependency_plan(
-                        plan,
-                        context,
-                        [
-                            candidate
-                            for candidate, checkbox in optional_options
-                            if bool(getattr(checkbox, "value", False))
-                        ],
-                    ),
-                )
-            )
-            close_text = self.trans("cancel")
-        else:
-            close_text = self.trans("close")
-        actions.append(
-            ui.Button(
-                text=close_text,
-                variant="outline",
-                tone="neutral",
-                on_click=lambda _e: self._close_modrinth_dependency_dialog(),
-            )
-        )
-
-        self.modrinth_dependency_dialog = ui.AlertDialog(
-            title=ui.Text(
-                self.trans("modrinth_dependencies_title"),
-                color=theme.text_color,
-                weight=theme.font_weight_bold,
-            ),
-            modal=True,
-            content=ui.Column(
-                content_controls,
-                width=theme.modal_width,
-                height=min(theme.modal_height, 520),
-                spacing=theme.spacing_md,
-                scroll=ft.ScrollMode.AUTO,
-            ),
-            actions=actions,
-        )
-        show_dialog(self.page, self.modrinth_dependency_dialog)
-        schedule_update(self.page)
-
-    def _modrinth_dependency_candidate_section(
-        self,
-        title_key: str,
-        candidates: list[ModrinthInstallCandidate],
-        *,
-        replace: bool,
-    ) -> list[ft.Control]:
-        theme = self.app.theme
-        rows: list[ft.Control] = []
-        for candidate in candidates:
-            if replace:
-                installed = candidate.installed_item or {}
-                current = (
-                    installed.get("modrinth_version_number")
-                    or installed.get("version")
-                    or installed.get("filename")
-                    or self.trans("unknown")
-                )
-                line = self.trans(
-                    "modrinth_dependency_replace_line",
-                    name=candidate.title,
-                    current=current,
-                    new=candidate.version_number or candidate.install_file.filename,
-                )
-            else:
-                line = self.trans(
-                    "modrinth_dependency_install_line",
-                    name=candidate.title,
-                    version=candidate.version_number or candidate.install_file.filename,
-                )
-            rows.append(self._modrinth_dependency_candidate_row(candidate, line))
-        return [self._modrinth_dependency_section_panel(title_key, rows, accent=theme.primary if replace else theme.info)]
-
-    def _modrinth_optional_dependency_section(
-        self,
-        candidates: list[ModrinthInstallCandidate],
-        options: list[tuple[ModrinthInstallCandidate, ft.Checkbox]],
-    ) -> list[ft.Control]:
-        theme = self.app.theme
-        rows: list[ft.Control] = []
-        for candidate in candidates:
-            if candidate.action == "replace":
-                installed = candidate.installed_item or {}
-                current = (
-                    installed.get("modrinth_version_number")
-                    or installed.get("version")
-                    or installed.get("filename")
-                    or self.trans("unknown")
-                )
-                label = self.trans(
-                    "modrinth_dependency_replace_line",
-                    name=candidate.title,
-                    current=current,
-                    new=candidate.version_number or candidate.install_file.filename,
-                )
-            else:
-                label = self.trans(
-                    "modrinth_dependency_install_line",
-                    name=candidate.title,
-                    version=candidate.version_number or candidate.install_file.filename,
-                )
-            checkbox = ui.Checkbox(value=False, label=label, expand=True)
-            options.append((candidate, checkbox))
-            rows.append(
-                ui.Row(
-                    [
-                        checkbox,
-                        self._modrinth_project_open_button(candidate.page_url),
-                    ],
-                    spacing=theme.spacing_sm,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                )
-            )
-        return [self._modrinth_dependency_section_panel("modrinth_dependencies_optional", rows, accent=theme.primary)]
-
-    def _modrinth_dependency_candidate_row(self, candidate: ModrinthInstallCandidate, line: str) -> ft.Control:
-        theme = self.app.theme
-        return ui.Row(
-            [
-                ui.Text(line, color=theme.text_secondary, size=theme.text_size_sm, expand=True),
-                self._modrinth_project_open_button(candidate.page_url),
-            ],
-            spacing=theme.spacing_sm,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
-
-    def _modrinth_dependency_issue_section(
-        self,
-        title_key: str,
-        issues: list[ModrinthDependencyIssue],
-    ) -> list[ft.Control]:
-        theme = self.app.theme
-        rows: list[ft.Control] = []
-        for issue in issues:
-            rows.append(
-                ui.Row(
-                    [
-                        ui.Text(
-                            self._format_modrinth_dependency_issue(issue),
-                            color=theme.error if issue.blocking else theme.text_secondary,
-                            size=theme.text_size_sm,
-                            expand=True,
-                        ),
-                        self._modrinth_project_open_button(issue.project_url),
-                    ],
-                    spacing=theme.spacing_sm,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                )
-            )
-        accent = theme.error if any(issue.blocking for issue in issues) else theme.text_secondary
-        return [self._modrinth_dependency_section_panel(title_key, rows, accent=accent)]
-
-    def _modrinth_dependency_section_panel(
-        self,
-        title_key: str,
-        rows: list[ft.Control],
-        *,
-        accent: str,
-    ) -> ft.Control:
-        theme = self.app.theme
-        return ui.Container(
-            content=ui.Column(
-                [
-                    ui.Text(
-                        self.trans(title_key),
-                        color=theme.text_color,
-                        weight=theme.font_weight_semibold,
-                    ),
-                    *rows,
-                ],
-                spacing=theme.spacing_sm,
-                tight=True,
-            ),
-            bgcolor=theme.overlay(0.08, accent),
-            border=ft.Border.all(1, theme.overlay(0.28, accent)),
-            border_radius=ft.BorderRadius.all(theme.radius_sm),
-            padding=theme.padding_md,
-        )
 
     def _format_modrinth_dependency_issue(self, issue: ModrinthDependencyIssue) -> str:
         name = issue.display_name or self.trans("unknown")
@@ -563,6 +337,8 @@ class ModsManagerSearchMixin:
             return issue.message
         if issue.code == "dependency_incompatible":
             return self.trans("modrinth_dependency_incompatible_build_issue", name=name)
+        if issue.code == "dependency_project_mismatch":
+            return self.trans("modrinth_dependency_project_mismatch_issue", name=name)
         if issue.code == "dependency_no_file":
             return self.trans("modrinth_dependency_no_file_issue", name=name)
         return self.trans(
@@ -636,21 +412,14 @@ class ModsManagerSearchMixin:
             self._warn_modrinth_plan_failure(plan)
             return
 
-        self.content_installing = True
         main_name = plan.main.title if plan.main is not None else self.trans("modrinth_content_tab")
-        self.app.feedback.info(self.trans("installing_modrinth_dependencies", name=main_name))
-        try:
-            run_task(
-                self.page,
-                self._install_confirmed_modrinth_plan_async,
-                plan,
-                context,
-                selected_optional_dependencies or [],
-            )
-        except Exception:
-            self.content_installing = False
-            self.app.feedback.warning(self.trans("installation_failed"))
-            raise
+        self._schedule_modrinth_install(
+            self.trans("installing_modrinth_dependencies", name=main_name),
+            self._install_confirmed_modrinth_plan_async,
+            plan,
+            context,
+            selected_optional_dependencies or [],
+        )
 
     async def _install_confirmed_modrinth_plan_async(
         self,

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import ctypes
 import sys
 import threading
+from contextlib import contextmanager
 from typing import Iterator
-
 
 SEM_FAILCRITICALERRORS = 0x0001
 SEM_NOGPFAULTERRORBOX = 0x0002
@@ -41,6 +40,6 @@ def suppress_windows_error_dialogs() -> Iterator[None]:
         try:
             yield
         finally:
-            if thread_mode_set:
+            if thread_mode_set and callable(set_thread_error_mode):
                 set_thread_error_mode(old_thread_mode.value, None)
             kernel32.SetErrorMode(previous_mode)

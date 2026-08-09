@@ -7,7 +7,6 @@ from typing import Any
 from launcher.core.game import Game
 from launcher.core.loaders.base import BaseLoader
 from launcher.platform.paths import StorageLayout
-from launcher.shared.app_context import AppContext
 
 
 class _ConcreteLoader(BaseLoader):
@@ -30,16 +29,13 @@ def test_game_uses_app_storage_layout_for_relative_version_paths(tmp_path: Path)
         minecraft_dir=tmp_path / "minecraft",
         games_dir=tmp_path / "minecraft" / "games",
     )
-    AppContext.set(
-        SimpleNamespace(
-            paths=layout,
-            util=SimpleNamespace(minecraft_dir=tmp_path / "legacy" / "minecraft"),
-        )
+    app = SimpleNamespace(
+        paths=layout,
+        util=SimpleNamespace(minecraft_dir=tmp_path / "legacy" / "minecraft"),
     )
     version = SimpleNamespace(path="games/demo", version_id="demo", name="Demo")
 
-    assert Game.version_game_dir(version) == layout.minecraft_dir / "games" / "demo"
-    assert Game()._version_game_dir(version) == layout.minecraft_dir / "games" / "demo"
+    assert Game(app)._version_game_dir(version) == layout.minecraft_dir / "games" / "demo"
 
 
 def test_base_loader_uses_app_storage_layout_paths(tmp_path: Path) -> None:
@@ -48,17 +44,15 @@ def test_base_loader_uses_app_storage_layout_paths(tmp_path: Path) -> None:
         minecraft_dir=tmp_path / "minecraft",
         games_dir=tmp_path / "minecraft" / "games",
     )
-    AppContext.set(
-        SimpleNamespace(
-            paths=layout,
-            util=SimpleNamespace(
-                minecraft_dir=tmp_path / "legacy" / "minecraft",
-                games_path=tmp_path / "legacy" / "minecraft" / "games",
-            ),
-        )
+    app = SimpleNamespace(
+        paths=layout,
+        util=SimpleNamespace(
+            minecraft_dir=tmp_path / "legacy" / "minecraft",
+            games_path=tmp_path / "legacy" / "minecraft" / "games",
+        ),
     )
 
-    loader = _ConcreteLoader()
+    loader = _ConcreteLoader(app=app)
 
     assert loader.minecraft_dir == layout.minecraft_dir
     assert loader.install_dir == layout.games_dir

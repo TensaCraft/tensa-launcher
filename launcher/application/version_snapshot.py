@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 from typing import Any
 
+from launcher.storage.atomic import atomic_write_json
 
 COPY_SNAPSHOT_FILE = "tensalauncher-copy.json"
 COPY_SYNC_MODE = "manual"
@@ -29,9 +29,12 @@ def write_copy_snapshot(source_version, copied_version, destination: Path) -> Pa
         "source": _version_summary(source_version),
         "copy": _version_summary(copied_version),
     }
-    snapshot_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
+    atomic_write_json(
+        snapshot_path,
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
     )
     return snapshot_path
 

@@ -293,6 +293,7 @@ def test_flet_desktop_release_uses_public_artifact_api():
                 stderr="AttributeError: module 'flet_desktop' has no attribute '__get_artifact_filename'",
             )
         assert "get_artifact_filename()" in code
+        assert "importlib.metadata.version('flet-desktop')" in code
         assert kwargs["capture_output"] is True
         return subprocess.CompletedProcess(cmd, 0, "0.85.1\nflet-windows.zip\n", "")
 

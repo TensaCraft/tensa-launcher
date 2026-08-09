@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import flet as ft
 
@@ -14,14 +15,18 @@ from launcher.core.game import Game
 from launcher.pages.launch_feedback import handle_launch_response
 from launcher.pages.launch_profiles import launch_start_kwargs, launch_task_args, show_launch_profile_selector
 from launcher.presentation import ModsManagerCards
-from launcher.ui.core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
+from launcher.storage.version_store import VersionDirectoryCleanupError
+from launcher.ui.core.page_runtime import close_dialog, run_blocking, schedule_update, show_dialog
+from launcher.ui.core.session_tasks import PageSessionTasks, SessionTaskToken
 
+from .mods_manager_dependency_dialog import ModsManagerDependencyDialogMixin
 from .mods_manager_installed import ModsManagerInstalledMixin
 from .mods_manager_search import ModsManagerSearchMixin
 from .version_settings import VersionSettingsPage
 
 
 class ModsManagerPage(
+    ModsManagerDependencyDialogMixin,
     ModsManagerSearchMixin,
     ModsManagerInstalledMixin,
 ):
@@ -43,6 +48,7 @@ class ModsManagerPage(
     def __init__(self, app, version):
         self.app = app
         self.page = app.page
+        self._session_tasks = PageSessionTasks(self.page)
         self.version = version
         self.trans = self.app.trans
         self.cards = ModsManagerCards(app)
@@ -61,6 +67,7 @@ class ModsManagerPage(
         ]
 
         self.installed_items: dict[str, list[Dict]] = {key: [] for key, *_rest in self.CONTENT_TABS}
+        self.installed_search_queries: dict[str, str] = {key: "" for key in self.content_configs}
         self.installed_mods: list[Dict] = []
         self.installed_resourcepacks: list[Dict] = []
         self.installed_shaderpacks: list[Dict] = []
@@ -79,6 +86,8 @@ class ModsManagerPage(
 
         self.search_field = None
         self.search_bar = None
+        self.installed_search_input = None
+        self.installed_search_bar = None
         self.search_results_container = None
         self.search_prev_button = None
         self.search_next_button = None
@@ -91,13 +100,22 @@ class ModsManagerPage(
         self.search_result_items: list[Dict] = []
 
         self.search_state = CatalogState(limit=self.app.theme.modpacks_per_page)
-        self._is_active = False
         self._search_timer: threading.Timer | None = None
+        self._is_active = False
         self.content_installing = False
-        self.is_loading = True
+        self.is_loading = False
 
         self._setup_header()
         self._setup_ui()
+
+    def _run_session_task(
+        self,
+        task: Callable[..., Any],
+        *args: Any,
+        token: SessionTaskToken | None = None,
+        **kwargs: Any,
+    ) -> object | None:
+        return self._session_tasks.run(task, *args, token=token, **kwargs)
 
     def _build_content_configs(self) -> dict[str, dict]:
         return {
@@ -208,7 +226,7 @@ class ModsManagerPage(
             return
         try:
             args = launch_task_args(self.version, allow_duplicate, profile_key)
-            run_task(self.page, self._handle_play_async, *args)
+            self._run_session_task(self._handle_play_async, *args)
         except Exception:
             self.app.feedback.info(self.trans("installation_already_running"))
             raise
@@ -305,6 +323,14 @@ class ModsManagerPage(
         )
         self.search_input = search_parts.field
         self.search_bar = search_parts.row
+        installed_search_parts = ui.build_search_field(
+            self.app,
+            label=self.trans(config["search_key"]),
+            on_submit=self.on_installed_search_change,
+            on_change=self.on_installed_search_change,
+        )
+        self.installed_search_input = installed_search_parts.field
+        self.installed_search_bar = installed_search_parts.row
         self.search_results_container = ui.ListView(
             [],
             spacing=8,
@@ -398,7 +424,7 @@ class ModsManagerPage(
             for key, *_rest in self.CONTENT_TABS
         }
         self.screenshots_container = self.installed_containers["screenshots"]
-        self._ensure_tab_loaded(self.current_content_key, update=False)
+        self._ensure_tab_loaded(self.current_content_key, update=True)
 
         self.tab_content = ui.Container(expand=True)
         self._build_tab_bar()
@@ -462,18 +488,25 @@ class ModsManagerPage(
 
     def after_show(self):
         self._is_active = True
+        if not self.is_loading:
+            schedule_update(self.page)
 
     def before_hide(self):
         self._is_active = False
         self.search_state.cancel()
+        self.is_loading = False
         if self._search_timer is not None:
             self._search_timer.cancel()
             self._search_timer = None
+        self._session_tasks.close()
+        if self.version_settings_page is not None:
+            self.version_settings_page.before_hide()
 
     def _switch_content_tab(self, key: str):
         if key == self.current_content_key:
             return
 
+        self._cancel_installed_mods_scan()
         self.current_content_key = key
         self._normalize_inner_tab_for_content()
         if self._is_world_backups_tab():
@@ -500,6 +533,7 @@ class ModsManagerPage(
         if not self._inner_tab_available(key):
             return
 
+        self._cancel_installed_mods_scan()
         self.current_inner_tab = key
         self.inner_tab_buttons.controls = self._build_inner_tab_buttons()
         if self.current_inner_tab == "installed":
@@ -597,7 +631,13 @@ class ModsManagerPage(
         if self.current_content_key == "mods" and not self.mods_supported:
             return self._build_unavailable_content()
         self._ensure_tab_loaded(self.current_content_key, update=False)
-        return self.installed_containers[self.current_content_key]
+        if self.current_content_key not in self.content_configs:
+            return self.installed_containers[self.current_content_key]
+        return ui.Column(
+            [self.installed_search_bar, self.installed_containers[self.current_content_key]],
+            spacing=8,
+            expand=True,
+        )
 
     def _build_modrinth_panel(self):
         if self.current_content_key == "mods" and not self.mods_supported:
@@ -675,7 +715,10 @@ class ModsManagerPage(
 
     def _ensure_tab_loaded(self, key: str, *, update: bool = False) -> None:
         if key in self.content_configs:
-            if key not in self.loaded_content_keys:
+            if key == "mods":
+                if key not in self.loaded_content_keys and not self.is_loading:
+                    self._rebuild_installed_mods(update=update)
+            elif key not in self.loaded_content_keys:
                 self._rebuild_installed_content(key, update=update)
             return
         if key == "backups":
@@ -701,7 +744,14 @@ class ModsManagerPage(
 
     def _refresh_search_label(self) -> None:
         if self.search_input is not None and not self._is_world_backups_tab():
-            self.search_input.label = self.trans(self._current_config()["search_key"])
+            label = self.trans(self._current_config()["search_key"])
+            self.search_input.hint_text = label
+            if self.installed_search_input is not None:
+                self.installed_search_input.hint_text = label
+                self.installed_search_input.value = self.installed_search_queries.get(
+                    self.current_content_key,
+                    "",
+                )
 
     def _scan_installed_content(self, key: str) -> list[Dict]:
         if key == "mods":
@@ -718,8 +768,14 @@ class ModsManagerPage(
             return
         if key not in self.content_configs:
             return
+        if key == "mods":
+            self._rebuild_installed_mods(update=update)
+            return
 
         items = self._scan_installed_content(key)
+        self._apply_installed_content(key, items, update=update)
+
+    def _apply_installed_content(self, key: str, items: list[Dict], *, update: bool) -> None:
         self.installed_items[key] = items
         if key == "mods":
             self.installed_mods = items
@@ -728,10 +784,38 @@ class ModsManagerPage(
         elif key == "shaders":
             self.installed_shaderpacks = items
 
+        self.loaded_content_keys.add(key)
+        self._render_installed_content(key, update=update)
+
+    def on_installed_search_change(self, event) -> None:
+        key = self.current_content_key
+        if key not in self.content_configs:
+            return
+        value = getattr(getattr(event, "control", None), "value", "")
+        self.installed_search_queries[key] = str(value or "").strip()
+        if key in self.loaded_content_keys:
+            self._render_installed_content(key, update=self._is_active)
+
+    def _filtered_installed_items(self, key: str) -> list[Dict]:
+        items = self.installed_items.get(key, [])
+        query = self.installed_search_queries.get(key, "").casefold().strip()
+        if not query:
+            return list(items)
+
+        fields = ("name", "title", "filename", "project_id", "modrinth_project_id", "version_number")
+        return [
+            item
+            for item in items
+            if any(query in str(item.get(field) or "").casefold() for field in fields)
+        ]
+
+    def _render_installed_content(self, key: str, *, update: bool) -> None:
+        all_items = self.installed_items.get(key, [])
+        items = self._filtered_installed_items(key)
         container = self.installed_containers[key]
         container.controls.clear()
 
-        if not items:
+        if not all_items:
             config = self.content_configs[key]
             container.controls.append(
                 ui.Container(
@@ -750,16 +834,30 @@ class ModsManagerPage(
                     expand=True,
                 )
             )
+        elif not items:
+            container.controls.append(
+                ui.Container(
+                    ui.Column(
+                        [
+                            ui.Icon(ft.Icons.SEARCH_OFF, size=48, color=self.app.theme.text_tertiary),
+                            ui.Text(
+                                self.trans("no_installed_content_found"),
+                                size=self.app.theme.text_size_medium,
+                                color=self.app.theme.text_secondary,
+                            ),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    alignment=ft.Alignment.CENTER,
+                    expand=True,
+                )
+            )
         else:
             for item in items:
                 container.controls.append(self._create_installed_content_card(key, item))
 
-        self.loaded_content_keys.add(key)
         if update and self.page and self._is_active:
             schedule_update(self.page)
-
-    def _rebuild_installed_mods(self):
-        self._rebuild_installed_content("mods")
 
     def _rebuild_installed_resourcepacks(self):
         self._rebuild_installed_content("resourcepacks")
@@ -848,7 +946,11 @@ class ModsManagerPage(
         return self.version_settings_page.diagnostics_view()
 
     def _after_embedded_version_save(self, version) -> None:
+        self._cancel_installed_mods_scan()
+        self.loaded_content_keys.discard("mods")
         self.version = version
+        self.mods_supported = self._check_mods_support()
+        self.mods_dir = self._get_mods_directory() if self.mods_supported else None
         self.app.header.set_params(title=self.trans("mods_manager_title", version=self.version.name))
 
     def _build_delete_version_panel(self) -> ft.Control:
@@ -978,7 +1080,7 @@ class ModsManagerPage(
                 self.app.feedback.warning(self.trans("version_delete_close_game_first"))
                 return
             try:
-                run_task(self.page, self._delete_version_async, delete_directory, delete_backups)
+                self._run_session_task(self._delete_version_async, delete_directory, delete_backups)
             except Exception as exc:
                 self.app.log.error(f"Unable to schedule version deletion for '{self.version.version_id}': {exc}")
                 self.app.feedback.warning(self.trans("version_delete_failed"))
@@ -996,6 +1098,12 @@ class ModsManagerPage(
                 delete_directory=delete_directory,
                 delete_backups=delete_backups,
             )
+        except VersionDirectoryCleanupError as exc:
+            self.app.log.warning(str(exc))
+            self.app.feedback.warning(self.trans("version_delete_files_remain"))
+            self.app.show_versions_page()
+            schedule_update(self.page)
+            return
         except Exception as exc:
             self.app.log.error(f"Version deletion failed for '{self.version.version_id}': {exc}")
             self.app.feedback.warning(self.trans("version_delete_failed"))
@@ -1480,7 +1588,7 @@ class ModsManagerPage(
             status=self.trans("world_backup_creating", world=world.name),
         )
         try:
-            run_task(self.page, self._create_world_backup_async, world, operation)
+            self._run_session_task(self._create_world_backup_async, world, operation)
         except Exception:
             operation.fail(self.trans("world_backup_create_failed", world=world.name), notify=False)
             raise
@@ -1517,7 +1625,7 @@ class ModsManagerPage(
                 kind="backup",
                 status=self.trans("world_backup_restoring", world=backup.world_name),
             )
-            run_task(self.page, self._restore_world_backup_async, backup, operation)
+            self._run_session_task(self._restore_world_backup_async, backup, operation)
 
         self.app.feedback.confirm(
             self.trans("confirmation"),

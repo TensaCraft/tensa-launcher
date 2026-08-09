@@ -8,7 +8,6 @@ from pathlib import Path
 
 from launcher import APP_NAME
 
-
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 

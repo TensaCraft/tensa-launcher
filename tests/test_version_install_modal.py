@@ -27,17 +27,10 @@ def test_version_install_modal_updates_tensacraft_description(fake_app, monkeypa
         },
     ]
 
-    class FakeTensaCraftAPI:
-        def list_versions(self):
-            return packs
-
     fake_loader = SimpleNamespace(get_id=lambda: "tensacraft", get_name=lambda: "TensaCraft")
-    monkeypatch.setattr("launcher.ui.modals.version_install_modal.TensaCraftAPI", FakeTensaCraftAPI)
-    monkeypatch.setattr("launcher.ui.modals.version_install_modal.Launcher.loaders", lambda _self: [fake_loader])
-    monkeypatch.setattr(
-        "launcher.ui.modals.version_install_modal.Launcher.get_loader_versions",
-        lambda _self, _loader: ["aeronautics", "tensa-lite"],
-    )
+    fake_app.tensa_api = SimpleNamespace(list_versions=lambda: packs)
+    monkeypatch.setattr(fake_app.launcher, "loaders", lambda: [fake_loader])
+    monkeypatch.setattr(fake_app.launcher, "get_loader_versions", lambda _loader: ["aeronautics", "tensa-lite"])
 
     modal = ui.VersionInstallModal(fake_app)
 
@@ -52,12 +45,9 @@ def test_version_install_modal_updates_tensacraft_description(fake_app, monkeypa
 
 def test_version_install_modal_marks_tensacraft_pack_pending(fake_app, monkeypatch):
     fake_loader = SimpleNamespace(get_id=lambda: "tensacraft", get_name=lambda: "TensaCraft")
-    monkeypatch.setattr("launcher.ui.modals.version_install_modal.TensaCraftAPI", lambda: SimpleNamespace(list_versions=lambda: []))
-    monkeypatch.setattr("launcher.ui.modals.version_install_modal.Launcher.loaders", lambda _self: [fake_loader])
-    monkeypatch.setattr(
-        "launcher.ui.modals.version_install_modal.Launcher.get_loader_versions",
-        lambda _self, _loader: ["aeronautics"],
-    )
+    fake_app.tensa_api = SimpleNamespace(list_versions=lambda: [])
+    monkeypatch.setattr(fake_app.launcher, "loaders", lambda: [fake_loader])
+    monkeypatch.setattr(fake_app.launcher, "get_loader_versions", lambda _loader: ["aeronautics"])
     scheduled = []
     fake_app.page.run_task = lambda func, *args, **_kwargs: scheduled.append((func, args))
     fake_app.versions.get_by_name = lambda _name: None
@@ -110,12 +100,9 @@ def test_version_install_modal_installs_selected_loader_build(fake_app, monkeypa
         SimpleNamespace(get_id=lambda: "tensacraft", get_name=lambda: "TensaCraft"),
         SimpleNamespace(get_id=lambda: "fabric", get_name=lambda: "Fabric"),
     ]
-    monkeypatch.setattr("launcher.ui.modals.version_install_modal.TensaCraftAPI", lambda: SimpleNamespace(list_versions=lambda: []))
-    monkeypatch.setattr("launcher.ui.modals.version_install_modal.Launcher.loaders", lambda _self: fake_loaders)
-    monkeypatch.setattr(
-        "launcher.ui.modals.version_install_modal.Launcher.get_loader_versions",
-        lambda _self, _loader: ["aeronautics"],
-    )
+    fake_app.tensa_api = SimpleNamespace(list_versions=lambda: [])
+    monkeypatch.setattr(fake_app.launcher, "loaders", lambda: fake_loaders)
+    monkeypatch.setattr(fake_app.launcher, "get_loader_versions", lambda _loader: ["aeronautics"])
     monkeypatch.setattr("launcher.ui.modals.version_install_modal.VersionCreationCatalogService", FakeCatalog)
     monkeypatch.setattr("launcher.ui.modals.version_install_modal.InstalledComponentsService", FakeInstalledComponentsService)
 

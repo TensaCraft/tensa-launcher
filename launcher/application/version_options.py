@@ -4,10 +4,9 @@ import base64
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from launcher.application.memory_preferences import MemoryPreferencesService
-
 
 RECOMMENDED_PRESETS = [
     ("keep", "jvm_preset_keep", None),
@@ -137,7 +136,7 @@ class VersionOptionsService:
         host = (payload.server_host or "").strip()
         port_raw = (payload.server_port or "").strip()
         if host:
-            server_config = {"host": host}
+            server_config: dict[str, Any] = {"host": host}
             if port_raw:
                 try:
                     server_config["port"] = int(port_raw)

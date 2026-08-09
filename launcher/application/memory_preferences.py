@@ -191,7 +191,10 @@ class MemoryPreferencesService:
 
         status = MemoryStatusEx()
         status.dwLength = ctypes.sizeof(MemoryStatusEx)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        windll = getattr(ctypes, "windll", None)
+        kernel32 = getattr(windll, "kernel32", None)
+        global_memory_status = getattr(kernel32, "GlobalMemoryStatusEx", None)
+        if not callable(global_memory_status) or not global_memory_status(ctypes.byref(status)):
             return None, None
         return int(status.ullTotalPhys), int(status.ullAvailPhys)
 
@@ -211,9 +214,16 @@ class MemoryPreferencesService:
     @staticmethod
     def _detect_sysconf_memory_bytes() -> tuple[int | None, int | None]:
         try:
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            page_count = os.sysconf("SC_PHYS_PAGES")
-            return int(page_size * page_count), None
+            sysconf = getattr(os, "sysconf", None)
+            if not callable(sysconf):
+                return FALLBACK_TOTAL_GB * GIB, None
+            raw_page_size = sysconf("SC_PAGE_SIZE")
+            raw_page_count = sysconf("SC_PHYS_PAGES")
+            if not isinstance(raw_page_size, int) or not isinstance(raw_page_count, int):
+                return FALLBACK_TOTAL_GB * GIB, None
+            page_size = raw_page_size
+            page_count = raw_page_count
+            return page_size * page_count, None
         except (AttributeError, OSError, ValueError):
             return FALLBACK_TOTAL_GB * GIB, None
 

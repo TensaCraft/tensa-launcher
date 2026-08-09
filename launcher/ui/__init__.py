@@ -21,8 +21,9 @@ from .core import (
     run_blocking,
     run_task,
     schedule_update,
-    show_window_when_ready,
     show_dialog,
+    show_window_when_ready,
+    unregister_service,
 )
 from .feedback import Alert, AlertDialog, BottomSheet, ProgressOverlay, SnackBar
 from .feedback.tooltip import Tooltip
@@ -42,7 +43,16 @@ from .layout import Column, Container, GridView, ListView, PageContainer, Respon
 from .modals import CurseForgeImportModal, ModpackInstallModal, VersionCopyModal, VersionInstallModal
 from .navigation import Footer, Header, Sidebar
 from .patterns import VersionCard
-from .theme import UiPalette, UiScale, UiTheme, UiTokens, configured_font_family, configured_page_fonts, current_theme, set_current_theme
+from .theme import (
+    UiPalette,
+    UiScale,
+    UiTheme,
+    UiTokens,
+    configured_font_family,
+    configured_page_fonts,
+    current_theme,
+    set_current_theme,
+)
 
 __all__ = [
     "Alert",
@@ -100,6 +110,7 @@ __all__ = [
     "invoke_on_ui",
     "initial_directory_from_path",
     "register_service",
+    "unregister_service",
     "run_blocking",
     "run_task",
     "schedule_update",

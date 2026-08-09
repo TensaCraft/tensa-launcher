@@ -72,6 +72,17 @@ class SettingsPage:
     # Build
     # ------------------------------------------------------------------
     def _build_controls(self) -> None:
+        self._build_launcher_behavior_controls()
+        self._build_interface_controls()
+        self._build_update_controls()
+        self._build_performance_controls()
+        self._build_report_contact_control()
+        self._build_storage_controls()
+        self._build_backup_controls()
+        self._build_custom_java_controls()
+        self._expand_controls()
+
+    def _build_launcher_behavior_controls(self) -> None:
         self.language_select = ui.build_field(
             self.app,
             ui.FieldSpec(
@@ -103,6 +114,8 @@ class SettingsPage:
             label=self.trans("ask_profile_on_launch"),
             default="no",
         )
+
+    def _build_interface_controls(self) -> None:
         self.show_tensacraft_toggle = self._yesno_toggle(
             key="show_tensacraft_versions",
             label=self.trans("show_tensacraft_versions"),
@@ -133,6 +146,8 @@ class SettingsPage:
             ),
             on_change=self.on_click_sound_change,
         )
+
+    def _build_update_controls(self) -> None:
         self.beta_updates_toggle = self._yesno_toggle(
             key="include_beta_updates",
             label=self.trans("include_beta_updates"),
@@ -147,6 +162,7 @@ class SettingsPage:
             height=self.app.theme.input_height,
         )
 
+    def _build_performance_controls(self) -> None:
         default_ram_gb = MemoryPreferencesService.normalize_max_ram_gb(
             self.app.config.get("default_max_ram_gb"),
             limits=self.memory_limits,
@@ -187,6 +203,8 @@ class SettingsPage:
             ),
             on_change=self.on_global_gpu_change,
         )
+
+    def _build_report_contact_control(self) -> None:
         self.report_contact = ui.build_field(
             self.app,
             ui.FieldSpec(
@@ -200,6 +218,7 @@ class SettingsPage:
             on_change=self.on_report_contact_change,
         )
 
+    def _build_storage_controls(self) -> None:
         self.minecraft_game_dir = ui.build_field(
             self.app,
             ui.FieldSpec(
@@ -220,6 +239,7 @@ class SettingsPage:
             height=self.app.theme.input_height,
         )
 
+    def _build_backup_controls(self) -> None:
         default_backup_dir = str(self._default_world_backups_dir())
         self.world_backups_toggle = self._yesno_toggle(
             key="world_backups_enabled",
@@ -260,6 +280,7 @@ class SettingsPage:
             height=self.app.theme.input_height,
         )
 
+    def _build_custom_java_controls(self) -> None:
         self.custom_java_name = ui.build_field(
             self.app,
             ui.FieldSpec(
@@ -306,6 +327,7 @@ class SettingsPage:
         )
         self.custom_java_list = ui.Column(controls=self._build_custom_java_rows(), spacing=8, tight=True)
 
+    def _expand_controls(self) -> None:
         self.layout.expand_controls(
             self.language_select,
             self.auto_update_toggle,
@@ -525,6 +547,9 @@ class SettingsPage:
 
     def before_hide(self) -> None:
         self.activity_panel.before_hide()
+        self.minecraft_dir_picker.dispose()
+        self.world_backups_dir_picker.dispose()
+        self.custom_java_picker.dispose()
 
     def _normalize_tab(self, key: str) -> str:
         if key in {"storage", "interface"}:

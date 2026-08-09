@@ -87,6 +87,13 @@ def register_service(page: ft.Page, service: ft.Service) -> None:
         overlay.append(service)
 
 
+def unregister_service(page: ft.Page, service: ft.Service) -> None:
+    for collection_name in ("services", "overlay"):
+        collection = getattr(page, collection_name, None)
+        if collection is not None and service in collection:
+            collection.remove(service)
+
+
 def schedule_update(page: ft.Page) -> None:
     updater = getattr(page, "update", None)
     if callable(updater) and _is_on_page_loop(page):
@@ -137,16 +144,34 @@ async def run_blocking(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> 
     future = loop.create_future()
     bound = partial(fn, *args, **kwargs)
 
+    def _set_result(result: Any) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def _set_exception(exc: Exception) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
     def _worker() -> None:
         try:
             result = bound()
         except Exception as exc:  # pragma: no cover - thread handoff
-            loop.call_soon_threadsafe(future.set_exception, exc)
+            loop.call_soon_threadsafe(_set_exception, exc)
             return
-        loop.call_soon_threadsafe(future.set_result, result)
+        loop.call_soon_threadsafe(_set_result, result)
 
     threading.Thread(target=_worker, daemon=True).start()
-    return await future
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError as cancellation:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+        if not future.cancelled():
+            future.exception()
+        raise cancellation
 
 
 def invoke_on_ui(page: ft.Page, callback: Callable[..., Any], *args: Any, **kwargs: Any):

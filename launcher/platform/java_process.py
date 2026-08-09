@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import os
-from pathlib import Path
 import threading
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
-
 
 _PATH_LOCK = threading.RLock()
 _JAVA_OPTION_ENV_KEYS = ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS")

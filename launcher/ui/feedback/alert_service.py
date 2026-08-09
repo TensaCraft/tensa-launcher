@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 import flet as ft
 
@@ -24,7 +24,7 @@ class Alert:
     def __init__(self, app):
         self.app = app
 
-    def _pop_active_dialog(self, fallback_dialog: ft.Control | None = None) -> None:
+    def _pop_active_dialog(self, fallback_dialog: ft.DialogControl | None = None) -> None:
         popper = getattr(self.app.page, "pop_dialog", None)
         if callable(popper):
             try:
@@ -188,6 +188,9 @@ class Alert:
                 self.app.log.warning(f"Device URL opener failed: {exc!r}")
 
         page = getattr(self.app, "page", None)
+        if page is None:
+            return False
+        page = cast(ft.Page, page)
         launch_url = getattr(page, "launch_url", None)
         if not callable(launch_url):
             return False
@@ -240,7 +243,7 @@ class Alert:
         if not callable(submit):
             return None
 
-        action: ft.Control | None = None
+        action: ft.Button | None = None
         status = {"value": "idle"}
 
         def set_action_state(text_key: str, *, disabled: bool) -> None:
@@ -255,12 +258,18 @@ class Alert:
                 self.app.log.debug(f"Report action update skipped: {exc}")
 
         def on_success(result: dict[str, Any]) -> None:
+            invoke_on_ui(self.app.page, apply_success, result)
+
+        def apply_success(result: dict[str, Any]) -> None:
             status["value"] = "sent"
             set_action_state("error_report_sent_button", disabled=True)
             report_id = result.get("report_id", "")
             self.show_alert(self.app.trans("error_report_sent", report_id=report_id))
 
         def on_error(exc: Exception) -> None:
+            invoke_on_ui(self.app.page, apply_error, exc)
+
+        def apply_error(exc: Exception) -> None:
             status["value"] = "idle"
             set_action_state("error_report_retry", disabled=False)
             self.show_alert(
@@ -331,14 +340,14 @@ class Alert:
         )
         self.open_dialog(confirm_dialog)
 
-    def open_dialog(self, dialog: ft.Control) -> None:
+    def open_dialog(self, dialog: ft.DialogControl) -> None:
         try:
             show_dialog(self.app.page, dialog)
             schedule_update(self.app.page)
         except Exception as exc:
             self.app.log.debug(f"Dialog open skipped: {exc}")
 
-    def close_dialog(self, dialog: ft.Control) -> None:
+    def close_dialog(self, dialog: ft.DialogControl) -> None:
         try:
             self._pop_active_dialog(dialog)
             schedule_update(self.app.page)

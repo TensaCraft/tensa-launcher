@@ -60,6 +60,7 @@ def test_report_service_posts_launcher_log_and_metadata(fake_app, tmp_path, monk
     assert payload["metadata"]["feedback"]["recent_activity"][-1]["message"] == "Network is slow"
     assert "launcher line" in payload["log"]
     assert "minecraft line" in payload["log"]
+    assert payload["log"].index("minecraft line") < payload["log"].index("launcher line")
     operation.finish(show_success=False)
 
 
@@ -82,6 +83,39 @@ def test_report_service_includes_optional_contact(fake_app, tmp_path, monkeypatc
     payload = captured["kwargs"]["json"]
     assert payload["contact"] == "client@example.com"
     assert payload["metadata"]["contact"] == "client@example.com"
+
+
+def test_report_service_redacts_tokens_and_home_paths(fake_app, tmp_path, monkeypatch):
+    log_file = tmp_path / "app.log"
+    home = Path.home()
+    log_file.write_text(
+        f"java --accessToken secret-token --gameDir {home / 'TensaLauncher'}\n"
+        "Authorization: Bearer another-secret\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeSession:
+        def post(self, _url, **kwargs):
+            captured["payload"] = kwargs["json"]
+            return FakeResponse({"ok": True, "report_id": "report-redacted"})
+
+    monkeypatch.setattr("launcher.application.error_reports.Logger.log_file", log_file)
+
+    LauncherReportService(fake_app, session=FakeSession()).submit_report(
+        title="Launch failed",
+        message=f"Failure in {home / 'TensaLauncher'}",
+        metadata={"diagnostic_path": home / "TensaLauncher" / "latest.log"},
+    )
+
+    payload = captured["payload"]
+    serialized = repr(payload)
+    assert "secret-token" not in serialized
+    assert "another-secret" not in serialized
+    assert str(home) not in serialized
+    assert "<redacted>" in payload["log"]
+    assert "<USER_HOME>" in payload["message"]
+    assert payload["metadata"]["diagnostic_path"].startswith("<USER_HOME>")
 
 
 def test_warning_alert_adds_send_report_action(fake_app):
@@ -201,9 +235,13 @@ def test_warning_alert_report_action_ignores_duplicate_clicks(fake_app):
     assert report_action.content == "error_report_sending"
 
 
-def test_warning_alert_report_action_shows_sent_state(fake_app):
+def test_warning_alert_report_action_shows_sent_state(fake_app, monkeypatch):
     captured = {"dialogs": [], "reports": []}
     fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)
+    monkeypatch.setattr(
+        "launcher.ui.feedback.alert_service.invoke_on_ui",
+        lambda _page, callback, *args, **kwargs: callback(*args, **kwargs),
+    )
 
     class FakeReporter:
         def submit_report_async(self, **kwargs):
@@ -224,9 +262,13 @@ def test_warning_alert_report_action_shows_sent_state(fake_app):
     assert report_action.content == "error_report_sent_button"
 
 
-def test_warning_alert_report_action_allows_retry_after_failure(fake_app):
+def test_warning_alert_report_action_allows_retry_after_failure(fake_app, monkeypatch):
     captured = {"dialogs": [], "reports": []}
     fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)
+    monkeypatch.setattr(
+        "launcher.ui.feedback.alert_service.invoke_on_ui",
+        lambda _page, callback, *args, **kwargs: callback(*args, **kwargs),
+    )
 
     class FakeReporter:
         def submit_report_async(self, **kwargs):
@@ -246,3 +288,34 @@ def test_warning_alert_report_action_allows_retry_after_failure(fake_app):
     assert len(captured["reports"]) == 2
     assert report_action.disabled is False
     assert report_action.content == "error_report_retry"
+
+
+def test_warning_alert_dispatches_report_completion_to_ui(fake_app, monkeypatch):
+    captured = {"callback": None, "reports": [], "dialogs": []}
+    fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)
+
+    class FakeReporter:
+        def submit_report_async(self, **kwargs):
+            captured["reports"].append(kwargs)
+
+    def capture_invoke(_page, callback, *args, **kwargs):
+        captured["callback"] = (callback, args, kwargs)
+
+    fake_app.reporter = FakeReporter()
+    monkeypatch.setattr("launcher.ui.feedback.alert_service.invoke_on_ui", capture_invoke)
+    alert = Alert(fake_app)
+    alert._show_alert_impl("Minecraft exited", is_warning=True, report_title="Launch failed")
+    warning_dialog = captured["dialogs"][0]
+    report_action = next(action for action in warning_dialog.actions if action.content == "send_error_report")
+
+    report_action.on_click(None)
+    captured["reports"][0]["on_success"]({"ok": True, "report_id": "report-thread"})
+
+    assert captured["callback"] is not None
+    callback, args, kwargs = captured["callback"]
+    assert args == ({"ok": True, "report_id": "report-thread"},)
+    assert kwargs == {}
+    assert report_action.content == "error_report_sending"
+
+    callback(*args)
+    assert report_action.content == "error_report_sent_button"

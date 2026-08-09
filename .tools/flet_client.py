@@ -65,8 +65,8 @@ def resolve_flet_desktop_release(ctx) -> tuple[str, str]:
             ctx.python_bin,
             "-c",
             (
-                "import flet_desktop, flet_desktop.version; "
-                "print(flet_desktop.version.version); "
+                "import importlib.metadata, flet_desktop; "
+                "print(importlib.metadata.version('flet-desktop')); "
                 "print(flet_desktop.get_artifact_filename())"
             ),
         ],

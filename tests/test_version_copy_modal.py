@@ -1,38 +1,32 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 import pytest
 
 from launcher.core import util
-from launcher.storage.version_store import Versions
+from launcher.domain.version import Version
 from launcher.ui.modals.version_copy_modal import VersionCopyModal
 
 
-class _TensaVersion:
-    version_id = "aeronautics"
-    id = "aeronautics"
-    name = "Aeronautics"
-    version = "1.21.1"
-    client = "TensaCraft"
-    loader = "neoforge-21.1.228"
-    loader_version = "21.1.228"
-    force_update = True
-    image = "icon"
-
+class _TensaVersion(Version):
     def __init__(self, path: str) -> None:
-        self.path = path
-        self.options = {"gpuMode": "dgpu", "jvmArguments": ["-Xmx4G"]}
-
-
-class _EmptyLauncher:
-    def loaders(self):
-        return []
-
-
-def _empty_launcher():
-    return _EmptyLauncher()
+        super().__init__(
+            "aeronautics",
+            {
+                "id": "aeronautics",
+                "name": "Aeronautics",
+                "version": "1.21.1",
+                "client": "TensaCraft",
+                "loader": "neoforge-21.1.228",
+                "loader_version": "21.1.228",
+                "force_update": True,
+                "image": "icon",
+                "path": path,
+                "options": {"gpuMode": "dgpu", "jvmArguments": ["-Xmx4G"]},
+            },
+        )
 
 
 def test_tensacraft_copy_defaults_to_source_loader(fake_app, monkeypatch, tmp_path: Path):
@@ -40,7 +34,7 @@ def test_tensacraft_copy_defaults_to_source_loader(fake_app, monkeypatch, tmp_pa
     source_dir.mkdir(parents=True)
     source = _TensaVersion(str(source_dir))
 
-    monkeypatch.setattr("launcher.ui.modals.version_copy_modal.Launcher", _empty_launcher)
+    monkeypatch.setattr(fake_app.launcher, "loaders", lambda: [])
 
     modal = VersionCopyModal(fake_app, source)
 
@@ -63,9 +57,7 @@ def test_tensacraft_copy_copies_mods_to_games_dir_and_keeps_loader(fake_app, mon
 
     monkeypatch.setattr(util, "minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr(util, "games_path", str(games_dir))
-    Versions._instance = None
-    monkeypatch.setattr(Versions, "instance", lambda: fake_app.versions)
-    monkeypatch.setattr("launcher.ui.modals.version_copy_modal.Launcher", _empty_launcher)
+    monkeypatch.setattr(fake_app.launcher, "loaders", lambda: [])
 
     saved = []
     fake_app.versions.add = lambda version: saved.append(version)
@@ -105,7 +97,7 @@ def test_version_copy_fails_without_source_directory(fake_app, monkeypatch, tmp_
 
     monkeypatch.setattr(util, "minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr(util, "games_path", str(games_dir))
-    monkeypatch.setattr("launcher.ui.modals.version_copy_modal.Launcher", _empty_launcher)
+    monkeypatch.setattr(fake_app.launcher, "loaders", lambda: [])
 
     saved = []
     fake_app.versions.add = lambda version: saved.append(version)

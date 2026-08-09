@@ -6,6 +6,7 @@
 /.dev/
 /.pytest_cache/
 /.ruff_cache/
+/.tensalauncher-locks/
 /.venv/
 /.venv-linux/
 /.venv-win/

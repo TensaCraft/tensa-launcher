@@ -6,7 +6,6 @@ from pathlib import Path
 
 from python_runtime import reexec_if_needed
 
-
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "launcher"
 TESTS = ROOT / "tests"

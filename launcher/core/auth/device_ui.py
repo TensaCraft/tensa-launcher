@@ -296,9 +296,11 @@ class DeviceCodeUI:
         if not url:
             return False
         try:
-            if sys.platform.startswith("win") and hasattr(os, "startfile"):
-                os.startfile(url)
-                return True
+            if sys.platform.startswith("win"):
+                startfile = getattr(os, "startfile", None)
+                if callable(startfile):
+                    startfile(url)
+                    return True
             if sys.platform == "darwin":
                 subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return True

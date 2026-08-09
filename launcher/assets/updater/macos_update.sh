@@ -1,79 +1,92 @@
-#!/bin/bash
-# Параметри: $1 - DMG файл, $2 - шлях до .app, $3 - PID
+#!/bin/sh
 
-DMG_PATH="$1"
-APP_PATH="$2"
-PID="$3"
+DMG_PATH=$1
+APP_PATH=$2
+PID=$3
+MARKER=$4
+STAGED="${APP_PATH}.new"
+BACKUP="${APP_PATH}.bak"
+MOUNT_POINT=
+HAD_TARGET=0
 
-echo "TensaLauncher Updater (macOS)"
-echo "=============================="
-echo ""
-echo "Waiting for launcher to close (PID: $PID)..."
+detach_image() {
+    if [ -n "$MOUNT_POINT" ]; then
+        hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+        MOUNT_POINT=
+    fi
+}
 
-# Чекаємо завершення
+cleanup_marker_if_runnable() {
+    if [ -d "$APP_PATH" ] && [ -n "$MARKER" ]; then
+        rm -f -- "$MARKER"
+    fi
+}
+
+restore_previous() {
+    rm -rf -- "$APP_PATH"
+    if [ "$HAD_TARGET" -eq 1 ] && [ -d "$BACKUP" ]; then
+        mv -f -- "$BACKUP" "$APP_PATH"
+    fi
+    cleanup_marker_if_runnable
+}
+
+trap detach_image EXIT INT TERM
+
 counter=0
 while kill -0 "$PID" 2>/dev/null; do
-    if [ $counter -gt 60 ]; then
+    if [ "$counter" -ge 60 ]; then
         echo "ERROR: Timeout waiting for launcher to close"
-        echo "Please close the launcher manually and run this script again"
         exit 1
     fi
     sleep 1
     counter=$((counter + 1))
 done
 
-echo "Launcher closed successfully"
-echo ""
-
-# Додаткова затримка
 if [ ! -f "$DMG_PATH" ]; then
     echo "ERROR: DMG file not found: $DMG_PATH"
+    cleanup_marker_if_runnable
     exit 1
 fi
 
-echo "Mounting DMG..."
-
-# Монтуємо DMG
-MOUNT_POINT=$(hdiutil attach "$DMG_PATH" 2>/dev/null | grep Volumes | awk '{print $3}')
-
-if [ -z "$MOUNT_POINT" ]; then
-    echo "ERROR: Failed to mount DMG"
+MOUNT_POINT=$(hdiutil attach "$DMG_PATH" -nobrowse 2>/dev/null | awk '/\/Volumes\// {print substr($0, index($0, "/Volumes/")); exit}')
+if [ -z "$MOUNT_POINT" ] || [ ! -d "$MOUNT_POINT/TensaLauncher.app" ]; then
+    echo "ERROR: TensaLauncher.app was not found in the update image"
+    cleanup_marker_if_runnable
     exit 1
 fi
 
-echo "DMG mounted at: $MOUNT_POINT"
-echo ""
+rm -rf -- "$STAGED"
+ditto "$MOUNT_POINT/TensaLauncher.app" "$STAGED" || {
+    echo "ERROR: Failed to stage application bundle"
+    cleanup_marker_if_runnable
+    exit 1
+}
+if [ ! -d "$STAGED" ]; then
+    echo "ERROR: Staged application bundle is missing"
+    cleanup_marker_if_runnable
+    exit 1
+fi
 
-# Видаляємо старий .app
-echo "Removing old version..."
-rm -rf "$APP_PATH"
-
+rm -rf -- "$BACKUP"
 if [ -d "$APP_PATH" ]; then
-    echo "ERROR: Cannot delete old application"
-    hdiutil detach "$MOUNT_POINT" 2>/dev/null
+    HAD_TARGET=1
+    mv -f -- "$APP_PATH" "$BACKUP" || {
+        echo "ERROR: Failed to back up current application"
+        rm -rf -- "$STAGED"
+        cleanup_marker_if_runnable
+        exit 1
+    }
+fi
+
+if ! mv -f -- "$STAGED" "$APP_PATH"; then
+    echo "ERROR: Failed to activate update; restoring previous application"
+    restore_previous
     exit 1
 fi
 
-# Копіюємо новий .app
-echo "Installing new version..."
-
-if [ -d "$MOUNT_POINT/TensaLauncher.app" ]; then
-    cp -R "$MOUNT_POINT/TensaLauncher.app" "$(dirname "$APP_PATH")/"
-else
-    echo "ERROR: TensaLauncher.app not found in DMG"
-    hdiutil detach "$MOUNT_POINT" 2>/dev/null
-    exit 1
+rm -rf -- "$BACKUP"
+rm -f -- "$DMG_PATH"
+if [ -n "$MARKER" ]; then
+    rm -f -- "$MARKER"
 fi
-
-# Демонтуємо DMG
-echo "Cleaning up..."
-hdiutil detach "$MOUNT_POINT" 2>/dev/null
-
-# Видаляємо DMG
-rm -f "$DMG_PATH"
-
-echo ""
-echo "Update completed successfully!"
-echo ""
-
-rm -- "$0"
+echo "TensaLauncher update completed successfully"

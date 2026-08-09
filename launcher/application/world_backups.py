@@ -1,21 +1,34 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
+import os
 import re
 import shutil
 import tempfile
-import time
 import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from launcher.application.instance_operations import (
+    InstanceOperationBusy,
+    InstanceOperationCoordinator,
+    InstanceOperationLease,
+)
+from launcher.application.storage_preflight import (
+    StorageRequest,
+    ensure_storage_available,
+)
+from launcher.storage.atomic import atomic_write_json
 
 BACKUP_SCHEMA = 1
 DEFAULT_KEEP_COUNT = 3
 SESSION_LOCK = "session.lock"
 METADATA_SUFFIX = ".json"
+RESTORE_JOURNAL_FILE = ".tensalauncher-world-restore.json"
+RESTORE_JOURNAL_SCHEMA = 1
+RESTORE_PHASES = {"prepared", "original_moved", "activated"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +64,20 @@ class WorldBackupResult:
 
 
 class WorldBackupService:
-    def __init__(self, minecraft_dir: str | Path, config, logger: Any, translator=None) -> None:
+    def __init__(
+        self,
+        minecraft_dir: str | Path,
+        config,
+        logger: Any,
+        translator=None,
+        *,
+        instance_operations: InstanceOperationCoordinator | None = None,
+    ) -> None:
         self.minecraft_dir = Path(minecraft_dir)
         self.config = config
         self.logger = logger
         self._translator = translator
+        self._instance_operations = instance_operations
 
     def enabled(self) -> bool:
         return str(self.config.get("world_backups_enabled", "no")).lower() == "yes"
@@ -103,10 +125,37 @@ class WorldBackupService:
             )
         return worlds
 
-    def auto_backup_changed_worlds(self, version: Any, operation=None) -> WorldBackupResult:
+    def auto_backup_changed_worlds(
+        self,
+        version: Any,
+        operation=None,
+        *,
+        lease: InstanceOperationLease | None = None,
+    ) -> WorldBackupResult:
         if not self.enabled():
             return WorldBackupResult(created=0, skipped=0, failed=0)
 
+        instance_path = self.version_game_dir(version)
+        try:
+            if self._instance_operations is not None:
+                return self._instance_operations.execute(
+                    instance_path,
+                    "world_backup",
+                    self._auto_backup_changed_worlds_locked,
+                    version,
+                    operation,
+                    lease=lease,
+                )
+            return self._auto_backup_changed_worlds_locked(version, operation)
+        except InstanceOperationBusy as exc:
+            raise RuntimeError(
+                self._translate(
+                    "instance_operation_busy",
+                    version=self._version_label(version, instance_path.name),
+                )
+            ) from exc
+
+    def _auto_backup_changed_worlds_locked(self, version: Any, operation=None) -> WorldBackupResult:
         worlds = self.scan_worlds(version)
         if not worlds:
             return WorldBackupResult(created=0, skipped=0, failed=0)
@@ -126,7 +175,7 @@ class WorldBackupService:
                         progress=index - 1,
                         total=total,
                     )
-                self.create_backup(version, world.path, kind="auto")
+                self._create_backup_locked(version, world.path, kind="auto")
                 created += 1
                 if operation is not None:
                     operation.update(
@@ -140,20 +189,70 @@ class WorldBackupService:
 
         return WorldBackupResult(created=created, skipped=skipped, failed=failed)
 
-    def create_backup(self, version: Any, world_path: str | Path, *, kind: str = "manual") -> WorldBackupInfo:
+    def create_backup(
+        self,
+        version: Any,
+        world_path: str | Path,
+        *,
+        kind: str = "manual",
+        lease: InstanceOperationLease | None = None,
+    ) -> WorldBackupInfo:
         world_dir = Path(world_path)
+        instance_path = world_dir.parent.parent
+        try:
+            if self._instance_operations is not None:
+                return self._instance_operations.execute(
+                    instance_path,
+                    "world_backup",
+                    self._create_backup_locked,
+                    version,
+                    world_dir,
+                    kind=kind,
+                    lease=lease,
+                )
+            return self._create_backup_locked(version, world_dir, kind=kind)
+        except InstanceOperationBusy as exc:
+            raise RuntimeError(
+                self._translate(
+                    "instance_operation_busy",
+                    version=self._version_label(version, instance_path.name),
+                )
+            ) from exc
+
+    def _create_backup_locked(
+        self,
+        version: Any,
+        world_dir: Path,
+        *,
+        kind: str,
+    ) -> WorldBackupInfo:
+        instance_path = world_dir.parent.parent
+        self._ensure_instance_idle(
+            instance_path,
+            self._version_label(version, instance_path.name),
+        )
         if not world_dir.exists() or not world_dir.is_dir():
             raise FileNotFoundError(f"World directory not found: {world_dir}")
         if not (world_dir / "level.dat").is_file():
             raise ValueError(f"World directory does not contain level.dat: {world_dir}")
 
         target_dir = self._backup_dir_for_world(version, world_dir)
+        self._ensure_backup_outside_world(world_dir, target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc)
         timestamp_name = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
         zip_name = f"[Auto] {timestamp_name}.zip" if kind == "auto" else f"{timestamp_name}.zip"
         final_path = self._unique_path(target_dir / zip_name)
         metadata_path = final_path.with_suffix(final_path.suffix + METADATA_SUFFIX)
+        ensure_storage_available(
+            [
+                StorageRequest(
+                    target=final_path,
+                    required_bytes=self._directory_size(world_dir),
+                    label=f"world backup {world_dir.name}",
+                )
+            ]
+        )
 
         with tempfile.NamedTemporaryFile(prefix=final_path.name, suffix=".tmp", dir=target_dir, delete=False) as handle:
             temp_path = Path(handle.name)
@@ -162,7 +261,12 @@ class WorldBackupService:
             final_path.unlink(missing_ok=True)
             shutil.move(str(temp_path), str(final_path))
             metadata = self._metadata_for_backup(version, world_dir, final_path, timestamp, kind)
-            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(
+                metadata_path,
+                metadata,
+                ensure_ascii=False,
+                indent=2,
+            )
         except Exception:
             temp_path.unlink(missing_ok=True)
             final_path.unlink(missing_ok=True)
@@ -189,29 +293,208 @@ class WorldBackupService:
         return sorted(backups, key=lambda backup: backup.created_timestamp, reverse=True)
 
     def restore_backup(self, backup: WorldBackupInfo | str | Path) -> Path:
-        backup_info = self._resolve_backup_info(backup)
-        target = backup_info.restore_path or backup_info.source_path
-        if target is None:
-            raise ValueError("Backup metadata does not contain source_path")
+        if not isinstance(backup, WorldBackupInfo) or backup.restore_path is None:
+            raise ValueError(
+                "World restore requires a backup selected for a known launcher world"
+            )
+        backup_info = backup
+        target = self._validated_restore_target(backup_info)
+        instance_path = target.parent.parent
+        try:
+            if self._instance_operations is not None:
+                return self._instance_operations.execute(
+                    instance_path,
+                    "world_restore",
+                    self._restore_backup_locked,
+                    backup_info,
+                    target,
+                )
+            return self._restore_backup_locked(backup_info, target)
+        except InstanceOperationBusy as exc:
+            raise RuntimeError(
+                self._translate(
+                    "instance_operation_busy",
+                    version=backup_info.version_id or target.name,
+                )
+            ) from exc
+
+    def _restore_backup_locked(
+        self,
+        backup_info: WorldBackupInfo,
+        target: Path,
+    ) -> Path:
+        instance_path = target.parent.parent
+        self._ensure_instance_idle(
+            instance_path,
+            backup_info.version_id or target.name,
+        )
         saves_dir = target.parent
-        restore_tmp = saves_dir / f"{target.name}.restore-{int(time.time())}"
-        old_path = saves_dir / f"{target.name}.old-{int(time.time())}"
+        self._recover_restore_transaction(saves_dir)
+        with zipfile.ZipFile(backup_info.path) as archive:
+            restore_size = sum(
+                max(0, int(member.file_size))
+                for member in archive.infolist()
+                if not member.is_dir()
+            )
+        ensure_storage_available(
+            [
+                StorageRequest(
+                    target=saves_dir,
+                    required_bytes=restore_size,
+                    label=f"world restore {target.name}",
+                )
+            ]
+        )
+        restore_tmp = Path(tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=saves_dir))
+        old_path = restore_tmp.with_name(f"{restore_tmp.name}.previous")
+        journal_started = False
         try:
             with zipfile.ZipFile(backup_info.path) as archive:
                 self._extract_zip_safely(archive, restore_tmp)
-            if target.exists():
+            self._validate_staged_world(restore_tmp)
+
+            journal = {
+                "schema_version": RESTORE_JOURNAL_SCHEMA,
+                "phase": "prepared",
+                "target_name": target.name,
+                "staged_name": restore_tmp.name,
+                "previous_name": old_path.name,
+                "had_original": target.exists(),
+            }
+            self._write_restore_journal(saves_dir, journal)
+            journal_started = True
+
+            if journal["had_original"]:
                 target.rename(old_path)
+                self._sync_directory(saves_dir)
+            self._set_restore_phase(saves_dir, journal, "original_moved")
+
             restore_tmp.rename(target)
+            self._sync_directory(saves_dir)
+            self._set_restore_phase(saves_dir, journal, "activated")
+
             if old_path.exists():
-                shutil.rmtree(old_path)
+                try:
+                    shutil.rmtree(old_path)
+                    self._sync_directory(saves_dir)
+                except OSError as exc:
+                    self._warning(f"Restored world but could not remove previous copy {old_path}: {exc!r}")
+                    return target
+            self._clear_restore_journal(saves_dir)
             return target
         except Exception:
-            if target.exists() and old_path.exists():
-                shutil.rmtree(target, ignore_errors=True)
-            if old_path.exists() and not target.exists():
-                old_path.rename(target)
-            shutil.rmtree(restore_tmp, ignore_errors=True)
+            if journal_started:
+                try:
+                    self._recover_restore_transaction(saves_dir)
+                except Exception as recovery_error:
+                    raise RuntimeError(
+                        "World restore failed and automatic recovery could not be completed; "
+                        f"recovery state remains at {saves_dir / RESTORE_JOURNAL_FILE}"
+                    ) from recovery_error
+            else:
+                shutil.rmtree(restore_tmp, ignore_errors=True)
             raise
+
+    def _recover_restore_transaction(self, saves_dir: Path) -> bool:
+        journal_path = saves_dir / RESTORE_JOURNAL_FILE
+        if not journal_path.exists():
+            return False
+
+        journal = self._read_restore_journal(journal_path)
+        target = self._restore_journal_world_path(saves_dir, journal, "target_name")
+        staged = self._restore_journal_world_path(saves_dir, journal, "staged_name")
+        previous = self._restore_journal_world_path(saves_dir, journal, "previous_name")
+        if len({target.name, staged.name, previous.name}) != 3:
+            raise RuntimeError("World restore journal paths are not distinct")
+
+        for path in (target, staged, previous):
+            if path.exists() and not path.is_dir():
+                raise RuntimeError(f"World restore recovery path is not a directory: {path}")
+
+        had_original = journal.get("had_original")
+        if not isinstance(had_original, bool):
+            raise RuntimeError("World restore journal original-world state is invalid")
+
+        if staged.exists():
+            if previous.exists():
+                if target.exists():
+                    raise RuntimeError("World restore recovery state is ambiguous")
+                previous.rename(target)
+                self._sync_directory(saves_dir)
+            elif had_original and not target.exists():
+                raise RuntimeError("World restore recovery cannot find the original world")
+            shutil.rmtree(staged)
+            self._sync_directory(saves_dir)
+        elif target.exists():
+            if previous.exists():
+                shutil.rmtree(previous)
+                self._sync_directory(saves_dir)
+        elif previous.exists():
+            previous.rename(target)
+            self._sync_directory(saves_dir)
+        elif had_original:
+            raise RuntimeError("World restore recovery cannot find either world copy")
+
+        self._clear_restore_journal(saves_dir)
+        return True
+
+    def _write_restore_journal(self, saves_dir: Path, journal: dict[str, Any]) -> None:
+        atomic_write_json(
+            saves_dir / RESTORE_JOURNAL_FILE,
+            journal,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        self._sync_directory(saves_dir)
+
+    def _set_restore_phase(
+        self,
+        saves_dir: Path,
+        journal: dict[str, Any],
+        phase: str,
+    ) -> None:
+        if phase not in RESTORE_PHASES:
+            raise ValueError(f"Unknown world restore phase: {phase}")
+        journal["phase"] = phase
+        self._write_restore_journal(saves_dir, journal)
+
+    def _read_restore_journal(self, journal_path: Path) -> dict[str, Any]:
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("World restore journal is corrupted") from exc
+        if not isinstance(journal, dict):
+            raise RuntimeError("World restore journal is invalid")
+        if journal.get("schema_version") != RESTORE_JOURNAL_SCHEMA:
+            raise RuntimeError("World restore journal schema is unsupported")
+        if journal.get("phase") not in RESTORE_PHASES:
+            raise RuntimeError("World restore journal phase is invalid")
+        return journal
+
+    @staticmethod
+    def _restore_journal_world_path(
+        saves_dir: Path,
+        journal: dict[str, Any],
+        field: str,
+    ) -> Path:
+        name = journal.get(field)
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or Path(name).is_absolute()
+        ):
+            raise RuntimeError(f"World restore journal {field} is invalid")
+        return saves_dir / name
+
+    def _clear_restore_journal(self, saves_dir: Path) -> None:
+        (saves_dir / RESTORE_JOURNAL_FILE).unlink(missing_ok=True)
+        self._sync_directory(saves_dir)
 
     def delete_backup(self, backup: WorldBackupInfo | str | Path) -> None:
         backup_info = self._resolve_backup_info(backup)
@@ -306,6 +589,25 @@ class WorldBackupService:
         path = Path(backup)
         return self._backup_info_from_files(path, path.with_suffix(path.suffix + METADATA_SUFFIX))
 
+    @staticmethod
+    def _validated_restore_target(backup: WorldBackupInfo) -> Path:
+        world_folder = str(backup.world_folder or "").strip()
+        if (
+            not world_folder
+            or world_folder in {".", ".."}
+            or Path(world_folder).name != world_folder
+            or "/" in world_folder
+            or "\\" in world_folder
+        ):
+            raise ValueError("Backup metadata contains an invalid world folder")
+
+        raw_target = Path(backup.restore_path or "")
+        if raw_target.name != world_folder or raw_target.parent.name.casefold() != "saves":
+            raise ValueError("Backup restore target does not match the selected world")
+        if raw_target.is_symlink() or raw_target.parent.is_symlink():
+            raise ValueError("Backup restore target cannot use a symbolic link")
+        return raw_target.resolve(strict=False)
+
     def _prune_auto_backups(self, version: Any, world_path: Path) -> None:
         auto_backups = [backup for backup in self.scan_backups(version, world_path) if backup.kind == "auto"]
         for backup in auto_backups[self.keep_count():]:
@@ -315,6 +617,18 @@ class WorldBackupService:
         with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
             for file_path in self._iter_world_files(source):
                 archive.write(file_path, file_path.relative_to(source).as_posix())
+
+    @staticmethod
+    def _ensure_backup_outside_world(world_dir: Path, target_dir: Path) -> None:
+        resolved_world = world_dir.resolve()
+        resolved_target = target_dir.resolve()
+        if resolved_target == resolved_world or resolved_world in resolved_target.parents:
+            raise ValueError(f"Backup directory cannot be inside the source world: {target_dir}")
+
+    @staticmethod
+    def _validate_staged_world(staged_world: Path) -> None:
+        if not (staged_world / "level.dat").is_file():
+            raise ValueError("Backup archive does not contain level.dat")
 
     @staticmethod
     def _extract_zip_safely(archive: zipfile.ZipFile, destination: Path) -> None:
@@ -372,10 +686,44 @@ class WorldBackupService:
                 return candidate
         raise FileExistsError(f"Could not create a unique backup path for {path}")
 
+    def _ensure_instance_idle(self, instance_path: Path, version_name: str) -> None:
+        from launcher.core.game import Game
+
+        if Game.is_game_dir_active(instance_path):
+            raise RuntimeError(
+                self._translate(
+                    "instance_game_running",
+                    version=version_name,
+                )
+            )
+
+    @staticmethod
+    def _version_label(version: Any, fallback: str) -> str:
+        return str(
+            getattr(version, "name", None)
+            or getattr(version, "version_id", None)
+            or getattr(version, "id", None)
+            or fallback
+        )
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
     def _translate(self, key: str, **kwargs: Any) -> str:
         trans = self._translator
         if callable(trans):
-            return trans(key, **kwargs)
+            return str(trans(key, **kwargs))
         if key == "world_backup_progress":
             return f"Backing up world {kwargs.get('world', '')}".strip()
         return key
@@ -386,4 +734,10 @@ class WorldBackupService:
             warning(message)
 
 
-__all__ = ["WorldBackupInfo", "WorldBackupResult", "WorldBackupService", "WorldInfo"]
+__all__ = [
+    "RESTORE_JOURNAL_FILE",
+    "WorldBackupInfo",
+    "WorldBackupResult",
+    "WorldBackupService",
+    "WorldInfo",
+]

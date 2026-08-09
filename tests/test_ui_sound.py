@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from launcher import ui
 from launcher.application.ui_sound import UiSoundService
 from launcher.ui.core.click_sound import wrap_click_handler
-from launcher.shared import AppContext
 
 
 class DummyConfig:
@@ -17,6 +16,10 @@ class DummyConfig:
 
     def get(self, _key: str, default=None):
         return self.value if self.value is not None else default
+
+
+def _event(fake_app):
+    return SimpleNamespace(control=SimpleNamespace(page=fake_app.page))
 
 
 def test_ui_sound_service_respects_click_sound_setting():
@@ -80,72 +83,72 @@ def test_button_wrapper_plays_click_sound_before_handler(fake_app):
     clicks = []
     events = []
     fake_app.ui_sound = SimpleNamespace(play_click=lambda: clicks.append("click"))
-    AppContext.set(fake_app)
     button = ui.Button(text="Save", on_click=lambda e: events.append(e))
+    event = _event(fake_app)
 
-    button.on_click("event")
+    button.on_click(event)
 
     assert clicks == ["click"]
-    assert events == ["event"]
+    assert events == [event]
 
 
 def test_click_sound_wrapper_preserves_async_handlers(fake_app):
     clicks = []
     events = []
     fake_app.ui_sound = SimpleNamespace(play_click=lambda: clicks.append("click"))
-    AppContext.set(fake_app)
 
     async def handle_click(event):
         events.append(event)
 
     wrapped = wrap_click_handler(handle_click)
+    event = _event(fake_app)
 
     assert inspect.iscoroutinefunction(wrapped)
-    asyncio.run(wrapped("event"))
+    asyncio.run(wrapped(event))
     assert clicks == ["click"]
-    assert events == ["event"]
+    assert events == [event]
 
 
 def test_button_wrapper_preserves_async_handlers(fake_app):
     clicks = []
     events = []
     fake_app.ui_sound = SimpleNamespace(play_click=lambda: clicks.append("click"))
-    AppContext.set(fake_app)
 
     async def handle_click(event):
         events.append(event)
 
     button = ui.Button(text="Save", on_click=handle_click)
+    event = _event(fake_app)
 
     assert inspect.iscoroutinefunction(button.on_click)
-    asyncio.run(button.on_click("event"))
+    asyncio.run(button.on_click(event))
     assert clicks == ["click"]
-    assert events == ["event"]
+    assert events == [event]
 
 
 def test_clickable_container_wrapper_plays_click_sound(fake_app):
     clicks = []
     events = []
     fake_app.ui_sound = SimpleNamespace(play_click=lambda: clicks.append("click"))
-    AppContext.set(fake_app)
     container = ui.Container(on_click=lambda e: events.append(e))
+    event = _event(fake_app)
 
-    container.on_click("event")
+    container.on_click(event)
 
     assert clicks == ["click"]
-    assert events == ["event"]
+    assert events == [event]
 
 
 def test_version_card_action_plays_click_sound(fake_app):
     clicks = []
     events = []
     fake_app.ui_sound = SimpleNamespace(play_click=lambda: clicks.append("click"))
-    AppContext.set(fake_app)
     card = ui.VersionCard().create("Aeronautics", on_action_click=lambda e: events.append(e))
     card.on_enter(SimpleNamespace())
     action = card.content.content.controls[2].content
+    event = _event(fake_app)
 
-    action.on_tap("event")
+    action.on_tap(event)
 
     assert clicks == ["click"]
-    assert events == ["event"]
+    assert events == [event]

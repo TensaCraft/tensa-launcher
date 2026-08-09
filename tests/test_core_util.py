@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import sys
 import subprocess
+import sys
 from types import SimpleNamespace
 
 from launcher.core import util

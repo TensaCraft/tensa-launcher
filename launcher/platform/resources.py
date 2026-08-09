@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,8 +24,12 @@ class ResourceService:
     def get_resource_path(self, *path_parts: str) -> Path | None:
         normalized_parts = self._normalize_parts(*path_parts)
         candidates: list[Path] = []
-        if is_frozen() and hasattr(sys, "_MEIPASS"):
-            candidates.append(Path(sys._MEIPASS) / "launcher" / "assets" / Path(*normalized_parts))
+        flet_assets_dir = os.environ.get("FLET_ASSETS_DIR")
+        if flet_assets_dir:
+            candidates.append(Path(flet_assets_dir) / Path(*normalized_parts))
+        frozen_root = getattr(sys, "_MEIPASS", None)
+        if is_frozen() and frozen_root:
+            candidates.append(Path(frozen_root) / "launcher" / "assets" / Path(*normalized_parts))
         candidates.append(PACKAGE_ASSETS_DIR / Path(*normalized_parts))
 
         for path in candidates:

@@ -16,9 +16,12 @@ if str(ROOT_DIR) not in sys.path:
 from launcher import APP_NAME, __version__, ui  # noqa: E402
 from launcher.application.catalog import ModrinthCatalogService  # noqa: E402
 from launcher.application.feedback import FeedbackService  # noqa: E402
+from launcher.application.instance_operations import InstanceOperationCoordinator  # noqa: E402
 from launcher.application.modrinth_mods import ModrinthModsService  # noqa: E402
+from launcher.application.shared_resources import SharedResourceCoordinator  # noqa: E402
 from launcher.application.version_content import VersionContentService  # noqa: E402
 from launcher.application.version_options import VersionOptionsService  # noqa: E402
+from launcher.application.version_runtime import VersionRuntime  # noqa: E402
 from launcher.application.world_backups import WorldBackupService  # noqa: E402
 
 
@@ -156,6 +159,7 @@ class FakeVersion:
 class FakeVersionsRepo:
     def __init__(self, versions: list[FakeVersion]) -> None:
         self._versions = list(versions)
+        self._runtime = None
 
     def all(self) -> list[FakeVersion]:
         return list(self._versions)
@@ -171,6 +175,30 @@ class FakeVersionsRepo:
             if version.name == name:
                 return version
         return None
+
+    def bind_runtime(self, runtime) -> None:
+        self._runtime = runtime
+        for version in self._versions:
+            binder = getattr(version, "bind_runtime", None)
+            if callable(binder):
+                binder(runtime)
+
+    def prepare(self, version):
+        persistence_binder = getattr(version, "bind_persistence", None)
+        if callable(persistence_binder):
+            persistence_binder(self._save_version)
+        runtime_binder = getattr(version, "bind_runtime", None)
+        if callable(runtime_binder):
+            runtime_binder(self._runtime)
+        return version
+
+    def _save_version(self, version) -> None:
+        self._versions = [
+            item
+            for item in self._versions
+            if item.version_id != version.version_id and getattr(item, "id", None) != version.version_id
+        ]
+        self._versions.append(version)
 
     def remove(self, key: str, *, delete_files: bool = True) -> None:
         if delete_files:
@@ -219,7 +247,7 @@ class FakeProfilesRepo:
     def create_profile(self, name: str, payload: dict[str, Any]):
         self._profiles[name] = dict(payload)
         self.set_default_profile(name)
-        return None
+        return {"status": True, "text": "profile_created"}
 
 
 @pytest.fixture
@@ -260,11 +288,18 @@ def fake_app(tmp_path: Path):
     app.util = util
     app.log = DummyLogger()
     app.config = config
+    app.instance_operations = InstanceOperationCoordinator()
+    app.shared_resources = SharedResourceCoordinator()
     app.catalog = ModrinthCatalogService()
     app.modrinth_mods = ModrinthModsService()
     app.version_options = VersionOptionsService()
     app.content = VersionContentService(util.minecraft_dir, app.log)
-    app.world_backups = WorldBackupService(util.minecraft_dir, config, app.log)
+    app.world_backups = WorldBackupService(
+        util.minecraft_dir,
+        config,
+        app.log,
+        instance_operations=app.instance_operations,
+    )
     app.trans = lambda key, **placeholders: (
         f"{key} ({', '.join(f'{name}={value}' for name, value in placeholders.items())})"
         if placeholders
@@ -310,6 +345,15 @@ def fake_app(tmp_path: Path):
     app.curseforge_import_modal = lambda *_args, **_kwargs: SimpleNamespace(show=lambda: None)
     app.form_modal = lambda *_args, **_kwargs: SimpleNamespace(open=lambda: None)
 
+    from launcher.core.api import TensaCraftAPI
+    from launcher.core.game import Game
+    from launcher.core.launcher import Launcher
+
+    app.launcher = Launcher(app)
+    app.game = Game(app)
+    app.tensa_api = TensaCraftAPI(app)
+    app.versions.bind_runtime(VersionRuntime(app))
+    page.data = app
     app._content_area = None
 
     return app

@@ -9,8 +9,6 @@ from launcher.application.installed_components import InstalledComponentsService
 from launcher.application.tensacraft_catalog import TensaCraftCatalogService
 from launcher.application.tensacraft_install_state import mark_pending, unmark_pending
 from launcher.application.version_creation import VersionCreateOption, VersionCreationCatalogService
-from launcher.core import Launcher
-from launcher.core.api import TensaCraftAPI
 from launcher.core.versions import Version
 
 from ..controls.button import Button
@@ -44,6 +42,7 @@ class VersionInstallModal:
             minecraft_dir,
             games_dir=games_dir,
             versions_provider=app.versions.all,
+            loader_provider=app.launcher.get_loader,
         )
 
         self.version_name = build_field(
@@ -142,11 +141,10 @@ class VersionInstallModal:
         )
         self.on_type_change(None)
 
-    @staticmethod
-    def _build_loader_options() -> list[dict]:
+    def _build_loader_options(self) -> list[dict]:
         seen = set()
         options = []
-        for loader in Launcher().loaders():
+        for loader in self.app.launcher.loaders():
             loader_id = loader.get_id()
             if loader_id in {"modrinth", "curseforge"} or loader_id in seen:
                 continue
@@ -187,7 +185,7 @@ class VersionInstallModal:
     def _loader_minecraft_versions(self, loader_id: str) -> list[str]:
         self.loader_options_by_version = {}
         if loader_id == "tensacraft":
-            return Launcher().get_loader_versions(loader_id)
+            return self.app.launcher.get_loader_versions(loader_id)
         if loader_id == "minecraft":
             options = self.catalog.minecraft_versions()
         else:
@@ -228,7 +226,7 @@ class VersionInstallModal:
             return
 
         try:
-            packs = TensaCraftAPI().list_versions()
+            packs = self.app.tensa_api.list_versions()
         except Exception as exc:
             self.app.log.error(f"Unable to fetch TensaCraft descriptions: {exc}")
             packs = []
@@ -315,7 +313,7 @@ class VersionInstallModal:
             data = {"name": name, "version": version, "client": loader}
             if self._pending_loader_version and loader != "tensacraft":
                 data["loader_version"] = self._pending_loader_version
-            installed_version = Version(name, data)
+            installed_version = self.app.versions.prepare(Version(name, data))
             if loader == "tensacraft":
                 await run_blocking(installed_version.install)
             else:

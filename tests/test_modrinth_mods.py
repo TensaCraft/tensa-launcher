@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from launcher.application.modrinth_mods import ModInstallFile, ModrinthModsService
 
 
@@ -75,8 +77,20 @@ def test_modrinth_mods_selects_primary_file():
     version_data = {
         "version_number": "1.2.3",
         "files": [
-            {"filename": "secondary.jar", "url": "https://example.com/secondary.jar", "primary": False},
-            {"filename": "primary.jar", "url": "https://example.com/primary.jar", "primary": True},
+            {
+                "filename": "secondary.jar",
+                "url": "https://example.com/secondary.jar",
+                "primary": False,
+                "size": 8,
+                "hashes": {"sha1": "b" * 40},
+            },
+            {
+                "filename": "primary.jar",
+                "url": "https://example.com/primary.jar",
+                "primary": True,
+                "size": 7,
+                "hashes": {"sha512": "a" * 128, "sha1": "b" * 40},
+            },
         ],
     }
 
@@ -86,7 +100,57 @@ def test_modrinth_mods_selects_primary_file():
         url="https://example.com/primary.jar",
         filename="primary.jar",
         version_number="1.2.3",
+        size=7,
+        file_hash="a" * 128,
+        hash_algorithm="sha512",
     )
+
+
+@pytest.mark.parametrize(
+    "file_data",
+    [
+        {
+            "filename": "mod.jar",
+            "url": "http://example.com/mod.jar",
+            "size": 1,
+            "hashes": {"sha512": "a" * 128},
+        },
+        {
+            "filename": "mod.jar",
+            "url": "https://example.com/mod.jar",
+            "size": 0,
+            "hashes": {"sha512": "a" * 128},
+        },
+        {
+            "filename": "mod.jar",
+            "url": "https://example.com/mod.jar",
+            "size": 1,
+            "hashes": {},
+        },
+    ],
+)
+def test_modrinth_mods_rejects_unverifiable_install_files(file_data):
+    assert ModrinthModsService.select_primary_file({"files": [file_data]}) is None
+
+
+def test_modrinth_mods_uses_sha1_when_sha512_is_unavailable():
+    selected = ModrinthModsService.select_primary_file(
+        {
+            "files": [
+                {
+                    "filename": "mod.jar",
+                    "url": "https://example.com/mod.jar",
+                    "size": 5,
+                    "hashes": {"sha1": "b" * 40},
+                    "primary": True,
+                }
+            ]
+        }
+    )
+
+    assert selected is not None
+    assert selected.hash_algorithm == "sha1"
+    assert selected.file_hash == "b" * 40
 
 
 def test_modrinth_mods_detects_installed_file_by_project_title_or_slug():
@@ -135,7 +199,15 @@ def _modrinth_version(
         "game_versions": ["1.20.1"],
         "loaders": loaders or ["fabric"],
         "date_published": date,
-        "files": [{"filename": filename, "url": f"https://example.com/{filename}", "primary": True}],
+        "files": [
+            {
+                "filename": filename,
+                "url": f"https://example.com/{filename}",
+                "primary": True,
+                "size": 3,
+                "hashes": {"sha512": "a" * 128, "sha1": "b" * 40},
+            }
+        ],
         "dependencies": dependencies or [],
     }
 
@@ -147,6 +219,43 @@ def _project(project_id: str) -> dict:
         "project_type": "mod",
         "title": project_id.replace("-", " ").title(),
     }
+
+
+def test_modrinth_mods_treats_sodium_extra_fuzzy_match_as_non_owning_hint(monkeypatch):
+    service = ModrinthModsService()
+    version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
+    sodium_version = _modrinth_version(
+        "sodium-project",
+        "sodium-version",
+        "sodium.jar",
+    )
+    sodium_extra = {
+        "filename": "sodium-extra-fabric-0.6.0.jar",
+        "path": "/tmp/sodium-extra-fabric-0.6.0.jar",
+        "name": "Sodium Extra",
+    }
+    monkeypatch.setattr(
+        "launcher.core.api.modrinth.ModrinthAPI.get_mod_versions",
+        lambda *_args, **_kwargs: [sodium_version],
+    )
+
+    plan = service.build_dependency_plan(
+        {
+            "project_id": "sodium-project",
+            "slug": "sodium",
+            "title": "Sodium",
+        },
+        version,
+        project_type="mod",
+        game_version="1.20.1",
+        installed_items=[sodium_extra],
+        include_implicit_dependencies=False,
+    )
+
+    assert plan.main is not None
+    assert plan.main.installed_item == sodium_extra
+    assert plan.main.action == "install"
+    assert service.owns_installed_item(sodium_extra, "sodium-project") is False
 
 
 def test_dependency_plan_resolves_required_exact_version(monkeypatch):
@@ -192,7 +301,7 @@ def test_dependency_plan_resolves_required_exact_version(monkeypatch):
     assert not plan.blocking_issues
 
 
-def test_dependency_plan_falls_back_to_project_when_dependency_version_is_incompatible(monkeypatch):
+def test_dependency_plan_blocks_incompatible_exact_dependency_without_fallback(monkeypatch):
     service = ModrinthModsService()
     version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
     main_version = _modrinth_version(
@@ -215,19 +324,13 @@ def test_dependency_plan_falls_back_to_project_when_dependency_version_is_incomp
         number="1.0.0",
         date="2026-01-02T00:00:00Z",
     )
-    compatible_latest = _modrinth_version(
-        "dep-project",
-        "dep-fabric",
-        "dep-fabric.jar",
-        loaders=["fabric"],
-        number="2.0.0",
-        date="2026-02-02T00:00:00Z",
-    )
+    dependency_project_lookups = []
 
     def fake_versions(project_id, *_args, **_kwargs):
         if project_id == "main-project":
             return [main_version]
-        return [compatible_latest]
+        dependency_project_lookups.append(project_id)
+        return []
 
     monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod_versions", fake_versions)
     monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_version_by_id", lambda _version_id: incompatible_exact)
@@ -242,9 +345,96 @@ def test_dependency_plan_falls_back_to_project_when_dependency_version_is_incomp
         include_implicit_dependencies=False,
     )
 
-    assert [candidate.version_id for candidate in plan.dependencies_to_install] == ["dep-fabric"]
-    assert plan.dependencies_to_install[0].install_file.filename == "dep-fabric.jar"
-    assert not plan.blocking_issues
+    assert plan.dependencies_to_install == []
+    assert [issue.code for issue in plan.blocking_issues] == ["dependency_incompatible"]
+    assert plan.blocking_issues[0].version_id == "dep-forge"
+    assert dependency_project_lookups == []
+
+
+def test_dependency_plan_blocks_exact_dependency_from_another_project(monkeypatch):
+    service = ModrinthModsService()
+    version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
+    main_version = _modrinth_version(
+        "main-project",
+        "main-version",
+        "main.jar",
+        dependencies=[
+            {
+                "version_id": "wrong-project-version",
+                "project_id": "dep-project",
+                "dependency_type": "required",
+            }
+        ],
+    )
+    wrong_project_version = _modrinth_version(
+        "other-project",
+        "wrong-project-version",
+        "other.jar",
+    )
+
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod_versions", lambda *_args, **_kwargs: [main_version])
+    monkeypatch.setattr(
+        "launcher.core.api.modrinth.ModrinthAPI.get_version_by_id",
+        lambda _version_id: wrong_project_version,
+    )
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod", _project)
+
+    plan = service.build_dependency_plan(
+        {"project_id": "main-project", "slug": "main", "title": "Main"},
+        version,
+        project_type="mod",
+        game_version="1.20.1",
+        installed_items=[],
+        include_implicit_dependencies=False,
+    )
+
+    assert plan.dependencies_to_install == []
+    assert [issue.code for issue in plan.blocking_issues] == ["dependency_project_mismatch"]
+    assert plan.blocking_issues[0].version_id == "wrong-project-version"
+
+
+def test_dependency_plan_blocks_unavailable_exact_dependency_without_fallback(monkeypatch):
+    service = ModrinthModsService()
+    version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
+    main_version = _modrinth_version(
+        "main-project",
+        "main-version",
+        "main.jar",
+        dependencies=[
+            {
+                "version_id": "missing-version",
+                "project_id": "dep-project",
+                "dependency_type": "required",
+            }
+        ],
+    )
+    dependency_project_lookups = []
+
+    def fake_versions(project_id, *_args, **_kwargs):
+        if project_id == "main-project":
+            return [main_version]
+        dependency_project_lookups.append(project_id)
+        return []
+
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod_versions", fake_versions)
+    monkeypatch.setattr(
+        "launcher.core.api.modrinth.ModrinthAPI.get_version_by_id",
+        lambda _version_id: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod", _project)
+
+    plan = service.build_dependency_plan(
+        {"project_id": "main-project", "slug": "main", "title": "Main"},
+        version,
+        project_type="mod",
+        game_version="1.20.1",
+        installed_items=[],
+        include_implicit_dependencies=False,
+    )
+
+    assert plan.dependencies_to_install == []
+    assert [issue.code for issue in plan.blocking_issues] == ["dependency_resolution_failed"]
+    assert dependency_project_lookups == []
 
 
 def test_dependency_plan_adds_fabric_api_for_fabric_mod_without_declared_dependency(monkeypatch):
@@ -399,6 +589,9 @@ def test_dependency_plan_treats_same_installed_dependency_version_as_satisfied(m
         "path": "/tmp/dep-new.jar",
         "modrinth_project_id": "dep-project",
         "modrinth_version_id": "dep-new",
+        "modrinth_hash_algorithm": "sha512",
+        "modrinth_file_hash": "a" * 128,
+        "modrinth_provenance_authoritative": True,
     }
 
     monkeypatch.setattr(
@@ -450,6 +643,9 @@ def test_dependency_plan_replaces_older_installed_dependency(monkeypatch):
         "path": "/tmp/dep-old.jar",
         "modrinth_project_id": "dep-project",
         "modrinth_version_id": "dep-old",
+        "modrinth_hash_algorithm": "sha512",
+        "modrinth_file_hash": "a" * 128,
+        "modrinth_provenance_authoritative": True,
     }
 
     monkeypatch.setattr(
@@ -511,6 +707,9 @@ def test_dependency_plan_blocks_incompatible_installed_dependency(monkeypatch):
         "filename": "bad.jar",
         "path": "/tmp/bad.jar",
         "modrinth_project_id": "bad-project",
+        "modrinth_hash_algorithm": "sha512",
+        "modrinth_file_hash": "a" * 128,
+        "modrinth_provenance_authoritative": True,
     }
 
     monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod_versions", lambda *_args, **_kwargs: [main_version])

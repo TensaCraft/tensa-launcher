@@ -1,28 +1,78 @@
 from __future__ import annotations
 
-import shutil
-import zipfile
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
-from launcher.application.feedback import OperationHandle
+from launcher.application.curseforge_install import (
+    CurseForgeInstallLimits,
+    CurseForgeInstallService,
+)
+from launcher.application.curseforge_install import (
+    FileMetadata as _FileMetadata,
+)
 from launcher.application.curseforge_manifest import CurseForgeManifestService
-from launcher.core.async_downloader import AsyncDownloader, DownloadTask
+from launcher.application.feedback import OperationHandle
+from launcher.application.file_transaction import build_commit_key
+from launcher.application.instance_operations import (
+    InstanceOperationBusy,
+    InstanceOperationLease,
+)
+from launcher.application.version_profile_state import (
+    capture_version_profile,
+    restore_version_profile,
+)
+from launcher.core.async_downloader import AsyncDownloader
 from launcher.core.versions import Version
 from launcher.models.logger import Logger
+
 from .base import BaseLoader
 
 
 class CurseForgeLoader(BaseLoader):
     DOWNLOAD_URL_TEMPLATE = "https://www.curseforge.com/api/v1/mods/{project_id}/files/{file_id}/download"
     FILE_META_URL_TEMPLATE = "https://www.curseforge.com/api/v1/mods/{project_id}/files/{file_id}"
+    MAX_OVERRIDE_MEMBERS = 20_000
+    MAX_OVERRIDE_ENTRY_SIZE = 1024 * 1024 * 1024
+    MAX_OVERRIDE_TOTAL_SIZE = 4 * 1024 * 1024 * 1024
+
+    _HASH_ALGORITHM_IDS = {1: "sha1"}
+    _HASH_PRIORITY = {"sha1": 1, "sha256": 2, "sha512": 3}
+    _HASH_LENGTHS = {"sha1": 40, "sha256": 64, "sha512": 128}
     manifest_service = CurseForgeManifestService()
 
-    def __init__(self):
-        super().__init__()
-        self._file_meta_cache: Dict[Tuple[int, int], Tuple[str, Optional[int]]] = {}
+    def __init__(self, *, app: Any):
+        super().__init__(app=app)
+        self._file_meta_cache: Dict[Tuple[int, int], _FileMetadata] = {}
+
+    def _install_service(
+        self,
+        *,
+        operation: OperationHandle | None = None,
+    ) -> CurseForgeInstallService:
+        def progress_callback(
+            completed: int,
+            total: int,
+            current_file: str,
+        ) -> None:
+            self._update_feedback_operation(
+                status=current_file,
+                progress=completed,
+                max_progress=total,
+                operation=operation,
+            )
+
+        return CurseForgeInstallService(
+            limits=CurseForgeInstallLimits(
+                override_members=self.MAX_OVERRIDE_MEMBERS,
+                override_entry_size=self.MAX_OVERRIDE_ENTRY_SIZE,
+                override_total_size=self.MAX_OVERRIDE_TOTAL_SIZE,
+            ),
+            downloader_factory=lambda **kwargs: AsyncDownloader(**kwargs),
+            progress_callback=progress_callback,
+        )
 
     def get_id(self) -> str:
         return "curseforge"
@@ -46,7 +96,33 @@ class CurseForgeLoader(BaseLoader):
         java_path: Optional[str] = None,
         loader_version: Optional[str] = None,
         operation: OperationHandle | None = None,
+        lease: InstanceOperationLease | None = None,
     ) -> None:
+        game_path = self.get_game_path(version.version_id)
+        try:
+            with self._instance_operation(game_path, "curseforge_install", lease=lease):
+                self._ensure_instance_idle(game_path, version.name)
+                self._install_locked(
+                    version,
+                    callback=callback,
+                    java_path=java_path,
+                    loader_version=loader_version,
+                    operation=operation,
+                )
+        except InstanceOperationBusy as exc:
+            raise RuntimeError(
+                self.app.trans("instance_operation_busy", version=version.name)
+            ) from exc
+
+    def _install_locked(
+        self,
+        version: Version,
+        callback: Optional[Any] = None,
+        java_path: Optional[str] = None,
+        loader_version: Optional[str] = None,
+        operation: OperationHandle | None = None,
+    ) -> None:
+        version_snapshot = capture_version_profile(version)
         owns_operation = operation is None
         previous_operation = self._feedback_operation
         if operation is None:
@@ -92,13 +168,50 @@ class CurseForgeLoader(BaseLoader):
                     requested_loader_version=requested_loader_version,
                     operation=operation,
                 )
-                from launcher.core import Launcher
+                client_name = self.app.launcher.get_loader(loader_name).get_name()
 
-                client_name = Launcher.get_loader(loader_name).get_name()
-
-            self._apply_overrides(source_path, source_kind, manifest, game_path)
-
-            download_result = self._download_manifest_files(manifest.get("files") or [], game_path, operation=operation)
+            install_service = self._install_service(operation=operation)
+            remote_files, download_result = install_service.plan_manifest_files(
+                manifest.get("files") or [],
+                game_path,
+                metadata_resolver=self._resolve_file_metadata,
+                download_url=lambda project_id, file_id: (
+                    self.DOWNLOAD_URL_TEMPLATE.format(
+                        project_id=project_id,
+                        file_id=file_id,
+                    )
+                ),
+            )
+            if download_result["failed"] == 0:
+                overrides = install_service.plan_overrides(
+                    source_path,
+                    source_kind,
+                    manifest,
+                    game_path,
+                )
+                download_result = install_service.install_content(
+                    game_path=game_path,
+                    remote_files=remote_files,
+                    overrides=overrides,
+                    source_path=source_path,
+                    source_kind=source_kind,
+                    operation_name="curseforge-install",
+                    result=download_result,
+                    commit_callback=lambda: self._commit_profile(
+                        version,
+                        game_path=game_path,
+                        minecraft_version=mc_version,
+                        installed_loader=installed_loader,
+                        loader_version=actual_loader_version,
+                        client_name=client_name,
+                        manifest=manifest,
+                    ),
+                    commit_key=build_commit_key("curseforge-profile", manifest),
+                )
+            else:
+                Logger.warning(
+                    "CurseForge file preflight failed before override staging"
+                )
             if download_result["failed"] > 0:
                 errors_preview = "; ".join(download_result["errors"][:3])
                 raise ValueError(
@@ -106,183 +219,122 @@ class CurseForgeLoader(BaseLoader):
                     f"{f' {errors_preview}' if errors_preview else ''}"
                 )
 
-            version.path = str(game_path)
-            version.version = mc_version
-            version.loader = installed_loader
-            version.loader_version = actual_loader_version
-            version.client = client_name
-            version.options = dict(version.options or {})
-            version.options.pop("curseforge_source_path", None)
-            version.options.pop("curseforge_source_type", None)
-            version.options["curseforge_manifest_name"] = str(manifest.get("name") or "")
-            version.options["curseforge_manifest_version"] = str(manifest.get("version") or "")
-            version.save()
-
             if callback:
                 callback()
+        except Exception:
+            restore_version_profile(version, version_snapshot)
+            raise
         finally:
             if owns_operation:
                 self.finish_feedback_operation(operation)
             else:
                 self._feedback_operation = previous_operation
 
-    def _apply_overrides(self, source_path: Path, source_kind: str, manifest: dict, game_path: Path) -> None:
-        overrides_path = str(manifest.get("overrides") or "overrides").strip().replace("\\", "/").strip("/")
-        if not overrides_path:
-            return
-
-        if source_kind == "zip":
-            self._extract_overrides_from_zip(source_path, overrides_path, game_path)
-            return
-
-        source_root = (source_path.parent / overrides_path).resolve()
-        if not source_root.exists() or not source_root.is_dir():
-            Logger.info("No local overrides directory found next to manifest.json")
-            return
-
-        Logger.info(f"Copying overrides from {source_root}")
-        for entry in source_root.rglob("*"):
-            if not entry.is_file():
-                continue
-
-            relative = entry.relative_to(source_root)
-            target = game_path / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(entry, target)
-
-    def _extract_overrides_from_zip(self, archive_path: Path, overrides_dir: str, game_path: Path) -> None:
-        prefix = f"{overrides_dir}/"
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            members = [name for name in zf.namelist() if name.startswith(prefix)]
-            if not members:
-                Logger.info(f"No overrides found in archive: {overrides_dir}/")
-                return
-
-            Logger.info(f"Extracting {len(members)} override files")
-            game_root = game_path.resolve()
-
-            for member in members:
-                if member.endswith("/"):
-                    continue
-
-                relative_name = member[len(prefix):]
-                if not relative_name:
-                    continue
-
-                relative_path = Path(relative_name)
-                if ".." in relative_path.parts:
-                    Logger.warning(f"Skipping unsafe override path: {member}")
-                    continue
-
-                target = (game_path / relative_path).resolve()
-                try:
-                    target.relative_to(game_root)
-                except ValueError:
-                    Logger.warning(f"Skipping override outside target directory: {member}")
-                    continue
-
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-
-    def _download_manifest_files(
-        self,
-        file_entries: List[dict],
-        game_path: Path,
+    @staticmethod
+    def _commit_profile(
+        version: Version,
         *,
-        operation: OperationHandle | None = None,
-    ) -> Dict[str, Any]:
-        result: Dict[str, Any] = {"success": 0, "failed": 0, "skipped": 0, "errors": []}
-        if not file_entries:
-            Logger.info("CurseForge manifest has no files to download")
-            return result
+        game_path: Path,
+        minecraft_version: str,
+        installed_loader: str,
+        loader_version: str | None,
+        client_name: str,
+        manifest: dict[str, Any],
+    ) -> None:
+        version.path = str(game_path)
+        version.version = minecraft_version
+        version.loader = installed_loader
+        version.loader_version = loader_version
+        version.client = client_name
+        version.options = dict(version.options or {})
+        version.options.pop("curseforge_source_path", None)
+        version.options.pop("curseforge_source_type", None)
+        version.options["curseforge_manifest_name"] = str(manifest.get("name") or "")
+        version.options["curseforge_manifest_version"] = str(manifest.get("version") or "")
+        version.save()
 
-        mods_dir = game_path / "mods"
-        mods_dir.mkdir(parents=True, exist_ok=True)
-
-        tasks: List[DownloadTask] = []
-        for entry in file_entries:
-            if not isinstance(entry, dict):
-                continue
-
-            if entry.get("required", True) is False:
-                result["skipped"] += 1
-                continue
-
-            project_id = self._safe_int(entry.get("projectID"))
-            file_id = self._safe_int(entry.get("fileID"))
-            if project_id is None or file_id is None:
-                result["failed"] += 1
-                result["errors"].append(f"Invalid manifest file entry: {entry}")
-                continue
-
-            file_name, expected_size = self._resolve_file_metadata(project_id, file_id)
-            download_url = self.DOWNLOAD_URL_TEMPLATE.format(project_id=project_id, file_id=file_id)
-            destination = mods_dir / file_name
-            task = DownloadTask(
-                url=download_url,
-                destination=destination,
-                expected_size=expected_size,
-                task_id=f"{project_id}:{file_id}",
-                use_requests=True,
-            )
-            tasks.append(task)
-
-        if not tasks:
-            return result
-
-        downloader = AsyncDownloader(max_workers=6)
-
-        def progress_callback(completed: int, total: int, current_file: str) -> None:
-            self._update_feedback_operation(
-                status=current_file,
-                progress=completed,
-                max_progress=total,
-                operation=operation,
-            )
-
-        download_result = downloader.download_files(
-            tasks,
-            progress_callback=progress_callback,
-            skip_existing=True,
-        )
-
-        result["success"] += download_result["success"]
-        result["failed"] += download_result["failed"]
-        result["skipped"] += download_result["skipped"]
-        result["errors"].extend(download_result["errors"])
-        return result
-
-    def _resolve_file_metadata(self, project_id: int, file_id: int) -> tuple[str, Optional[int]]:
+    def _resolve_file_metadata(self, project_id: int, file_id: int) -> _FileMetadata:
         cache_key = (project_id, file_id)
         cached = self._file_meta_cache.get(cache_key)
         if cached:
             return cached
 
-        fallback_name = f"{project_id}-{file_id}.jar"
-        fallback_size: Optional[int] = None
         meta_url = self.FILE_META_URL_TEMPLATE.format(project_id=project_id, file_id=file_id)
 
         try:
             response = requests.get(meta_url, headers={"User-Agent": "launcher/3.0"}, timeout=20)
             if response.status_code != 200:
-                Logger.warning(f"Failed to fetch CurseForge metadata for {project_id}/{file_id}: {response.status_code}")
-                self._file_meta_cache[cache_key] = (fallback_name, fallback_size)
-                return fallback_name, fallback_size
+                raise ValueError(
+                    f"CurseForge metadata request failed with HTTP {response.status_code}"
+                )
 
             payload = response.json().get("data") or {}
-            file_name = str(payload.get("fileName") or fallback_name).strip() or fallback_name
+            file_name = str(payload.get("fileName") or "").strip()
             file_size = payload.get("fileLength")
-            if not isinstance(file_size, int) or file_size <= 0:
-                file_size = None
+            if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size <= 0:
+                raise ValueError("CurseForge metadata is missing a valid fileLength")
 
-            resolved = (file_name, file_size)
+            hash_algorithm, hash_value = self._select_strongest_hash(payload.get("hashes"))
+            resolved = _FileMetadata(
+                name=file_name,
+                size=file_size,
+                hash_value=hash_value,
+                hash_algorithm=hash_algorithm,
+            )
             self._file_meta_cache[cache_key] = resolved
             return resolved
+        except ValueError:
+            raise
         except Exception as exc:
-            Logger.warning(f"Could not read CurseForge metadata for {project_id}/{file_id}: {exc}")
-            self._file_meta_cache[cache_key] = (fallback_name, fallback_size)
-            return fallback_name, fallback_size
+            raise ValueError(
+                f"Could not read CurseForge metadata for {project_id}/{file_id}: {exc}"
+            ) from exc
+
+    @classmethod
+    def _select_strongest_hash(cls, hashes: Any) -> tuple[str, str]:
+        if not isinstance(hashes, list):
+            raise ValueError("CurseForge metadata is missing file hashes")
+
+        supported: list[tuple[int, str, str]] = []
+        for item in hashes:
+            if not isinstance(item, dict):
+                continue
+
+            algorithm = cls._normalize_hash_algorithm(item.get("algo"))
+            value = str(item.get("value") or "").strip().lower()
+            if algorithm is None or not cls._is_valid_hash(value, algorithm):
+                continue
+            supported.append((cls._HASH_PRIORITY[algorithm], algorithm, value))
+
+        if not supported:
+            raise ValueError("CurseForge metadata has no supported valid file hash")
+
+        _, algorithm, value = max(supported, key=lambda candidate: candidate[0])
+        return algorithm, value
+
+    @classmethod
+    def _normalize_hash_algorithm(cls, value: Any) -> str | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return cls._HASH_ALGORITHM_IDS.get(value)
+        if not isinstance(value, str):
+            return None
+
+        normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+        if normalized.isdigit():
+            return cls._HASH_ALGORITHM_IDS.get(int(normalized))
+        aliases = {
+            "sha1": "sha1",
+            "sha256": "sha256",
+            "sha512": "sha512",
+        }
+        return aliases.get(normalized)
+
+    @classmethod
+    def _is_valid_hash(cls, value: str, algorithm: str) -> bool:
+        expected_length = cls._HASH_LENGTHS[algorithm]
+        return len(value) == expected_length and all(character in "0123456789abcdef" for character in value)
 
     @staticmethod
     def _safe_int(value: Any) -> Optional[int]:

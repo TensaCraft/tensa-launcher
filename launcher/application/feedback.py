@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import itertools
 import inspect
+import itertools
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Literal
-
 
 FeedbackLevel = Literal["info", "success", "warning", "error"]
 

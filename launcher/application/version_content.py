@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import json
 import shutil
-import zipfile
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Sequence
+
+from launcher.application.mod_identity import (
+    inspect_mod_jar,
+    normalize_file_hash,
+    verify_file_hash,
+)
+from launcher.storage.atomic import (
+    atomic_copy_file,
+    atomic_write_json,
+    atomic_write_text,
+)
 
 
 class VersionContentService:
     MODRINTH_METADATA_FILE = "modrinth-content.json"
+    MODRINTH_METADATA_SCHEMA_VERSION = 2
     IRIS_PROPERTIES_FILE = "iris.properties"
 
     def __init__(self, minecraft_dir: str | Path, logger) -> None:
@@ -244,24 +255,74 @@ class VersionContentService:
         version_data: dict[str, Any],
         install_file,
     ) -> None:
-        index_path = self._modrinth_metadata_path(version, create=True)
+        self.write_modrinth_content_batch(
+            version,
+            [
+                (
+                    content_key,
+                    Path(file_path),
+                    project,
+                    version_data,
+                    install_file,
+                )
+            ],
+        )
+
+    def write_modrinth_content_batch(
+        self,
+        version,
+        records: Sequence[tuple[str, Path, dict[str, Any], dict[str, Any], Any]],
+        *,
+        removed_paths: Sequence[Path] = (),
+        output_path: Path | None = None,
+    ) -> Path | None:
+        index_path = self._modrinth_metadata_path(version)
         if index_path is None:
-            return
+            return None
 
         version_root = index_path.parent.parent
-        relative_path = self._relative_content_path(version_root, Path(file_path))
         index = self._load_modrinth_metadata(index_path)
-        files = index.setdefault("files", {})
-        files[relative_path] = {
-            "content_key": content_key,
-            "filename": install_file.filename,
-            "project_id": project.get("project_id"),
-            "project_slug": project.get("slug"),
-            "project_title": project.get("title"),
-            "version_id": version_data.get("id"),
-            "version_number": version_data.get("version_number"),
-        }
-        self._write_modrinth_metadata(index_path, index)
+        files = index.get("files")
+        if not isinstance(files, dict):
+            files = {}
+            index["files"] = files
+        index["schema_version"] = self.MODRINTH_METADATA_SCHEMA_VERSION
+
+        for removed_path in removed_paths:
+            relative_path = self._strict_relative_content_path(version_root, Path(removed_path))
+            for candidate in self._metadata_path_candidates_from_relative(relative_path):
+                files.pop(candidate, None)
+
+        for content_key, file_path, project, version_data, install_file in records:
+            relative_path = self._strict_relative_content_path(version_root, Path(file_path))
+            metadata = {
+                "content_key": content_key,
+                "filename": install_file.filename,
+                "project_id": project.get("project_id"),
+                "project_slug": project.get("slug"),
+                "project_title": project.get("title"),
+                "version_id": version_data.get("id"),
+                "version_number": version_data.get("version_number"),
+            }
+            file_hash = self._install_file_hash(install_file)
+            if file_hash is not None:
+                hash_algorithm, expected_digest = file_hash
+                source_path = self._metadata_hash_source(
+                    version_root,
+                    Path(file_path),
+                    relative_path,
+                    output_path,
+                )
+                if not verify_file_hash(source_path, hash_algorithm, expected_digest):
+                    raise ValueError(
+                        f"Installed Modrinth content hash does not match: {relative_path}"
+                    )
+                metadata["hash_algorithm"] = hash_algorithm
+                metadata["file_hash"] = expected_digest
+            files[relative_path] = metadata
+
+        self._write_modrinth_metadata(output_path or index_path, index)
+        return index_path
 
     def apply_modrinth_metadata(self, version, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         index_path = self._modrinth_metadata_path(version)
@@ -270,6 +331,8 @@ class VersionContentService:
 
         version_root = index_path.parent.parent
         files = self._load_modrinth_metadata(index_path).get("files", {})
+        if not isinstance(files, dict):
+            return items
         for item in items:
             candidates = self._metadata_path_candidates(version_root, Path(item["path"]))
             metadata = next((files[path] for path in candidates if path in files), None)
@@ -280,6 +343,21 @@ class VersionContentService:
             item["modrinth_project_title"] = metadata.get("project_title")
             item["modrinth_version_id"] = metadata.get("version_id")
             item["modrinth_version_number"] = metadata.get("version_number")
+            file_hash = normalize_file_hash(
+                metadata.get("hash_algorithm"),
+                metadata.get("file_hash"),
+            )
+            item["modrinth_provenance_authoritative"] = False
+            if file_hash is None:
+                continue
+            hash_algorithm, expected_digest = file_hash
+            item["modrinth_hash_algorithm"] = hash_algorithm
+            item["modrinth_file_hash"] = expected_digest
+            item["modrinth_provenance_authoritative"] = verify_file_hash(
+                Path(item["path"]),
+                hash_algorithm,
+                expected_digest,
+            )
         return items
 
     def _modrinth_metadata_path(self, version, *, create: bool = False) -> Path | None:
@@ -290,6 +368,12 @@ class VersionContentService:
         if create:
             metadata_dir.mkdir(parents=True, exist_ok=True)
         return metadata_dir / self.MODRINTH_METADATA_FILE
+
+    def get_version_directory(self, version) -> Path | None:
+        return self._resolve_version_dir(version)
+
+    def get_modrinth_metadata_path(self, version) -> Path | None:
+        return self._modrinth_metadata_path(version)
 
     @staticmethod
     def _load_modrinth_metadata(index_path: Path) -> dict[str, Any]:
@@ -304,9 +388,7 @@ class VersionContentService:
 
     @staticmethod
     def _write_modrinth_metadata(index_path: Path, data: dict[str, Any]) -> None:
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        with index_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
+        atomic_write_json(index_path, data, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _relative_content_path(version_root: Path, file_path: Path) -> str:
@@ -315,49 +397,69 @@ class VersionContentService:
         except ValueError:
             return file_path.name
 
+    @staticmethod
+    def _strict_relative_content_path(version_root: Path, file_path: Path) -> str:
+        resolved_root = version_root.resolve()
+        resolved_path = file_path.resolve()
+        try:
+            return resolved_path.relative_to(resolved_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"Modrinth content path is outside the version directory: {file_path}") from exc
+
     def _metadata_path_candidates(self, version_root: Path, file_path: Path) -> list[str]:
         relative_path = self._relative_content_path(version_root, file_path)
+        return self._metadata_path_candidates_from_relative(relative_path)
+
+    @staticmethod
+    def _metadata_path_candidates_from_relative(relative_path: str) -> list[str]:
         candidates = [relative_path]
         if relative_path.endswith(".disabled"):
             candidates.append(relative_path[:-9])
         return candidates
 
+    @staticmethod
+    def _install_file_hash(install_file: Any) -> tuple[str, str] | None:
+        algorithm = getattr(install_file, "hash_algorithm", "")
+        digest = getattr(install_file, "file_hash", "")
+        if not algorithm and not digest:
+            return None
+        normalized = normalize_file_hash(algorithm, digest)
+        if normalized is None:
+            raise ValueError("Modrinth install file has an invalid content hash")
+        return normalized
+
+    @staticmethod
+    def _metadata_hash_source(
+        version_root: Path,
+        file_path: Path,
+        relative_path: str,
+        output_path: Path | None,
+    ) -> Path:
+        if output_path is not None:
+            work_root = (version_root / ".tensalauncher-sync").resolve()
+            resolved_output = output_path.resolve()
+            for ancestor in resolved_output.parents:
+                if ancestor.name != "stage" or ancestor.parent.parent.resolve() != work_root:
+                    continue
+                staged_path = ancestor.joinpath(*PurePosixPath(relative_path).parts)
+                if staged_path.is_file():
+                    return staged_path
+                break
+        return file_path
+
     def read_mod_metadata(self, jar_path: Path) -> dict[str, Any]:
-        metadata: dict[str, Any] = {}
-        try:
-            with zipfile.ZipFile(jar_path, "r") as archive:
-                names = archive.namelist()
-                if "fabric.mod.json" in names:
-                    with archive.open("fabric.mod.json") as handle:
-                        data = json.load(handle)
-                    metadata["name"] = data.get("name", "")
-                    metadata["version"] = data.get("version", "")
-                    metadata["description"] = data.get("description", "")
-                    metadata["id"] = data.get("id", "")
-                elif "mcmod.info" in names:
-                    with archive.open("mcmod.info") as handle:
-                        data = json.load(handle)
-                    if isinstance(data, list) and data:
-                        mod_data = data[0]
-                        metadata["name"] = mod_data.get("name", "")
-                        metadata["version"] = mod_data.get("version", "")
-                        metadata["description"] = mod_data.get("description", "")
-                        metadata["id"] = mod_data.get("modid", "")
-                elif "META-INF/mods.toml" in names:
-                    with archive.open("META-INF/mods.toml") as handle:
-                        content = handle.read().decode("utf-8")
-                    for line in content.splitlines():
-                        if "modId" in line and "=" in line:
-                            metadata["id"] = line.split("=", 1)[1].strip().strip('"')
-                        elif "displayName" in line and "=" in line:
-                            metadata["name"] = line.split("=", 1)[1].strip().strip('"')
-                        elif "version" in line and "=" in line:
-                            metadata["version"] = line.split("=", 1)[1].strip().strip('"')
-                        elif "description" in line and "=" in line:
-                            metadata["description"] = line.split("=", 1)[1].strip().strip('"')
-        except Exception as exc:
-            self._log("debug", f"Failed to read mod metadata from {jar_path.name}: {exc}")
-        return metadata
+        inspection = inspect_mod_jar(jar_path)
+        descriptor = inspection.primary_descriptor
+        if descriptor is None:
+            reason = inspection.error_kind.value if inspection.error_kind is not None else "missing descriptor"
+            self._log("debug", f"Failed to read mod metadata from {jar_path.name}: {reason}")
+            return {}
+        return {
+            "name": descriptor.name or "",
+            "version": descriptor.version or "",
+            "description": descriptor.description or "",
+            "id": descriptor.mod_id,
+        }
 
     def toggle_mod(self, mod: dict[str, Any]) -> bool:
         mod_path = Path(mod["path"])
@@ -381,9 +483,7 @@ class VersionContentService:
 
         mod_path = Path(mod["path"])
         backup_path = backup_dir / f"{mod['filename']}.backup"
-        if backup_path.exists():
-            backup_path.unlink()
-        shutil.copy2(mod_path, backup_path)
+        atomic_copy_file(mod_path, backup_path)
         self._log("info", f"Backup created for {mod['filename']}")
         return True
 
@@ -394,7 +494,7 @@ class VersionContentService:
         backup_path = backup_dir / f"{mod['filename']}.backup"
         if not backup_path.exists():
             raise FileNotFoundError("Backup file was not found")
-        shutil.copy2(backup_path, Path(mod["path"]))
+        atomic_copy_file(backup_path, Path(mod["path"]))
 
     @staticmethod
     def delete_mod(mod: dict[str, Any]) -> None:
@@ -524,7 +624,7 @@ class VersionContentService:
             output.append(line)
         if not replaced:
             output.append(replacement)
-        options_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+        atomic_write_text(options_path, "\n".join(output) + "\n")
 
     def _remove_options_entries(self, options_path: Path | None, key: str, entries_to_remove: set[str]) -> None:
         entries = [entry for entry in self._read_options_list(options_path, key) if entry not in entries_to_remove]
@@ -586,7 +686,7 @@ class VersionContentService:
                 output.append(line)
         for key, value in pending.items():
             output.append(f"{key}={value}")
-        properties_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+        atomic_write_text(properties_path, "\n".join(output) + "\n")
 
     def _resolve_version_dir(self, version) -> Path | None:
         if not version.path:

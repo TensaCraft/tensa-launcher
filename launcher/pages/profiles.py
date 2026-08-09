@@ -186,8 +186,10 @@ class ProfilesPage:
     def delete_profile(self, e):
         def handle_response(response):
             if response:
-                self.app.profiles.delete_profile(e.control.key)
-                self.app.feedback.info(self.trans("profile_deleted"))
+                if self.app.profiles.delete_profile(e.control.key):
+                    self.app.feedback.info(self.trans("profile_deleted"))
+                else:
+                    self.app.feedback.warning(self.trans("profile_save_failed"))
             self.profiles = self.app.profiles.get_all_profiles()
             self.update_list_view()
             schedule_update(self.page)
@@ -197,8 +199,10 @@ class ProfilesPage:
     def on_switch_change(self, e):
         if e.control.value:
             self.active_profile_key = e.control.key
-            self.app.profiles.set_default_profile(self.active_profile_key)
-            self.app.feedback.info(self.trans("profile_set_as_default", profile=e.control.data.get('name')))
+            if self.app.profiles.set_default_profile(self.active_profile_key):
+                self.app.feedback.info(self.trans("profile_set_as_default", profile=e.control.data.get('name')))
+            else:
+                self.app.feedback.warning(self.trans("profile_save_failed"))
         self.profiles = self.app.profiles.get_all_profiles()
         self.update_list_view()
         # Оновлюємо header в content area

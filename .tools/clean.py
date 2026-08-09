@@ -6,7 +6,6 @@ import os
 import shutil
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 REMOVABLE_PATHS = (
     "build",
@@ -18,6 +17,7 @@ REMOVABLE_PATHS = (
     "profiles.json",
     "versions.json",
     ".tensalauncher-paths.json",
+    ".tensalauncher-locks",
     "app.log",
 )
 EXCLUDED_WALK_ROOTS = {

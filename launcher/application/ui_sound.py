@@ -105,4 +105,12 @@ class UiSoundService:
     def _play_wav_file(cls, sound_file: Path) -> None:
         import winsound
 
-        winsound.PlaySound(str(sound_file), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        play_sound = getattr(winsound, "PlaySound", None)
+        if not callable(play_sound):
+            return
+        flags = (
+            int(getattr(winsound, "SND_FILENAME", 0))
+            | int(getattr(winsound, "SND_ASYNC", 0))
+            | int(getattr(winsound, "SND_NODEFAULT", 0))
+        )
+        play_sound(str(sound_file), flags)

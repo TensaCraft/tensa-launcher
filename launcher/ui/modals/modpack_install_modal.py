@@ -196,7 +196,7 @@ class ModpackInstallModal:
     async def _install_modpack_async(self, project_id: str, version_name: str, version_id: str, icon_url: str | None, operation) -> None:
         final_message = self.trans("installation_complete")
         try:
-            await run_blocking(
+            version = self.app.versions.prepare(
                 Version(
                     project_id,
                     {
@@ -206,8 +206,9 @@ class ModpackInstallModal:
                         "client": "modrinth",
                         "image": icon_url,
                     },
-                ).install
+                )
             )
+            await run_blocking(version.install)
         except Exception as exc:
             self.app.log.error(f"Failed to install modpack '{version_name}': {exc}")
             final_message = self.trans("version_install_error", client="modrinth", version=version_name, error=str(exc))

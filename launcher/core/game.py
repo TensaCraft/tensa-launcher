@@ -10,24 +10,31 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, cast
 
 import minecraft_launcher_lib
 
+from launcher.application.diagnostics import ActionSafety, DiagnosticCase, DiagnosticResult, read_artifact
+from launcher.application.file_sync_journal import FileSyncJournal
 from launcher.application.installed_components import InstalledComponentsService
-from launcher.application.launch_diagnostics import classify_launch_failure
+from launcher.application.instance_operations import (
+    InstanceOperationBusy,
+    InstanceOperationLease,
+)
+from launcher.application.launch_diagnostics import analyze_launch_failure
+from launcher.application.launch_workflow import LaunchPreparationRequest, LaunchWorkflow
 from launcher.application.memory_preferences import MemoryPreferencesService
 from launcher.core import util
 from launcher.core.versions import Version
 from launcher.models.logger import Logger
 from launcher.platform.java_process import java_process_env
-from launcher.shared import AppContext
 
 WINDOWS_CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 EARLY_EXIT_SECONDS = 5.0
 LOG_TAIL_LINES = 40
 LAUNCH_DIAGNOSTICS_LOG = "tensalauncher-launch.log"
 LAUNCH_COOLDOWN_SECONDS = 3.0
+REPAIR_SYNC_DIAGNOSIS_KINDS = {"missing_mod_dependency", "locked_file"}
 
 
 def _log_safely(level: str, message: str) -> None:
@@ -46,8 +53,8 @@ class Game:
     _active_game_dirs: Dict[str, list[object]] = {}
     _launch_guard_lock = threading.RLock()
 
-    def __init__(self, minecraft_dir: str | Path | None = None) -> None:
-        self.app = AppContext.get()
+    def __init__(self, app: Any, minecraft_dir: str | Path | None = None) -> None:
+        self.app = app
         self.mc_dir = self._resolve_minecraft_dir(self.app, minecraft_dir)
 
     @staticmethod
@@ -68,11 +75,7 @@ class Game:
 
     @classmethod
     def _default_minecraft_dir(cls) -> Path:
-        try:
-            app = AppContext.get()
-        except RuntimeError:
-            app = None
-        return cls._resolve_minecraft_dir(app)
+        return Path(util.minecraft_dir)
 
     # ------------------------------------------------------------------
     # Entry
@@ -83,7 +86,45 @@ class Game:
         *,
         allow_duplicate: bool = False,
         profile_key: str | None = None,
-    ) -> Dict[str, object]:
+    ) -> dict[str, Any]:
+        game_dir = self._version_game_dir(v)
+        coordinator = getattr(self.app, "instance_operations", None)
+        if coordinator is None:
+            return self._start_locked(
+                v,
+                allow_duplicate=allow_duplicate,
+                profile_key=profile_key,
+                instance_lease=None,
+            )
+        try:
+            with coordinator.operation(game_dir, "launch") as lease:
+                return self._start_locked(
+                    v,
+                    allow_duplicate=allow_duplicate,
+                    profile_key=profile_key,
+                    instance_lease=lease,
+                )
+        except InstanceOperationBusy as exc:
+            _log_safely(
+                "warning",
+                f"Launch blocked by active {exc.active_kind} operation for {v.name}: {game_dir}",
+            )
+            return {
+                "status": False,
+                "text": self.app.trans(
+                    "instance_operation_busy",
+                    version=v.name,
+                ),
+            }
+
+    def _start_locked(
+        self,
+        v: Version,
+        *,
+        allow_duplicate: bool,
+        profile_key: str | None,
+        instance_lease: InstanceOperationLease | None,
+    ) -> dict[str, Any]:
         t0 = time.perf_counter()
         game_dir = self._version_game_dir(v)
         if not allow_duplicate and self.is_game_dir_active(game_dir):
@@ -112,151 +153,29 @@ class Game:
                 ),
             }
 
-        launch_started = False
-        prepare_success = False
-        prepare_operation = self.app.feedback.begin_operation(
-            self.app.trans("syncing_files_check"),
-            kind="launch",
-            visible=False,
-            auto_open=False,
+        workflow = LaunchWorkflow(
+            self.app,
+            verify=self._verify,
+            build_options=self._build_opts,
+            launch=self._launch,
+            release_launch_slot=self._release_launch_slot,
         )
-        try:
-            prof = self._get_launch_profile(profile_key)
-            if not prof:
-                return {
-                    "status": False,
-                    "text": self.app.trans("no_default_profile"),
-                    "reason": "missing_profile",
-                }
-            requires_reauth = getattr(self.app.auth, "profile_requires_reauth", lambda _profile: False)
-            if requires_reauth(prof):
-                return {"status": False, "text": self.app.trans("profile_reauth_required")}
-
-            t_auth = time.perf_counter()
-            sync_ms = 0.0
-
-            if v.is_tensacraft():
-                sync_result, sync_ms = self._sync_for_launch(v)
-                if sync_result is not None:
-                    return sync_result
-
-                t_verify_start = time.perf_counter()
-                if not self._verify_for_launch(v, prepare_operation):
-                    return {
-                        "status": False,
-                        "text": self.app.trans("version_integrity_check_failed", version=v.name),
-                    }
-                verify_ms = (time.perf_counter() - t_verify_start) * 1000.0
-            else:
-                t_verify_start = time.perf_counter()
-                if not self._verify_for_launch(v, prepare_operation):
-                    return {
-                        "status": False,
-                        "text": self.app.trans("version_integrity_check_failed", version=v.name),
-                    }
-                verify_ms = (time.perf_counter() - t_verify_start) * 1000.0
-
-                if v.force_update:
-                    sync_result, sync_ms = self._sync_for_launch(v)
-                    if sync_result is not None:
-                        return sync_result
-
-            t_sync = time.perf_counter()
-            self._backup_worlds_before_launch(v, prepare_operation)
-            opts = self._build_opts(v, prof)
-            t_opts = time.perf_counter()
-            ok = self._launch(v.loader, v.version, opts, launch_key=launch_key)
-            launch_started = bool(ok)
-            t_launch = time.perf_counter()
-
-            _log_safely(
-                "info",
-                "Launch timing: "
-                f"ver={v.version} loader={v.loader} "
-                f"auth={(t_auth - t0) * 1000.0:.0f}ms "
-                f"verify={verify_ms:.0f}ms "
-                f"sync={sync_ms:.0f}ms "
-                f"opts={(t_opts - t_sync) * 1000.0:.0f}ms "
-                f"launch={(t_launch - t_opts) * 1000.0:.0f}ms "
-                f"total={(t_launch - t0) * 1000.0:.0f}ms",
+        result = workflow.run(
+            LaunchPreparationRequest(
+                version=v,
+                launch_key=launch_key,
+                started_at=t0,
+                profile_key=profile_key,
+                instance_lease=instance_lease,
             )
-
-            if not ok:
-                return {"status": False, "text": self.app.trans("version_integrity_check_failed", version=v.name)}
-            if v.is_tensacraft() and not v.is_home_pinned():
-                v.mark_home_pinned()
-            prepare_success = True
-            return {"status": True, "text": self.app.trans("version_starting", version=v.name)}
-        finally:
-            success_message = None
-            if prepare_success:
-                success_key = "syncing_files_complete" if v.force_update or v.is_tensacraft() else "installation_complete"
-                success_message = self.app.trans(success_key)
-            prepare_operation.finish(
-                success_message,
-                show_success=success_message is not None,
-            )
-            if not launch_started:
-                self._release_launch_slot(launch_key)
-
-    def _sync_for_launch(self, v: Version) -> Tuple[Dict[str, object] | None, float]:
-        t_sync_start = time.perf_counter()
-        try:
-            v.sync_update()
-        except Exception as exc:
-            Logger.error(f"Version sync failed for {v.name}: {exc}")
-            return (
-                {
-                    "status": False,
-                    "text": self.app.trans("version_sync_failed", version=v.name, error=str(exc)),
-                },
-                (time.perf_counter() - t_sync_start) * 1000.0,
-            )
-        return None, (time.perf_counter() - t_sync_start) * 1000.0
-
-    def _get_launch_profile(self, profile_key: str | None):
-        if not profile_key:
-            return self.app.auth.get_default_profile_data()
-        profile_getter = getattr(self.app.auth, "get_profile_data", None)
-        if callable(profile_getter):
-            return profile_getter(profile_key)
-        profile = self.app.profiles.get_profile(profile_key)
-        return self.app.auth.ensure_profile_authorized(profile) if profile else None
-
-    def _backup_worlds_before_launch(self, v: Version, operation) -> None:
-        service = getattr(self.app, "world_backups", None)
-        enabled = getattr(service, "enabled", None)
-        if callable(enabled) and not enabled():
-            return
-        backup = getattr(service, "auto_backup_changed_worlds", None)
-        if not callable(backup):
-            return
-        try:
-            result = backup(v, operation=operation)
-            created = int(getattr(result, "created", 0) or 0)
-            failed = int(getattr(result, "failed", 0) or 0)
-            if created:
-                Logger.info(f"Created {created} world backup(s) before launching {v.name}")
-            if failed:
-                Logger.warning(f"Failed to create {failed} world backup(s) before launching {v.name}")
-        except Exception as exc:
-            Logger.warning(f"World backup step failed before launching {v.name}: {exc!r}")
+        )
+        return result.as_response(self.app.trans)
 
     # ------------------------------------------------------------------
     # Integrity
     # ------------------------------------------------------------------
-    def _verify_for_launch(self, v: Version, operation) -> bool:
-        try:
-            parameters = inspect.signature(self._verify).parameters
-        except (TypeError, ValueError):
-            parameters = {}
-        if "operation" in parameters:
-            return self._verify(v, operation=operation)
-        return self._verify(v)
-
     def _verify(self, v: Version, operation=None) -> bool:
         try:
-            from launcher.core import Launcher
             from launcher.core.integrity import IntegrityChecker
 
             if not v.loader:
@@ -274,7 +193,7 @@ class Game:
                 "tensacraft": "tensacraft",
             }
             key = m.get(loader_name, "minecraft")
-            loader = Launcher.get_loader(key)
+            loader = self.app.launcher.get_loader(key)
 
             chk = IntegrityChecker(self.mc_dir)
             if not self._ensure_base_minecraft_version(v, loader, chk, operation):
@@ -306,6 +225,7 @@ class Game:
         versions_provider = getattr(getattr(self.app, "versions", None), "all", None)
         if not callable(versions_provider):
             versions_provider = None
+        typed_versions_provider = cast(Callable[[], Iterable[Any]] | None, versions_provider)
 
         paths = getattr(self.app, "paths", None)
         games_dir = getattr(paths, "games_dir", None) if paths is not None else None
@@ -313,7 +233,8 @@ class Game:
         service = InstalledComponentsService(
             self.mc_dir,
             games_dir=games_dir,
-            versions_provider=versions_provider,
+            versions_provider=typed_versions_provider,
+            loader_provider=self.app.launcher.get_loader,
         )
         component = service.install_component(
             loader_id,
@@ -332,13 +253,22 @@ class Game:
                 Logger.warning(f"Unable to persist repaired component for {getattr(v, 'name', v.loader)}: {exc}")
         return True
 
-    def _ensure_base_minecraft_version(self, v: Version, loader: object, chk: object, operation=None) -> bool:
+    def _ensure_base_minecraft_version(self, v: Version, loader: Any, chk: Any, operation=None) -> bool:
         mc_version = str(getattr(v, "version", "") or "").strip()
         if not mc_version:
             return True
         try:
             if chk._is_version_installed(mc_version):
-                return True
+                check_version = getattr(chk, "check_version", None)
+                if not callable(check_version):
+                    return True
+                integrity = check_version(mc_version, mc_version, check_java=False)
+                if isinstance(integrity, dict) and bool(integrity.get("valid")):
+                    return True
+                Logger.warning(
+                    f"Base Minecraft version {mc_version} is incomplete; "
+                    "minecraft-launcher-lib will repair it"
+                )
         except Exception:
             return True
 
@@ -402,13 +332,14 @@ class Game:
     # Options
     # ------------------------------------------------------------------
     def _build_opts(self, v: Version, prof: dict) -> dict:
-        game_dir = self._ensure_dir(v.path)
+        game_dir = self._ensure_dir(str(v.path or v.version_id))
+        loader_id = str(v.loader or v.version or "")
         o = {
             "username": prof.get("name"),
             "uuid": prof.get("id"),
             "token": prof.get("access_token"),
             "gameDirectory": str(game_dir),
-            "nativesDirectory": str(self.mc_dir / "versions" / v.loader / "natives"),
+            "nativesDirectory": str(self.mc_dir / "versions" / loader_id / "natives"),
             "launcherName": util.launcher_name,
             "launcherVersion": util.launcher_version,
         }
@@ -456,14 +387,21 @@ class Game:
     # ------------------------------------------------------------------
     # Launch
     # ------------------------------------------------------------------
-    def _launch(self, loader_id: str, mc_ver: str, opts: dict, launch_key: Optional[str] = None) -> bool:
+    def _launch(
+        self,
+        loader_id: str,
+        mc_ver: str,
+        opts: dict,
+        launch_key: Optional[str] = None,
+        version: Optional[Version] = None,
+    ) -> bool:
         try:
             is_new = self._mc_ge(mc_ver, (1, 20, 0))
             lib_opts, srv = self._normalize_server(opts, allow_legacy=not is_new)
 
             t_cmd0 = time.perf_counter()
             cmd = minecraft_launcher_lib.command.get_minecraft_command(
-                loader_id, str(self.mc_dir), lib_opts
+                loader_id, str(self.mc_dir), cast(Any, lib_opts)
             )
             t_cmd1 = time.perf_counter()
             _log_safely(
@@ -482,6 +420,7 @@ class Game:
 
             cwd = opts.get("gameDirectory") or str(self.mc_dir)
             cwd_path = Path(cwd)
+            launch_started_at = time.time()
             diagnostics_log = self._prepare_launch_diagnostics(cwd_path, loader_id, mc_ver)
             stdout_handle = None
             try:
@@ -515,7 +454,16 @@ class Game:
             self._register_active_game_dir(effective_launch_key, process)
             threading.Thread(
                 target=self._monitor_launch_process,
-                args=(process, cwd_path, diagnostics_log, loader_id, mc_ver, effective_launch_key),
+                args=(
+                    process,
+                    cwd_path,
+                    diagnostics_log,
+                    loader_id,
+                    mc_ver,
+                    effective_launch_key,
+                    version,
+                    launch_started_at,
+                ),
                 daemon=True,
             ).start()
 
@@ -596,21 +544,13 @@ class Game:
     def _win_high_perf(self, exe_path: str) -> None:
         try:
             import winreg  # type: ignore
+
+            registry = cast(Any, winreg)
             key = r"Software\Microsoft\DirectX\UserGpuPreferences"
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_ALL_ACCESS) as k:
-                winreg.SetValueEx(k, exe_path, 0, winreg.REG_SZ, "GpuPreference=2;")
+            with registry.CreateKeyEx(registry.HKEY_CURRENT_USER, key, 0, registry.KEY_ALL_ACCESS) as k:
+                registry.SetValueEx(k, exe_path, 0, registry.REG_SZ, "GpuPreference=2;")
         except Exception as exc:
             _log_safely("debug", f"Unable to write Windows GPU preference for {exe_path}: {exc!r}")
-
-    @staticmethod
-    def _parse_int(val: Optional[object]) -> Optional[int]:
-        try:
-            if val is None:
-                return None
-            num = int(val)
-            return num if num > 0 else None
-        except Exception:
-            return None
 
     # ------------------------------------------------------------------
     # Launch Guard
@@ -740,6 +680,8 @@ class Game:
         loader_id: str,
         mc_ver: str,
         launch_key: Optional[str] = None,
+        version: Optional[Version] = None,
+        launch_started_at: float | None = None,
     ) -> None:
         try:
             started_at = time.monotonic()
@@ -755,10 +697,12 @@ class Game:
                     )
                     return
 
-            crash_report = self._newest_crash_report(game_dir)
-            hs_err_log = self._newest_hs_err_log(game_dir)
-            latest_log = game_dir / "logs" / "latest.log"
-            best_path = crash_report or (latest_log if latest_log.exists() else None) or diagnostics_log or hs_err_log
+            crash_report = self._newest_crash_report(game_dir, newer_than=launch_started_at)
+            hs_err_log = self._newest_hs_err_log(game_dir, newer_than=launch_started_at)
+            latest_log = self._fresh_file(game_dir / "logs" / "latest.log", newer_than=launch_started_at)
+            diagnostics_log = self._fresh_file(diagnostics_log, newer_than=launch_started_at)
+            diagnostic_paths = self._unique_paths((crash_report, latest_log, diagnostics_log, hs_err_log))
+            best_path = diagnostic_paths[0] if diagnostic_paths else game_dir
 
             exit_context = "shortly after start" if exited_during_startup else "with a non-zero exit code"
             Logger.error(
@@ -770,7 +714,15 @@ class Game:
             self._log_tail("Minecraft hs_err log", hs_err_log)
             self._log_tail("Minecraft latest.log", latest_log)
             self._log_tail("TensaLauncher launch diagnostics", diagnostics_log)
-            self._show_launch_crash_alert(best_path, loader_id, mc_ver, hs_err_log)
+            self._show_launch_crash_alert(
+                best_path,
+                loader_id,
+                mc_ver,
+                hs_err_log,
+                version,
+                diagnostic_paths=diagnostic_paths,
+                launch_started_at=launch_started_at,
+            )
         except Exception as exc:
             _log_safely("error", f"Launch diagnostics monitor failed: {exc!r}")
         finally:
@@ -788,6 +740,10 @@ class Game:
         loader_id: str,
         mc_ver: str,
         hs_err_log: Optional[Path] = None,
+        version: Optional[Version] = None,
+        *,
+        diagnostic_paths: tuple[Path, ...] = (),
+        launch_started_at: float | None = None,
     ) -> None:
         if path is None:
             return
@@ -807,39 +763,94 @@ class Game:
                     with suppress(Exception):
                         self.app.feedback.warning(response)
 
-            action = ui.Button(
-                text=trans("open_crash_diagnostics"),
+            open_diagnostics_action = ui.Button(
+                text=str(trans("open_crash_diagnostics")),
                 icon=ft.Icons.FOLDER_OPEN,
                 on_click=open_diagnostics,
                 variant="outline",
                 tone="neutral",
             )
-            report_metadata = {
+            report_metadata: dict[str, Any] = {
                 "screen": "game",
                 "action": "launch",
                 "loader": loader_id,
                 "minecraft": mc_ver,
                 "diagnostic_path": str(path),
             }
-            diagnosis = self._diagnose_launch_failure(path, hs_err_log)
-            report_metadata["diagnostic_kind"] = diagnosis.kind
-            report_metadata["diagnostic_severity"] = diagnosis.severity
-            if diagnosis.evidence:
-                report_metadata["diagnostic_evidence"] = diagnosis.evidence
-            report_attachments = [path]
+            paths = diagnostic_paths or self._unique_paths((path, hs_err_log))
+            result = self._diagnose_launch_failure(
+                paths,
+                managed_pack=self._is_tensacraft_version(version),
+                launch_started_at=launch_started_at,
+            )
+            diagnosis = result.primary
+            diagnostic_actions = tuple(
+                {
+                    action.id: action
+                    for finding in result.findings
+                    for action in finding.actions
+                }.values()
+            )
+            self._mark_tensacraft_repair_sync_required(version, diagnosis, path)
+            report_metadata.update(
+                {
+                    "diagnostic_engine_version": result.engine_version,
+                    "diagnostic_kind": diagnosis.kind,
+                    "diagnostic_severity": diagnosis.severity,
+                    "diagnostic_finding_ids": [finding.id for finding in result.findings],
+                    "diagnostic_confidence": diagnosis.confidence.name.lower(),
+                    "diagnostic_action_ids": [action.id for action in diagnostic_actions],
+                }
+            )
+            report_attachments = list(paths)
             if hs_err_log is not None:
                 report_metadata["hs_err_path"] = str(hs_err_log)
-                if hs_err_log != path:
-                    report_attachments.append(hs_err_log)
 
             message = trans("version_crashed_open_logs", path=str(path))
-            diagnostic_message = trans(diagnosis.message_key)
-            if diagnostic_message and diagnostic_message != diagnosis.message_key:
-                message = f"{message}\n\n{diagnostic_message}"
+            diagnostic_sections = []
+            for finding in result.findings:
+                diagnostic_title = trans(finding.title_key)
+                diagnostic_message = trans(finding.message_key, **finding.params)
+                if diagnostic_message and diagnostic_message != finding.message_key:
+                    diagnostic_sections.append(f"{diagnostic_title}\n{diagnostic_message}")
+            if len(result.findings) > 1:
+                message = f"{message}\n\n{trans('launch_diagnostic_multiple', count=len(result.findings))}"
+            if diagnostic_sections:
+                message = f"{message}\n\n" + "\n\n".join(diagnostic_sections)
 
+            actions = [open_diagnostics_action]
+            if version is not None:
+                if any(action.kind == "open_mod_manager" for action in diagnostic_actions):
+                    actions.append(
+                        ui.Button(
+                            text=str(trans("diagnostic_action_open_mod_manager")),
+                            icon=ft.Icons.EXTENSION,
+                            on_click=lambda _event: self.app.show_mods_manager_page(version),
+                            variant="outline",
+                            tone="neutral",
+                        )
+                    )
+                repair_action = next(
+                    (
+                        action
+                        for action in diagnostic_actions
+                        if action.kind in {"repair", "repair_sync"} and action.safety == ActionSafety.CONFIRM
+                    ),
+                    None,
+                )
+                if repair_action is not None:
+                    actions.append(
+                        ui.Button(
+                            text=str(trans(repair_action.title_key)),
+                            icon=ft.Icons.BUILD,
+                            on_click=lambda _event: self._confirm_diagnostic_repair(version),
+                            variant="outline",
+                            tone="neutral",
+                        )
+                    )
             self.app.feedback.warning(
                 message,
-                actions=action,
+                actions=actions[0] if len(actions) == 1 else actions,
                 report_title="Minecraft exited after launch",
                 report_type="crash",
                 report_severity="error",
@@ -849,11 +860,108 @@ class Game:
         except Exception as exc:
             _log_safely("error", f"Unable to show launch crash diagnostics dialog: {exc!r}")
 
-    def _diagnose_launch_failure(self, path: Path, hs_err_log: Optional[Path] = None):
-        parts = [self._tail_text(path, max_lines=80)]
-        if hs_err_log is not None and hs_err_log != path:
-            parts.append(self._tail_text(hs_err_log, max_lines=80))
-        return classify_launch_failure("\n".join(part for part in parts if part))
+    def _confirm_diagnostic_repair(self, version: Version) -> None:
+        trans = self.app.trans
+
+        def confirmed(accepted: bool) -> None:
+            if not accepted:
+                return
+            version.force_update = True
+
+            async def repair_and_launch() -> None:
+                from launcher.ui.core.page_runtime import run_blocking
+
+                response = await run_blocking(self.start, version)
+                message = response.get("text") if response else None
+                if response and response.get("status"):
+                    self.app.feedback.info(message)
+                elif message:
+                    self.app.feedback.warning(message)
+
+            from launcher.ui.core.page_runtime import run_task
+
+            run_task(self.app.page, repair_and_launch)
+
+        self.app.feedback.confirm(
+            title=trans("diagnostic_repair_confirm_title", version=version.name),
+            question=trans("diagnostic_repair_confirm_message"),
+            callback=confirmed,
+        )
+
+    def _mark_tensacraft_repair_sync_required(self, version, diagnosis, diagnostic_path: Path) -> None:
+        if version is None or diagnosis.kind not in REPAIR_SYNC_DIAGNOSIS_KINDS:
+            return
+        is_tensacraft = getattr(version, "is_tensacraft", None)
+        if not callable(is_tensacraft) or not is_tensacraft():
+            return
+
+        try:
+            game_dir = self._version_game_dir(version)
+
+            def mark_repair_required() -> None:
+                FileSyncJournal(game_dir).mark_repair_required(
+                    reason=diagnosis.kind,
+                    details={
+                        "diagnostic_path": str(diagnostic_path),
+                        "version": str(
+                            getattr(version, "name", "")
+                            or getattr(version, "id", "")
+                            or "TensaCraft"
+                        ),
+                    },
+                )
+
+            coordinator = getattr(self.app, "instance_operations", None)
+            if coordinator is None:
+                mark_repair_required()
+            else:
+                coordinator.execute(
+                    game_dir,
+                    "diagnostic_repair_mark",
+                    mark_repair_required,
+                )
+            Logger.warning(
+                "Marked TensaCraft pack for repair sync after launch failure: "
+                f"version={getattr(version, 'name', version)} reason={diagnosis.kind}"
+            )
+        except InstanceOperationBusy:
+            _log_safely(
+                "warning",
+                f"Skipped repair marker while another instance operation is active: {game_dir}",
+            )
+        except Exception as exc:
+            _log_safely("warning", f"Unable to mark TensaCraft repair sync: {exc!r}")
+
+    @staticmethod
+    def _is_tensacraft_version(version: object | None) -> bool:
+        checker = getattr(version, "is_tensacraft", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _diagnose_launch_failure(
+        self,
+        paths: tuple[Path, ...],
+        *,
+        managed_pack: bool,
+        launch_started_at: float | None,
+    ) -> DiagnosticResult:
+        artifacts = tuple(
+            read_artifact(
+                path,
+                started_at=launch_started_at,
+            )
+            for path in paths
+        )
+        return analyze_launch_failure(
+            DiagnosticCase(
+                artifacts=artifacts,
+                managed_pack=managed_pack,
+            )
+        )
 
     def _tail_text(self, path: Optional[Path], max_lines: int = LOG_TAIL_LINES) -> str:
         if path is None or not path.exists() or not path.is_file():
@@ -864,34 +972,42 @@ class Game:
             return f"Unable to read {path}: {exc!r}"
         return "\n".join(lines[-max_lines:]).strip()
 
-    def _newest_crash_report(self, game_dir: Path) -> Optional[Path]:
-        crash_dir = game_dir / "crash-reports"
-        if not crash_dir.exists() or not crash_dir.is_dir():
-            return None
+    def _newest_crash_report(self, game_dir: Path, *, newer_than: float | None = None) -> Optional[Path]:
+        return self._newest_file((game_dir / "crash-reports").glob("*"), newer_than)
+
+    def _newest_hs_err_log(self, game_dir: Path, *, newer_than: float | None = None) -> Optional[Path]:
+        return self._newest_file(game_dir.glob("hs_err_*.log"), newer_than)
+
+    def _newest_file(self, candidates: Iterable[Path], newer_than: float | None) -> Optional[Path]:
         try:
-            files = [path for path in crash_dir.iterdir() if path.is_file()]
-        except Exception:
-            return None
-        if not files:
-            return None
-        try:
-            return max(files, key=lambda path: path.stat().st_mtime)
-        except Exception:
+            newest = max((path for path in candidates if path.is_file()), key=lambda path: path.stat().st_mtime, default=None)
+            return self._fresh_file(newest, newer_than=newer_than)
+        except OSError:
             return None
 
-    def _newest_hs_err_log(self, game_dir: Path) -> Optional[Path]:
-        if not game_dir.exists() or not game_dir.is_dir():
+    @staticmethod
+    def _fresh_file(path: Optional[Path], *, newer_than: float | None) -> Optional[Path]:
+        if path is None or not path.is_file():
             return None
+        if newer_than is None:
+            return path
         try:
-            files = [path for path in game_dir.glob("hs_err_*.log") if path.is_file()]
-        except Exception:
+            return path if path.stat().st_mtime >= newer_than - 2.0 else None
+        except OSError:
             return None
-        if not files:
-            return None
-        try:
-            return max(files, key=lambda path: path.stat().st_mtime)
-        except Exception:
-            return None
+
+    @staticmethod
+    def _unique_paths(paths: Iterable[Optional[Path]]) -> tuple[Path, ...]:
+        unique: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            if path is None:
+                continue
+            normalized = path.resolve(strict=False)
+            if normalized not in seen:
+                seen.add(normalized)
+                unique.append(path)
+        return tuple(unique)
 
     # ------------------------------------------------------------------
     # Process

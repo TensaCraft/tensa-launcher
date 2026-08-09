@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import minecraft_launcher_lib

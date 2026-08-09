@@ -20,6 +20,18 @@ SECRET_ENDPOINT_TEMPLATE = "https://gigabait.uk/api/mods/launcher/secret/{secret
 PROFILE_SECRET_FILE = "profile-token.key"
 
 
+class CredentialSecurityError(RuntimeError):
+    """Base error for unavailable credential protection."""
+
+
+class CredentialEncryptionUnavailableError(CredentialSecurityError):
+    """Raised when credentials cannot be encrypted safely."""
+
+
+class CredentialDecryptionUnavailableError(CredentialSecurityError):
+    """Raised when stored credentials cannot be decrypted safely."""
+
+
 class SecurityService:
     def __init__(self) -> None:
         self._client_id: str | None = None
@@ -29,6 +41,8 @@ class SecurityService:
         if storage_dir is None:
             return self.get_legacy_user_secret()
 
+        from launcher.storage.atomic import atomic_write_text
+
         secret_path = Path(storage_dir) / PROFILE_SECRET_FILE
         try:
             if secret_path.exists():
@@ -37,13 +51,14 @@ class SecurityService:
                     return key
 
             key = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
-            secret_path.parent.mkdir(parents=True, exist_ok=True)
-            secret_path.write_text(key, encoding="utf-8")
+            atomic_write_text(secret_path, key)
             with suppress(OSError):
                 secret_path.chmod(0o600)
             return key
-        except OSError:
-            return self.get_legacy_user_secret()
+        except OSError as exc:
+            raise CredentialEncryptionUnavailableError(
+                "Unable to provision the profile encryption key"
+            ) from exc
 
     def get_legacy_user_secret(self) -> str:
         mac_address = ":".join(("%012X" % uuid.getnode())[i : i + 2] for i in range(0, 12, 2))

@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 from launcher.application.memory_preferences import MemoryLimits, MemoryPreferencesService
 from launcher.core.game import Game
-from launcher.shared import AppContext
 
 
 def test_game_start_stops_when_default_online_profile_requires_reauth(fake_app, monkeypatch):
@@ -20,14 +19,13 @@ def test_game_start_stops_when_default_online_profile_requires_reauth(fake_app, 
         profile_requires_reauth=lambda _profile: True,
     )
     fake_app.trans = lambda key, **_: key
-    AppContext.set(fake_app)
     version = fake_app.versions.all()[0]
     version.force_update = False
 
     verify_calls = []
     monkeypatch.setattr(Game, "_verify", lambda self, version: verify_calls.append(version) or True)
 
-    result = Game().start(version)
+    result = Game(fake_app).start(version)
 
     assert result == {"status": False, "text": "profile_reauth_required"}
     assert verify_calls == []
@@ -39,12 +37,11 @@ def test_game_build_opts_clamps_legacy_excessive_jvm_memory(fake_app, monkeypatc
         "detect_limits",
         classmethod(lambda _cls: MemoryLimits(total_gb=6, available_gb=3, min_heap_gb=1, max_heap_gb=4, recommended_heap_gb=4)),
     )
-    AppContext.set(fake_app)
     version = fake_app.versions.all()[0]
     version.options = {"jvmArguments": ["-Xmx5000G", "-Xms2G", "-XX:+UseG1GC"]}
     version.executable_path = lambda: ""
 
-    opts = Game()._build_opts(version, {"name": "Player", "id": "uuid", "access_token": "token"})
+    opts = Game(fake_app)._build_opts(version, {"name": "Player", "id": "uuid", "access_token": "token"})
 
     assert opts["jvmArguments"] == ["-Xmx4G", "-XX:+UseG1GC"]
 
@@ -56,12 +53,11 @@ def test_game_build_opts_uses_safe_default_max_memory(fake_app, monkeypatch):
         classmethod(lambda _cls: MemoryLimits(total_gb=6, available_gb=3, min_heap_gb=1, max_heap_gb=4, recommended_heap_gb=4)),
     )
     fake_app.config.set("default_max_ram_gb", 5000)
-    AppContext.set(fake_app)
     version = fake_app.versions.all()[0]
     version.options = {}
     version.executable_path = lambda: ""
 
-    opts = Game()._build_opts(version, {"name": "Player", "id": "uuid", "access_token": "token"})
+    opts = Game(fake_app)._build_opts(version, {"name": "Player", "id": "uuid", "access_token": "token"})
 
     assert opts["jvmArguments"] == ["-Xmx4G"]
 
@@ -75,14 +71,13 @@ def test_game_start_marks_missing_default_profile_reason(fake_app, monkeypatch):
         profile_requires_reauth=lambda _profile: False,
     )
     fake_app.trans = lambda key, **_: key
-    AppContext.set(fake_app)
     version = fake_app.versions.all()[0]
     version.force_update = False
 
     verify_calls = []
     monkeypatch.setattr(Game, "_verify", lambda self, version: verify_calls.append(version) or True)
 
-    result = Game().start(version)
+    result = Game(fake_app).start(version)
 
     assert result == {
         "status": False,
@@ -110,7 +105,6 @@ def test_game_start_uses_selected_profile(fake_app, monkeypatch):
         profile_requires_reauth=lambda _profile: False,
     )
     fake_app.trans = lambda key, **_: key
-    AppContext.set(fake_app)
     version = fake_app.versions.all()[0]
     version.force_update = False
 
@@ -118,7 +112,7 @@ def test_game_start_uses_selected_profile(fake_app, monkeypatch):
     monkeypatch.setattr(Game, "_build_opts", lambda self, _version, profile: {"profile": profile["name"]})
     monkeypatch.setattr(Game, "_launch", lambda self, *_args, **_kwargs: True)
 
-    result = Game().start(version, profile_key="second")
+    result = Game(fake_app).start(version, profile_key="second")
 
     assert result == {"status": True, "text": "version_starting"}
     assert calls == ["second"]

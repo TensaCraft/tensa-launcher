@@ -7,6 +7,7 @@ from .page_runtime import (
     run_task,
     schedule_update,
     show_dialog,
+    unregister_service,
 )
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "filter_control_kwargs",
     "invoke_on_ui",
     "register_service",
+    "unregister_service",
     "run_blocking",
     "run_task",
     "schedule_update",

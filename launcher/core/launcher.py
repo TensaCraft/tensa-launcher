@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Type
+from typing import Any, Dict, Iterable, List, Type
 
 import minecraft_launcher_lib
 
@@ -32,9 +32,12 @@ class Launcher:
         "quilt": QuiltLoader,
     }
 
-    @classmethod
-    def available_loader_ids(cls) -> Iterable[str]:
-        builtin = set(cls.LOADERS.keys())
+    def __init__(self, app: Any) -> None:
+        self.app = app
+        self._instances: Dict[str, BaseLoader] = {}
+
+    def available_loader_ids(self) -> Iterable[str]:
+        builtin = set(self.LOADERS.keys())
         dynamic = {
             name
             for name in minecraft_launcher_lib.mod_loader.list_mod_loader()
@@ -42,26 +45,25 @@ class Launcher:
         }
         return [*builtin, *sorted(dynamic)]
 
-    _INSTANCE_CACHE: Dict[str, BaseLoader] = {}
-
-    @classmethod
-    def get_loader(cls, loader_name: str) -> BaseLoader:
+    def get_loader(self, loader_name: str) -> BaseLoader:
         name = loader_name.lower()
-        loader_class = cls.LOADERS.get(name)
+        loader_class = self.LOADERS.get(name)
         if not loader_class:
             Logger.error(f"No loader class defined for '{loader_name}'.")
             raise ValueError(f"No loader class defined for '{loader_name}'.")
-        if name not in cls._INSTANCE_CACHE:
-            cls._INSTANCE_CACHE[name] = loader_class()
-        return cls._INSTANCE_CACHE[name]
+        if name not in self._instances:
+            self._instances[name] = loader_class(app=self.app)
+        return self._instances[name]
 
-    @classmethod
-    def loaders(cls) -> List[BaseLoader]:
-        return [cls.get_loader(name) for name in cls.available_loader_ids() if name in cls.LOADERS]
+    def loaders(self) -> List[BaseLoader]:
+        return [
+            self.get_loader(name)
+            for name in self.available_loader_ids()
+            if name in self.LOADERS
+        ]
 
-    @classmethod
-    def get_loader_versions(cls, loader: str) -> List[str]:
-        loader_instance = cls.get_loader(loader)
+    def get_loader_versions(self, loader: str) -> List[str]:
+        loader_instance = self.get_loader(loader)
         return loader_instance.versions()
 
 

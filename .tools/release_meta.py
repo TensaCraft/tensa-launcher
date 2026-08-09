@@ -6,7 +6,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 INIT_FILE = ROOT / "launcher" / "__init__.py"
 

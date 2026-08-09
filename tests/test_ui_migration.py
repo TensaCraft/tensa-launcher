@@ -1,22 +1,18 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import fields, is_dataclass
+import asyncio
 import inspect
 import threading
-import asyncio
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import flet as ft
 
+from launcher import ui
 from launcher.app import App
 from launcher.application.feedback import FeedbackService
-from launcher.shared.app_context import AppContext
-from launcher import ui
-from launcher.platform.system import SystemService
-from launcher.ui.theme import font_config
-from launcher.ui.core.page_runtime import close_dialog, invoke_on_ui, schedule_update, show_dialog
 from launcher.pages.home import Home
 from launcher.pages.modpacks import ModpacksPage
 from launcher.pages.mods_manager import ModsManagerPage
@@ -24,7 +20,9 @@ from launcher.pages.profiles import ProfilesPage
 from launcher.pages.settings import SettingsPage
 from launcher.pages.version_settings import VersionSettingsPage
 from launcher.pages.versions import VersionsPage
-
+from launcher.platform.system import SystemService
+from launcher.ui.core.page_runtime import close_dialog, invoke_on_ui, run_blocking, schedule_update, show_dialog
+from launcher.ui.theme import font_config
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
@@ -274,7 +272,6 @@ def test_modpack_modal_defers_install_until_after_close(fake_app):
 
 def test_modal_fields_use_full_width(fake_app):
     source_version = fake_app.versions.all()[0]
-    AppContext.set(fake_app)
     form_dialog = ui.FormDialog(
         fake_app,
         title="Offline profile",
@@ -642,6 +639,19 @@ def test_file_picker_schedules_async_directory_result(fake_app):
     asyncio.run(callback(*args))
 
     assert events[0].path == "D:/Games/Minecraft"
+
+
+def test_file_picker_dispose_unregisters_service_and_ignores_late_result(fake_app):
+    events = []
+    picker = ui.FilePicker(page=fake_app.page, on_result=lambda event: events.append(event))
+
+    assert picker.service in fake_app.page.services
+
+    picker.dispose()
+    picker._emit_result(files=[], path="late")
+
+    assert picker.service not in fake_app.page.services
+    assert events == []
 
 
 def test_file_picker_initial_directory_uses_existing_path(tmp_path):
@@ -1228,12 +1238,36 @@ def test_feedback_operations_keep_root_visible_until_children_finish():
     assert shown
 
 
+def test_run_blocking_defers_cancellation_until_worker_finishes():
+    started = threading.Event()
+    release = threading.Event()
+
+    def worker():
+        started.set()
+        release.wait(timeout=2)
+        return "done"
+
+    async def scenario():
+        task = asyncio.create_task(run_blocking(worker))
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("Cancellation was not delivered after the worker finished")
+
+    asyncio.run(scenario())
+
+
 def test_version_install_modal_defers_install_until_after_close(fake_app):
     scheduled = []
     fake_app.page.run_task = lambda func, *args, **kwargs: scheduled.append((func, args))
     fake_app.feedback.is_busy = lambda: False
     fake_app.versions.get_by_name = lambda _name: None
-    AppContext.set(fake_app)
 
     modal = ui.VersionInstallModal(fake_app)
     modal.version_name.value = "Build 1"

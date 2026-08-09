@@ -7,8 +7,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
-from launcher.shared import AppContext
-
 
 class TensaCraftAPI:
     REQUEST_TIMEOUT = 20
@@ -22,9 +20,9 @@ class TensaCraftAPI:
     _force_update_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
     _force_update_cache_ttl = 60.0
 
-    def __init__(self) -> None:
+    def __init__(self, app: Any) -> None:
         self.base_url = "https://gigabait.uk/api/mods"
-        self.app = AppContext.get()
+        self.app = app
 
     def _request_json(self, url: str) -> Any:
         last_error: requests.RequestException | None = None
@@ -184,8 +182,10 @@ class TensaCraftAPI:
         try:
             data = self._request_json(force_url)
             if isinstance(data, dict):
-                files = data.get("files") if isinstance(data.get("files"), list) else []
-                directories = data.get("directories") if isinstance(data.get("directories"), list) else []
+                raw_files = data.get("files")
+                raw_directories = data.get("directories")
+                files: list[Any] = raw_files if isinstance(raw_files, list) else []
+                directories: list[Any] = raw_directories if isinstance(raw_directories, list) else []
                 manifest = {
                     **data,
                     "files": [item for item in files if isinstance(item, dict)],

@@ -238,7 +238,9 @@ class Auth:
             auth_code = receiver.wait_for_code(AUTH_CODE_TIMEOUT_SEC)
             tokens = self._exchange_authorization_code(auth_code, code_verifier)
             login_data = self.profile_builder.build(self.client_id, tokens)
-            self.app.profiles.create_profile(login_data.get("name"), login_data)
+            result = self.app.profiles.create_profile(login_data.get("name"), login_data)
+            if not result.get("status"):
+                raise OSError(result.get("text") or "Unable to save authenticated profile")
             self.last_auth_status = "ok"
             return login_data
         finally:
@@ -283,7 +285,9 @@ class Auth:
                 cancel_event=cancel_event,
             )
             login_data = self.profile_builder.build(self.client_id, tokens)
-            self.app.profiles.create_profile(login_data.get("name"), login_data)
+            result = self.app.profiles.create_profile(login_data.get("name"), login_data)
+            if not result.get("status"):
+                raise OSError(result.get("text") or "Unable to save authenticated profile")
             self.last_auth_status = "ok"
             return login_data
         finally:
@@ -337,7 +341,9 @@ class Auth:
                 login_data["reauth_required"] = False
                 login_data["reauth_reason"] = None
                 if profile_key:
-                    self.app.profiles.edit_profile(profile_key, login_data)
+                    result = self.app.profiles.edit_profile(profile_key, login_data)
+                    if not result.get("status"):
+                        raise OSError(result.get("text") or "Unable to save refreshed profile")
                     return self.app.profiles.get_profile(profile_key)
                 return login_data
             except Exception as exc:  # pragma: no cover - network dependent
@@ -471,13 +477,15 @@ class Auth:
         profile_key = marked.get("name")
         if profile_key:
             try:
-                self.app.profiles.edit_profile(
+                result = self.app.profiles.edit_profile(
                     profile_key,
                     {
                         "reauth_required": True,
                         "reauth_reason": reason,
                     },
                 )
+                if not result.get("status"):
+                    return marked
                 return self.app.profiles.get_profile(profile_key) or marked
             except Exception:
                 return marked

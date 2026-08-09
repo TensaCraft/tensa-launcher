@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 import flet as ft
 
-from ..core.page_runtime import register_service
+from ..core.page_runtime import register_service, unregister_service
 
 
 def initial_directory_from_path(value: object) -> str | None:
@@ -35,6 +35,7 @@ class FilePicker:
         self.page = page
         self.on_result = on_result
         self.service = ft.FilePicker(on_upload=on_upload, **kwargs)
+        self._disposed = False
         register_service(page, self.service)
 
     def pick_files(self, **kwargs: Any):
@@ -68,8 +69,15 @@ class FilePicker:
         self._emit_result(files=[], path=value)
 
     def _emit_result(self, *, files: list[Any], path: str | None) -> None:
-        if callable(self.on_result):
+        if not self._disposed and callable(self.on_result):
             self.on_result(SimpleNamespace(files=files, path=path))
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        self._disposed = True
+        self.on_result = None
+        unregister_service(self.page, self.service)
 
     def __getattr__(self, item: str) -> Any:
         return getattr(self.service, item)

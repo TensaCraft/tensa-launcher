@@ -6,6 +6,7 @@ from threading import RLock
 from typing import Any, Dict, Iterable, Optional
 
 from launcher.models.logger import Logger
+from launcher.storage.atomic import atomic_write_json
 
 
 class Config:
@@ -47,8 +48,7 @@ class Config:
     def save(self) -> None:
         with self._lock:
             try:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                self._path.write_text(json.dumps(self._data, ensure_ascii=False, indent=4), encoding="utf-8")
+                atomic_write_json(self._path, self._data, ensure_ascii=False, indent=4)
             except OSError as exc:
                 Logger.error(f"Unable to save config file '{self._path}': {exc}")
 

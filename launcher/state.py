@@ -5,15 +5,17 @@ from typing import Any
 
 from launcher.application.catalog import ModrinthCatalogService
 from launcher.application.feedback import FeedbackService
+from launcher.application.instance_operations import InstanceOperationCoordinator
 from launcher.application.modrinth_mods import ModrinthModsService
+from launcher.application.shared_resources import SharedResourceCoordinator
 from launcher.application.ui_sound import UiSoundService
-from launcher.application.version_options import VersionOptionsService
 from launcher.application.version_content import VersionContentService
+from launcher.application.version_options import VersionOptionsService
 from launcher.application.world_backups import WorldBackupService
 from launcher.core import util
 from launcher.core.auth.auth import Auth
 from launcher.core.updater import AutoUpdater
-from launcher.platform.paths import StorageLayout
+from launcher.platform.paths import LauncherPaths
 from launcher.storage import Config, Profiles, Versions
 from launcher.ui.theme import UiTheme, set_current_theme
 
@@ -21,10 +23,12 @@ from launcher.ui.theme import UiTheme, set_current_theme
 @dataclass(slots=True)
 class AppState:
     util: Any
-    paths: StorageLayout
+    paths: LauncherPaths
     config: Config
     theme: UiTheme
     feedback: FeedbackService
+    instance_operations: InstanceOperationCoordinator
+    shared_resources: SharedResourceCoordinator
     catalog: ModrinthCatalogService
     modrinth_mods: ModrinthModsService
     ui_sound: UiSoundService
@@ -38,10 +42,8 @@ class AppState:
 
 
 class StateStore:
-    _state: AppState | None = None
-
-    @classmethod
-    def build(cls, app: Any) -> AppState:
+    @staticmethod
+    def build(app: Any) -> AppState:
         util.init(create_minecraft_dirs=False)
         app.util = util
 
@@ -56,23 +58,16 @@ class StateStore:
         layout = util.paths
         config = Config(storage_dir=layout.app_state_dir)
 
-        from launcher.core import Launcher
-
-        Launcher._INSTANCE_CACHE.clear()
-        configure_versions = getattr(Versions, "configure", None)
-        if callable(configure_versions):
-            configure_versions(
-                storage_dir=layout.app_state_dir,
-                minecraft_dir=layout.minecraft_dir,
-            )
-        Versions._instance = None
-
+        instance_operations = InstanceOperationCoordinator()
+        shared_resources = SharedResourceCoordinator()
         state = AppState(
             util=util,
             paths=layout,
             config=config,
             theme=set_current_theme(UiTheme.build()),
             feedback=FeedbackService(app),
+            instance_operations=instance_operations,
+            shared_resources=shared_resources,
             catalog=ModrinthCatalogService(),
             modrinth_mods=ModrinthModsService(),
             ui_sound=UiSoundService(config, app.log, use_thread=True),
@@ -83,17 +78,14 @@ class StateStore:
                 config,
                 app.log,
                 translator=getattr(app, "trans", None),
+                instance_operations=instance_operations,
             ),
             auth=Auth(app),
             profiles=Profiles(app, storage_dir=layout.app_state_dir),
-            versions=Versions.instance(),
+            versions=Versions(
+                storage_dir=layout.app_state_dir,
+                minecraft_dir=layout.minecraft_dir,
+            ),
             updater=AutoUpdater(app),
         )
-        cls._state = state
         return state
-
-    @classmethod
-    def current(cls) -> AppState:
-        if cls._state is None:
-            raise RuntimeError("App state has not been initialized.")
-        return cls._state

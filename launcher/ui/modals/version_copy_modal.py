@@ -7,7 +7,7 @@ from pathlib import Path
 import flet as ft
 
 from launcher.application.version_snapshot import mark_manual_copy_options, write_copy_snapshot
-from launcher.core import Launcher, util
+from launcher.core import util
 from launcher.core.versions import Version
 
 from ..controls.button import Button
@@ -76,11 +76,10 @@ class VersionCopyModal:
             ],
         )
 
-    @staticmethod
-    def _build_loader_options() -> list[dict]:
+    def _build_loader_options(self) -> list[dict]:
         seen = set()
         options = []
-        for loader in Launcher().loaders():
+        for loader in self.app.launcher.loaders():
             loader_id = loader.get_id()
             if loader_id in {"modrinth", "tensacraft"} or loader_id in seen:
                 continue
@@ -180,7 +179,7 @@ class VersionCopyModal:
         return candidates[0]
 
     def copy_version(self, _):
-        name = self.version_name.value.strip()
+        name = str(self.version_name.value or "").strip()
         if not name:
             self.app.feedback.info(self.app.trans("fill_all_fields"))
             return
@@ -259,7 +258,7 @@ class VersionCopyModal:
         copied_version = Version(new_version_id, new_data)
         if is_tensacraft:
             write_copy_snapshot(self.source_version, copied_version, dest_path)
-        copied_version.save()
+        self.app.versions.add(copied_version)
 
     def show(self):
         if self.app.feedback.is_busy():

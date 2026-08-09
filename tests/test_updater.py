@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from launcher import __version__
+from launcher.core.pending_update import PENDING_UPDATE_MARKER, PENDING_UPDATE_SCHEMA, PENDING_UPDATE_STAGING_DIR
 from launcher.core.updater import AutoUpdater
 
 
@@ -237,6 +243,154 @@ def test_updater_uses_product_named_temp_file_when_download_name_missing(tmp_pat
     assert partial_path == tmp_path / "tensalauncher-update-windows-4.1.8.exe.part"
 
 
+def test_updater_scopes_named_download_to_release_version(tmp_path):
+    updater = AutoUpdater(app_stub())
+    updater.platform = "windows"
+    updater._temp_dir = tmp_path
+
+    first, first_partial = updater._download_paths(
+        {"version": "4.2.3", "download_file_name": "TensaLauncher.exe"},
+        ".exe",
+    )
+    second, second_partial = updater._download_paths(
+        {"version": "4.2.4", "download_file_name": "TensaLauncher.exe"},
+        ".exe",
+    )
+
+    assert first == tmp_path / "TensaLauncher-4.2.3.exe"
+    assert second == tmp_path / "TensaLauncher-4.2.4.exe"
+    assert first_partial != second_partial
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "download_name", "staged_source_name", "staged_updater_name"),
+    [
+        (
+            "windows",
+            "TensaLauncher.exe",
+            "tensalauncher_update_payload.exe",
+            "tensalauncher_update.bat",
+        ),
+        (
+            "linux",
+            "TensaLauncher",
+            "tensalauncher_update_payload.AppImage",
+            "tensalauncher_update.sh",
+        ),
+        (
+            "macos",
+            "TensaLauncher.dmg",
+            "tensalauncher_update_payload.dmg",
+            "tensalauncher_update.sh",
+        ),
+    ],
+)
+def test_updater_downloads_and_stages_all_platforms_in_private_user_directory(
+    monkeypatch,
+    tmp_path: Path,
+    platform_name: str,
+    download_name: str,
+    staged_source_name: str,
+    staged_updater_name: str,
+):
+    shared_temp = tmp_path / "shared-temp"
+    user_cache = tmp_path / "user-cache"
+    shared_temp.mkdir()
+    monkeypatch.setattr("launcher.core.pending_update.tempfile.gettempdir", lambda: str(shared_temp))
+    monkeypatch.setattr("launcher.core.pending_update.PathPolicy.default_cache_dir", lambda: user_cache)
+    monkeypatch.setattr("launcher.core.updater.sys.frozen", True, raising=False)
+    monkeypatch.delenv("APPIMAGE", raising=False)
+
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    if platform_name == "macos":
+        target = install_root / "TensaLauncher.app"
+        executable = target / "Contents" / "MacOS" / "TensaLauncher"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"old")
+    else:
+        target = install_root / download_name
+        target.write_bytes(b"old")
+        executable = target
+
+    monkeypatch.setattr("launcher.core.updater.sys.executable", str(executable))
+
+    updater = AutoUpdater(app_stub())
+    updater.platform = platform_name
+    updater.appimage_path = None
+    private_update_dir = user_cache / PENDING_UPDATE_STAGING_DIR
+    assert updater._temp_dir == private_update_dir
+    assert updater._temp_dir != shared_temp
+
+    download_path, partial_path = updater._download_paths(
+        {
+            "version": "4.2.4",
+            "download_file_name": download_name,
+        },
+        updater._download_suffix(),
+    )
+    assert download_path.parent == private_update_dir
+    assert partial_path.parent == private_update_dir
+    download_path.write_bytes(b"new")
+
+    marker_path = updater.prepare_update(download_path)
+
+    assert isinstance(marker_path, Path)
+    assert marker_path == private_update_dir / PENDING_UPDATE_MARKER
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["schema"] == PENDING_UPDATE_SCHEMA
+    assert marker["platform"] == platform_name
+    assert "command" not in marker
+    assert Path(marker["source"]) == private_update_dir / staged_source_name
+    assert Path(marker["updater_script"]) == private_update_dir / staged_updater_name
+    assert Path(marker["target"]) == target
+    assert Path(marker["source"]).read_bytes() == b"new"
+    assert not any(shared_temp.iterdir())
+
+
+def test_execute_update_delegates_to_validated_pending_update_resumer(monkeypatch, tmp_path: Path):
+    stopped: list[bool] = []
+    app = app_stub()
+    app.stop = lambda: stopped.append(True)
+    updater = AutoUpdater(app)
+    updater.platform = "linux"
+    updater._temp_dir = tmp_path / "private-update"
+    update_marker = updater._temp_dir / PENDING_UPDATE_MARKER
+    resume_calls: list[dict[str, object]] = []
+
+    def fake_resume(logger, *, temp_dir, platform_name):
+        resume_calls.append(
+            {
+                "logger": logger,
+                "temp_dir": temp_dir,
+                "platform_name": platform_name,
+            }
+        )
+        return True
+
+    monkeypatch.setattr("launcher.core.updater.resume_pending_update_if_needed", fake_resume)
+
+    updater.execute_update(update_marker)
+
+    assert resume_calls == [
+        {
+            "logger": updater.logger,
+            "temp_dir": updater._temp_dir,
+            "platform_name": "linux",
+        }
+    ]
+    assert stopped == [True]
+
+
+def test_updater_has_no_direct_shell_or_generated_launcher_script_path():
+    source = inspect.getsource(AutoUpdater)
+
+    assert "subprocess.Popen" not in source
+    assert "shell=True" not in source.replace(" ", "")
+    assert "_format_nohup_command" not in source
+    assert "tensalauncher_start_update" not in source
+
+
 def test_updater_beta_channel_selects_newer_stable_release(monkeypatch):
     updater = AutoUpdater(app_stub(version="4.0.7", include_beta_updates="yes"))
     updater.platform = "windows"
@@ -311,7 +465,7 @@ def test_updater_runs_download_and_prepare_off_ui_thread(monkeypatch):
 
     def fake_prepare(path):
         assert path is download_path
-        return "update-cmd"
+        return Path("pending-update.json")
 
     async def fake_to_thread(fn, *args, **kwargs):
         to_thread_calls.append(fn)
@@ -350,7 +504,7 @@ def test_updater_resumes_partial_download(monkeypatch, tmp_path):
     updater.platform = "windows"
     updater._temp_dir = tmp_path
 
-    partial = tmp_path / "TensaLauncher.exe.part"
+    partial = tmp_path / "TensaLauncher-4.0.4.exe.part"
     partial.write_bytes(b"ab")
     calls = []
 
@@ -385,9 +539,55 @@ def test_updater_resumes_partial_download(monkeypatch, tmp_path):
             "version": "4.0.4",
             "download_url": "https://example.com/TensaLauncher.exe",
             "download_file_name": "TensaLauncher.exe",
+            "download_hash": hashlib.sha256(b"abcdef").hexdigest(),
+            "download_hash_algorithm": "sha256",
         }
     )
 
-    assert path == tmp_path / "TensaLauncher.exe"
+    assert path == tmp_path / "TensaLauncher-4.0.4.exe"
     assert path.read_bytes() == b"abcdef"
     assert calls[0]["headers"]["Range"] == "bytes=2-"
+
+
+def test_updater_discards_unverified_partial_download(tmp_path):
+    updater = AutoUpdater(app_stub())
+    updater.platform = "windows"
+    updater._temp_dir = tmp_path
+
+    partial = tmp_path / "TensaLauncher-4.0.4.exe.part"
+    partial.write_bytes(b"stale")
+    request_headers = []
+
+    class Response:
+        status_code = 200
+        headers = {"content-length": "5"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"fresh"
+
+    def fake_get(url, headers=None, stream=None, timeout=None):
+        request_headers.append(headers)
+        return Response()
+
+    updater._session.get = fake_get
+
+    path = updater.download_update(
+        {
+            "version": "4.0.4",
+            "download_url": "https://example.com/TensaLauncher.exe",
+            "download_file_name": "TensaLauncher.exe",
+        }
+    )
+
+    assert path is not None
+    assert path.read_bytes() == b"fresh"
+    assert request_headers == [{}]

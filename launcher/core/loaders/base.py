@@ -1,21 +1,29 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import hashlib
 import inspect
 import json
-from pathlib import Path
+import os
 import subprocess
 import tempfile
-from typing import TYPE_CHECKING, Any, Optional, Union
 import zipfile
+from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Union, cast
+from urllib.parse import urlparse
 
 import minecraft_launcher_lib
+import requests
 from minecraft_launcher_lib._helper import SUBPROCESS_STARTUP_INFO, download_file, empty
 from minecraft_launcher_lib.install import install_libraries
-import requests
+from minecraft_launcher_lib.types import CallbackDict
 
-from launcher.application.java_runtime import JavaRuntimeService
 from launcher.application.feedback import FeedbackLevel, OperationHandle
+from launcher.application.java_runtime import JavaRuntimeService
+from launcher.application.shared_resources import SharedResourceBusy
 from launcher.core import util
 from launcher.core.integrity import IntegrityChecker
 from launcher.core.minecraft_install import (
@@ -28,10 +36,19 @@ from launcher.core.minecraft_install import (
 from launcher.models.logger import Logger
 from launcher.platform.java_process import java_subprocess_kwargs, launcher_java_path
 from launcher.platform.windows_error_mode import suppress_windows_error_dialogs
-from launcher.shared import AppContext
+from launcher.storage.atomic import atomic_write_json, atomic_write_text
 
 if TYPE_CHECKING:
+    from launcher.application.instance_operations import InstanceOperationLease
     from launcher.domain.version import Version
+
+
+@dataclass(frozen=True)
+class _InstallerArtifact:
+    url: str
+    expected_size: int | None = None
+    expected_hash: str | None = None
+    hash_algorithm: str | None = None
 
 
 class BaseLoader(ABC):
@@ -39,14 +56,26 @@ class BaseLoader(ABC):
     MINECRAFT_INSTALL_ATTEMPTS = 4
     INCOMPLETE_INSTALL_MARKER = ".tensalauncher-installing"
     SUCCESSFUL_INSTALL_MARKER = ".tensalauncher-installed"
+    _WINDOWS_FORBIDDEN_NAME_CHARS = frozenset('<>:"/\\|?*')
+    _WINDOWS_RESERVED_NAMES = frozenset(
+        {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+    )
 
     def __init__(
         self,
         *,
+        app: Any,
         minecraft_dir: str | Path | None = None,
         games_dir: str | Path | None = None,
     ) -> None:
-        self.app = AppContext.get()
+        self.app = app
         self.minecraft_dir = self._resolve_minecraft_dir(minecraft_dir)
         self.install_dir = self._resolve_games_dir(games_dir)
         self.integrity_checker = IntegrityChecker(self.minecraft_dir)
@@ -82,6 +111,47 @@ class BaseLoader(ABC):
             if games_dir:
                 return Path(games_dir)
         return Path(util.games_path)
+
+    @contextmanager
+    def _instance_operation(
+        self,
+        path: str | Path,
+        kind: str,
+        *,
+        lease: InstanceOperationLease | None = None,
+    ) -> Iterator[InstanceOperationLease | None]:
+        coordinator = getattr(self.app, "instance_operations", None)
+        if coordinator is None:
+            yield lease
+            return
+        with coordinator.operation(path, kind, lease=lease) as active:
+            yield active
+
+    def _ensure_instance_idle(self, path: str | Path, version_name: str) -> None:
+        from launcher.core.game import Game
+
+        if Game.is_game_dir_active(path):
+            raise RuntimeError(
+                self.app.trans("instance_game_running", version=version_name)
+            )
+
+    @contextmanager
+    def _shared_minecraft_operation(self, kind: str) -> Iterator[None]:
+        coordinator = getattr(self.app, "shared_resources", None)
+        if coordinator is None:
+            yield
+            return
+        try:
+            with coordinator.operation(self.minecraft_dir, kind):
+                yield
+        except SharedResourceBusy as exc:
+            trans = getattr(self.app, "trans", None)
+            message = (
+                trans("shared_minecraft_operation_busy")
+                if callable(trans)
+                else "Another installation is updating shared Minecraft files."
+            )
+            raise RuntimeError(message) from exc
 
     # ------------------------------------------------------------------
     # Metadata
@@ -130,6 +200,14 @@ class BaseLoader(ABC):
         operation: OperationHandle | None = None,
     ) -> Optional[str]:
         """Return the Java path for a Minecraft version, installing it when needed."""
+        with self._shared_minecraft_operation("java_runtime"):
+            return self._get_version_java_path_locked(minecraft_version, operation=operation)
+
+    def _get_version_java_path_locked(
+        self,
+        minecraft_version: str,
+        operation: OperationHandle | None = None,
+    ) -> Optional[str]:
         had_runtime = bool(self.runtime.has_runtime(minecraft_version, minecraft_version))
 
         def on_install(runtime_name: str, version_key: str) -> None:
@@ -150,9 +228,41 @@ class BaseLoader(ABC):
 
         return java_path
 
+    @classmethod
+    def _validated_version_id(cls, value: object, *, label: str = "version id") -> str:
+        version_id = str(value or "")
+        if not version_id or version_id != version_id.strip():
+            raise ValueError(f"Invalid {label}")
+        if len(version_id) > 180:
+            raise ValueError(f"Invalid {label}: value is too long")
+        if version_id in {".", ".."} or version_id.endswith((" ", ".")):
+            raise ValueError(f"Invalid {label}: {version_id!r}")
+        if any(character in cls._WINDOWS_FORBIDDEN_NAME_CHARS for character in version_id):
+            raise ValueError(f"Invalid {label}: {version_id!r}")
+        if any(ord(character) < 32 for character in version_id):
+            raise ValueError(f"Invalid {label}: control characters are not allowed")
+        if version_id.split(".", 1)[0].upper() in cls._WINDOWS_RESERVED_NAMES:
+            raise ValueError(f"Invalid {label}: reserved file name")
+        if Path(version_id).name != version_id or Path(version_id).is_absolute():
+            raise ValueError(f"Invalid {label}: {version_id!r}")
+        return version_id
+
+    def _versions_root(self) -> Path:
+        return (self.minecraft_dir / "versions").resolve(strict=False)
+
+    def _version_dir(self, version_id: object, *, label: str = "version id") -> Path:
+        clean_id = self._validated_version_id(version_id, label=label)
+        root = self._versions_root()
+        candidate = root / clean_id
+        if candidate.is_symlink():
+            raise ValueError(f"Invalid {label}: symbolic links are not supported")
+        target = candidate.resolve(strict=False)
+        if target.parent != root:
+            raise ValueError(f"{label.capitalize()} escapes versions directory: {clean_id}")
+        return target
+
     def loaders_path(self, path: Optional[str]) -> Path:
-        relative = Path(path or "")
-        return self.minecraft_dir / "versions" / relative
+        return self._version_dir(path)
 
     def loader_exists(self, path: Optional[str]) -> bool:
         return self.loaders_path(path).exists()
@@ -267,6 +377,19 @@ class BaseLoader(ABC):
         force_check: bool = False,
         operation: OperationHandle | None = None,
     ) -> None:
+        with self._shared_minecraft_operation("minecraft_install"):
+            self._install_minecraft_if_needed_locked(
+                mc_version,
+                force_check=force_check,
+                operation=operation,
+            )
+
+    def _install_minecraft_if_needed_locked(
+        self,
+        mc_version: str,
+        force_check: bool = False,
+        operation: OperationHandle | None = None,
+    ) -> None:
         """Ensure vanilla Minecraft files are present.
 
         minecraft-launcher-lib owns the exact download plan for base Minecraft
@@ -275,6 +398,7 @@ class BaseLoader(ABC):
         restricted package or sandbox environments and blocked otherwise
         repairable installs.
         """
+        mc_version = self._validated_version_id(mc_version, label="Minecraft version id")
         exists = self.loader_exists(mc_version)
         if exists and not force_check:
             Logger.info(f"Minecraft {mc_version} already installed, skipping")
@@ -306,6 +430,7 @@ class BaseLoader(ABC):
         operation: OperationHandle | None = None,
     ) -> None:
         """Run minecraft-launcher-lib's base Minecraft installer."""
+        mc_version = self._validated_version_id(mc_version, label="Minecraft version id")
         self.minecraft_dir.mkdir(parents=True, exist_ok=True)
         IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
         install_minecraft_version_with_retries(
@@ -321,7 +446,7 @@ class BaseLoader(ABC):
         if not callable(trans):
             return fallback
         try:
-            return trans(key, version=mc_version)
+            return str(trans(key, version=mc_version))
         except Exception:
             return fallback
 
@@ -344,6 +469,25 @@ class BaseLoader(ABC):
         force_check: bool = False,
         operation: OperationHandle | None = None,
     ) -> tuple[str, str]:
+        with self._shared_minecraft_operation(f"{loader_name}_install"):
+            return self._install_mod_loader_locked(
+                mc_version,
+                loader_name,
+                requested_loader_version=requested_loader_version,
+                java_path=java_path,
+                force_check=force_check,
+                operation=operation,
+            )
+
+    def _install_mod_loader_locked(
+        self,
+        mc_version: str,
+        loader_name: str,
+        requested_loader_version: Optional[str] = None,
+        java_path: Optional[str] = None,
+        force_check: bool = False,
+        operation: OperationHandle | None = None,
+    ) -> tuple[str, str]:
         """Install a mod loader and verify existing installs before reuse.
 
         Args:
@@ -356,11 +500,15 @@ class BaseLoader(ABC):
         Returns:
             tuple[str, str]: (installed_version_name, actual_loader_version).
         """
+        mc_version = self._validated_version_id(mc_version, label="Minecraft version id")
         mod_loader = self._get_mod_loader_instance(loader_name)
 
         # Use the metadata-pinned loader version when one is provided.
-        requested_version = str(requested_loader_version).strip() if requested_loader_version else None
-        actual_loader_version = requested_version or mod_loader.get_latest_loader_version(mc_version)
+        requested_version = str(requested_loader_version) if requested_loader_version is not None else None
+        actual_loader_version = self._validated_version_id(
+            requested_version or mod_loader.get_latest_loader_version(mc_version),
+            label=f"{loader_name} loader version",
+        )
         if operation is not None:
             self._install_minecraft_if_needed(mc_version, force_check=force_check, operation=operation)
         else:
@@ -368,7 +516,10 @@ class BaseLoader(ABC):
         IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
         # Check whether the exact loader version is already installed
-        installed_version_name = mod_loader.get_installed_version(mc_version, actual_loader_version)
+        installed_version_name = self._validated_version_id(
+            mod_loader.get_installed_version(mc_version, actual_loader_version),
+            label=f"{loader_name} installed version id",
+        )
         exists = self.loader_exists(installed_version_name)
 
         if exists and not force_check and self._existing_mod_loader_install_is_reusable(installed_version_name, loader_name):
@@ -412,6 +563,30 @@ class BaseLoader(ABC):
         operation: OperationHandle | None = None,
         repair_managed_java: bool = False,
     ) -> None:
+        with self._shared_minecraft_operation(f"{loader_name}_installer"):
+            self._run_mod_loader_install_locked(
+                mod_loader,
+                mc_version=mc_version,
+                loader_name=loader_name,
+                loader_version=loader_version,
+                java_path=java_path,
+                operation=operation,
+                repair_managed_java=repair_managed_java,
+            )
+
+    def _run_mod_loader_install_locked(
+        self,
+        mod_loader: Any,
+        *,
+        mc_version: str,
+        loader_name: str,
+        loader_version: str,
+        java_path: Optional[str],
+        operation: OperationHandle | None = None,
+        repair_managed_java: bool = False,
+    ) -> None:
+        mc_version = self._validated_version_id(mc_version, label="Minecraft version id")
+        loader_version = self._validated_version_id(loader_version, label=f"{loader_name} loader version")
         self.minecraft_dir.mkdir(parents=True, exist_ok=True)
         for attempt in range(1, self.MOD_LOADER_INSTALL_ATTEMPTS + 1):
             try:
@@ -478,15 +653,168 @@ class BaseLoader(ABC):
     def _uses_captured_neoforge_installer(mod_loader: Any, loader_name: str) -> bool:
         return loader_name == "neoforge" and hasattr(mod_loader, "get_installer_url")
 
+    @classmethod
+    def _installer_artifact(cls, provider: Any, mc_version: str, loader_version: str) -> _InstallerArtifact:
+        artifact_getter = getattr(provider, "get_installer_artifact", None)
+        if callable(artifact_getter):
+            return cls._parse_installer_artifact(artifact_getter(mc_version, loader_version))
+
+        url_value = provider.get_installer_url(mc_version, loader_version)
+        metadata_getter = getattr(provider, "get_installer_metadata", None)
+        if not callable(metadata_getter):
+            return cls._parse_installer_artifact(url_value)
+
+        metadata = metadata_getter(mc_version, loader_version)
+        if not isinstance(metadata, Mapping):
+            raise RuntimeError("Installer metadata endpoint returned an invalid payload")
+        combined = dict(metadata)
+        combined.setdefault("url", url_value)
+        return cls._parse_installer_artifact(combined)
+
+    @classmethod
+    def _parse_installer_artifact(cls, value: object) -> _InstallerArtifact:
+        if isinstance(value, str):
+            url = value.strip()
+            metadata: Mapping[str, object] = {}
+        elif isinstance(value, Mapping):
+            metadata = value
+            url = str(
+                metadata.get("url")
+                or metadata.get("download_url")
+                or metadata.get("installer_url")
+                or ""
+            ).strip()
+        else:
+            raise RuntimeError("Installer artifact metadata is invalid")
+
+        parsed_url = urlparse(url)
+        if parsed_url.scheme.lower() != "https" or not parsed_url.netloc:
+            raise RuntimeError("Installer artifact must use an absolute HTTPS URL")
+
+        expected_size = cls._installer_expected_size(metadata)
+        expected_hash, hash_algorithm = cls._installer_expected_hash(metadata)
+        return _InstallerArtifact(
+            url=url,
+            expected_size=expected_size,
+            expected_hash=expected_hash,
+            hash_algorithm=hash_algorithm,
+        )
+
+    @staticmethod
+    def _installer_expected_size(metadata: Mapping[str, object]) -> int | None:
+        raw_size = metadata.get("size", metadata.get("file_size", metadata.get("filesize")))
+        if raw_size is None:
+            return None
+        try:
+            size = int(str(raw_size))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Installer artifact size metadata is invalid") from exc
+        if size <= 0:
+            raise RuntimeError("Installer artifact size metadata must be positive")
+        return size
+
+    @staticmethod
+    def _installer_expected_hash(metadata: Mapping[str, object]) -> tuple[str | None, str | None]:
+        hashes = metadata.get("hashes")
+        hash_values = hashes if isinstance(hashes, Mapping) else {}
+        for algorithm in ("sha512", "sha256", "sha1"):
+            raw_hash = hash_values.get(algorithm) or metadata.get(algorithm)
+            if raw_hash is not None:
+                return BaseLoader._validated_installer_hash(raw_hash, algorithm), algorithm
+
+        raw_hash = metadata.get("hash", metadata.get("expected_hash"))
+        if raw_hash is None:
+            return None, None
+        algorithm = str(metadata.get("hash_algorithm") or metadata.get("algorithm") or "").strip().lower()
+        if not algorithm:
+            raise RuntimeError("Installer artifact hash metadata is missing its algorithm")
+        return BaseLoader._validated_installer_hash(raw_hash, algorithm), algorithm
+
+    @staticmethod
+    def _validated_installer_hash(value: object, algorithm: str) -> str:
+        digest = str(value or "").strip().lower()
+        expected_lengths = {"sha1": 40, "sha256": 64, "sha512": 128}
+        if algorithm not in expected_lengths:
+            raise RuntimeError(f"Unsupported installer artifact hash algorithm: {algorithm}")
+        if len(digest) != expected_lengths[algorithm] or any(character not in "0123456789abcdef" for character in digest):
+            raise RuntimeError(f"Installer artifact {algorithm} metadata is invalid")
+        return digest
+
+    @staticmethod
+    def _verify_installer_artifact(path: Path, artifact: _InstallerArtifact) -> None:
+        try:
+            actual_size = path.stat().st_size
+        except OSError as exc:
+            raise RuntimeError("Downloaded installer artifact is unavailable") from exc
+
+        if actual_size <= 0:
+            raise RuntimeError("Downloaded installer artifact is empty")
+        if artifact.expected_size is not None and actual_size != artifact.expected_size:
+            raise RuntimeError(
+                f"Installer artifact size mismatch: expected {artifact.expected_size}, got {actual_size}"
+            )
+        expected_hash = artifact.expected_hash
+        hash_algorithm = artifact.hash_algorithm
+        if expected_hash is None:
+            expected_hash, hash_algorithm = BaseLoader._download_installer_checksum(artifact.url)
+
+        assert hash_algorithm is not None
+        digest = hashlib.new(hash_algorithm)
+        with path.open("rb") as installer_file:
+            for block in iter(lambda: installer_file.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest().lower() != expected_hash:
+            raise RuntimeError(f"Installer artifact {hash_algorithm} checksum mismatch")
+
+        if not zipfile.is_zipfile(path):
+            raise RuntimeError("Downloaded installer artifact is not a valid JAR file")
+
+    @staticmethod
+    def _download_installer_checksum(url: str) -> tuple[str, str]:
+        errors: list[str] = []
+        for algorithm in ("sha512", "sha256", "sha1"):
+            checksum_url = f"{url}.{algorithm}"
+            try:
+                response = requests.get(
+                    checksum_url,
+                    timeout=20,
+                    headers={"User-Agent": "TensaLauncher"},
+                )
+                response.raise_for_status()
+                token = str(response.text or "").strip().split(maxsplit=1)[0]
+                digest = BaseLoader._validated_installer_hash(token, algorithm)
+                return digest, algorithm
+            except Exception as exc:
+                errors.append(f"{algorithm}: {exc}")
+        details = "; ".join(errors)
+        raise RuntimeError(f"Installer artifact has no trusted checksum sidecar: {details}")
+
+    @classmethod
+    def _validated_profile_id(cls, value: object, *, expected: object, label: str) -> str:
+        profile_id = cls._validated_version_id(value, label=label)
+        expected_id = cls._validated_version_id(expected, label=f"expected {label}")
+        if os.path.normcase(profile_id) != os.path.normcase(expected_id):
+            raise RuntimeError(
+                f"{label.capitalize()} does not match requested loader version: "
+                f"{profile_id!r} != {expected_id!r}"
+            )
+        return profile_id
+
     def _existing_mod_loader_install_is_reusable(self, version_id: str, loader_name: str) -> bool:
-        if loader_name != "neoforge":
-            return True
         if self._has_incomplete_install_marker(version_id):
-            Logger.warning(f"{version_id} has an incomplete NeoForge install marker; refreshing")
+            Logger.warning(f"{version_id} has an incomplete {loader_name} install marker; refreshing")
             return False
         return self._version_manifest_and_libraries_exist(version_id)
 
     def _version_manifest_and_libraries_exist(self, version_id: str) -> bool:
+        version_id = self._validated_version_id(version_id)
+        manifest_path = self._version_dir(version_id) / f"{version_id}.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(manifest, dict) or str(manifest.get("id") or "") != version_id:
+            return False
         return bool(
             self.integrity_checker._check_version_manifest(version_id)
             and self.integrity_checker._check_libraries(version_id)
@@ -494,20 +822,18 @@ class BaseLoader(ABC):
 
     def _has_incomplete_install_marker(self, version_id: str) -> bool:
         version_dir = self.loaders_path(version_id)
-        return (version_dir / self.INCOMPLETE_INSTALL_MARKER).exists() and not (
-            version_dir / self.SUCCESSFUL_INSTALL_MARKER
-        ).exists()
+        return (version_dir / self.INCOMPLETE_INSTALL_MARKER).exists()
 
     def _mark_install_incomplete(self, version_id: str) -> None:
         version_dir = self.loaders_path(version_id)
         version_dir.mkdir(parents=True, exist_ok=True)
-        (version_dir / self.INCOMPLETE_INSTALL_MARKER).write_text("1", encoding="utf-8")
+        atomic_write_text(version_dir / self.INCOMPLETE_INSTALL_MARKER, "1")
         (version_dir / self.SUCCESSFUL_INSTALL_MARKER).unlink(missing_ok=True)
 
     def _mark_install_successful(self, version_id: str) -> None:
         version_dir = self.loaders_path(version_id)
         version_dir.mkdir(parents=True, exist_ok=True)
-        (version_dir / self.SUCCESSFUL_INSTALL_MARKER).write_text("1", encoding="utf-8")
+        atomic_write_text(version_dir / self.SUCCESSFUL_INSTALL_MARKER, "1")
         (version_dir / self.INCOMPLETE_INSTALL_MARKER).unlink(missing_ok=True)
 
     def _install_neoforge_loader_with_capture(
@@ -519,13 +845,17 @@ class BaseLoader(ABC):
         java_path: str | None,
         operation: OperationHandle | None = None,
     ) -> None:
-        callback = self._install_callbacks(operation) or {}
-        installer_download_url = mod_loader.get_installer_url(mc_version, loader_version)
-        installed_version = mod_loader.get_installed_version(mc_version, loader_version)
+        callback = cast(CallbackDict, self._install_callbacks(operation) or {})
+        artifact = self._installer_artifact(mod_loader, mc_version, loader_version)
+        installed_version = self._validated_version_id(
+            mod_loader.get_installed_version(mc_version, loader_version),
+            label="NeoForge installed version id",
+        )
 
         with tempfile.TemporaryDirectory(prefix="minecraft-launcher-lib-") as tempdir:
             installer_path = Path(tempdir) / "neoforge-installer.jar"
-            download_file(installer_download_url, str(installer_path), callback=callback, overwrite=True)
+            download_file(artifact.url, str(installer_path), callback=callback, overwrite=True)
+            self._verify_installer_artifact(installer_path, artifact)
 
             profile_id, install_profile = self._prepare_neoforge_profile_from_installer(
                 installer_path,
@@ -536,7 +866,7 @@ class BaseLoader(ABC):
             libraries = self._deduplicate_libraries(install_profile.get("libraries", []))
             if libraries:
                 callback.get("setStatus", empty)("Downloading NeoForge libraries")
-                install_libraries(profile_id, libraries, str(self.minecraft_dir), callback)
+                install_libraries(profile_id, cast(Any, libraries), str(self.minecraft_dir), callback)
 
             install_minecraft_version_with_retries(
                 profile_id,
@@ -581,16 +911,21 @@ class BaseLoader(ABC):
                 version_member = "version.json"
             version_profile = json.loads(archive.read(version_member))
 
-        profile_id = str(version_profile.get("id") or install_profile.get("version") or fallback_version_id).strip()
-        if not profile_id:
-            profile_id = fallback_version_id
+        raw_profile_id = version_profile.get("id") or fallback_version_id
+        profile_id = self._validated_profile_id(
+            raw_profile_id,
+            expected=fallback_version_id,
+            label="NeoForge profile id",
+        )
         version_profile["id"] = profile_id
 
-        version_dir = self.minecraft_dir / "versions" / profile_id
+        version_dir = self._version_dir(profile_id, label="NeoForge profile id")
         version_dir.mkdir(parents=True, exist_ok=True)
-        (version_dir / f"{profile_id}.json").write_text(
-            json.dumps(version_profile, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        atomic_write_json(
+            version_dir / f"{profile_id}.json",
+            version_profile,
+            ensure_ascii=False,
+            indent=2,
         )
         return profile_id, install_profile
 
@@ -621,14 +956,15 @@ class BaseLoader(ABC):
         java_path: str | None,
         operation: OperationHandle | None = None,
     ) -> None:
-        callback = self._install_callbacks(operation) or {}
+        callback = cast(CallbackDict, self._install_callbacks(operation) or {})
         base_loader = getattr(mod_loader, "_base")
-        installer_download_url = base_loader.get_installer_url(mc_version, loader_version)
+        artifact = self._installer_artifact(base_loader, mc_version, loader_version)
         installer_name = "quilt-installer.jar" if loader_name == "quilt" else "fabric-installer.jar"
 
         with tempfile.TemporaryDirectory(prefix="minecraft-launcher-lib-") as tempdir:
             installer_path = Path(tempdir) / installer_name
-            download_file(installer_download_url, str(installer_path), callback=callback, overwrite=True)
+            download_file(artifact.url, str(installer_path), callback=callback, overwrite=True)
+            self._verify_installer_artifact(installer_path, artifact)
             callback.get("setStatus", empty)("Running installer")
             command = self._fabric_quilt_installer_command(
                 loader_name=loader_name,
@@ -664,7 +1000,10 @@ class BaseLoader(ABC):
                 )
                 return
 
-        installed_version = mod_loader.get_installed_version(mc_version, loader_version)
+        installed_version = self._validated_version_id(
+            mod_loader.get_installed_version(mc_version, loader_version),
+            label=f"{loader_name} installed version id",
+        )
         install_minecraft_version_with_retries(
             installed_version,
             self.minecraft_dir,
@@ -721,16 +1060,24 @@ class BaseLoader(ABC):
             mc_version=mc_version,
             loader_version=loader_version,
         )
-        profile_id = str(profile.get("id") or "").strip()
-        if not profile_id:
-            profile_id = mod_loader.get_installed_version(mc_version, loader_version)
-            profile["id"] = profile_id
+        expected_profile_id = self._validated_version_id(
+            mod_loader.get_installed_version(mc_version, loader_version),
+            label=f"{loader_name} installed version id",
+        )
+        profile_id = self._validated_profile_id(
+            profile.get("id") or expected_profile_id,
+            expected=expected_profile_id,
+            label=f"{loader_name} profile id",
+        )
+        profile["id"] = profile_id
 
-        version_dir = self.minecraft_dir / "versions" / profile_id
+        version_dir = self._version_dir(profile_id, label=f"{loader_name} profile id")
         version_dir.mkdir(parents=True, exist_ok=True)
-        (version_dir / f"{profile_id}.json").write_text(
-            json.dumps(profile, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        atomic_write_json(
+            version_dir / f"{profile_id}.json",
+            profile,
+            ensure_ascii=False,
+            indent=2,
         )
         install_minecraft_version_with_retries(
             profile_id,
@@ -747,6 +1094,8 @@ class BaseLoader(ABC):
         mc_version: str,
         loader_version: str,
     ) -> dict[str, Any]:
+        mc_version = cls._validated_version_id(mc_version, label="Minecraft version id")
+        loader_version = cls._validated_version_id(loader_version, label=f"{loader_name} loader version")
         url = cls._fabric_quilt_profile_url(
             loader_name=loader_name,
             mc_version=mc_version,

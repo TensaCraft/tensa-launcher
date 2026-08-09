@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tomllib
+from pathlib import Path
 from typing import Any, cast
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -42,6 +42,13 @@ def test_runtime_dependencies_are_pinned_to_patched_security_releases():
 
     assert dependencies["cryptography"] >= (48, 0, 1)
     assert dependencies["requests"] >= (2, 33, 0)
+
+
+def test_flet_runtime_and_build_packages_use_the_same_version():
+    runtime = _project_dependencies()
+    build = _project_optional_dependencies("build")
+
+    assert runtime["flet"] == runtime["flet-desktop"] == build["flet-cli"]
 
 
 def test_build_dependencies_are_pinned_to_patched_security_releases():

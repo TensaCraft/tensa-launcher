@@ -222,7 +222,8 @@ class TensaCraftPayloadService:
 
     def _apply_forced_server(self, version, client_data: dict[str, Any], fields: set[str]) -> None:
         options = version.options or {}
-        existing = options.get("server") if isinstance(options.get("server"), dict) else {}
+        raw_existing = options.get("server")
+        existing = raw_existing if isinstance(raw_existing, dict) else {}
         force_all = "server" in fields
         force_host = force_all or "server_host" in fields
         force_port = force_all or "server_port" in fields

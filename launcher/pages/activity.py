@@ -16,9 +16,10 @@ class ActivityPanel:
         self.layout = ui.FormSection(app)
         self.scroll = scroll
         self._is_active = False
+        self._last_snapshot = self._snapshot()
         self.content = ui.Container(
             expand=True,
-            content=self._build_body(),
+            content=self._build_body(self._last_snapshot),
         )
 
     def view(self):
@@ -40,7 +41,7 @@ class ActivityPanel:
         self._is_active = False
 
     def refresh(self) -> None:
-        self._refresh_content()
+        self._refresh_content(force=True)
 
     async def _refresh_loop(self) -> None:
         while self._is_active:
@@ -49,12 +50,16 @@ class ActivityPanel:
                 break
             self._refresh_content()
 
-    def _refresh_content(self) -> None:
-        self.content.content = self._build_body()
+    def _refresh_content(self, *, force: bool = False) -> None:
+        snapshot = self._snapshot()
+        if not force and snapshot == self._last_snapshot:
+            return
+        self._last_snapshot = snapshot
+        self.content.content = self._build_body(snapshot)
         schedule_update(self.page)
 
-    def _build_body(self) -> ft.Control:
-        snapshot = self._snapshot()
+    def _build_body(self, snapshot: dict[str, Any] | None = None) -> ft.Control:
+        snapshot = snapshot if snapshot is not None else self._snapshot()
         active_operations = snapshot.get("active_operations") or []
         recent_activity = snapshot.get("recent_activity") or []
 
@@ -87,7 +92,8 @@ class ActivityPanel:
         snapshot = getattr(feedback, "snapshot", None)
         if not callable(snapshot):
             return {"busy": False, "active_operations": [], "recent_activity": []}
-        return snapshot(activity_limit=80)
+        result = snapshot(activity_limit=80)
+        return result if isinstance(result, dict) else {"busy": False, "active_operations": [], "recent_activity": []}
 
     def _active_operation_rows(self, operations: list[dict[str, Any]]) -> list[ft.Control]:
         operations = self._display_operations(operations)
@@ -211,7 +217,7 @@ class ActivityPanel:
             return f"{kind} / {event}"
         return event
 
-    def _level_icon(self, level: str) -> str:
+    def _level_icon(self, level: str) -> ft.IconData:
         return {
             "success": ft.Icons.CHECK_CIRCLE_OUTLINE,
             "warning": ft.Icons.WARNING_AMBER,

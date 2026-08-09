@@ -17,30 +17,28 @@ from launcher.models.install_callback import InstallCallback
 from launcher.models.logger import Logger
 from launcher.models.translator import Translator
 from launcher.pages.home import Home
-from launcher.pages.modpacks import ModpacksPage
 from launcher.pages.minecraft_components import MinecraftComponentsPage
+from launcher.pages.modpacks import ModpacksPage
 from launcher.pages.profiles import ProfilesPage
 from launcher.pages.settings import SettingsPage
 from launcher.pages.setup_wizard import maybe_show_setup_wizard
 from launcher.pages.version_create import VersionCreatePage
 from launcher.pages.version_settings import VersionSettingsPage
 from launcher.pages.versions import VersionsPage
-from launcher.shared import AppContext
 from launcher.state import StateStore
 
 
 class App:
-    instance: App | None = None
     JAVA_VERSIONS_TTL_SEC = 24 * 60 * 60
 
     def __init__(self, page: ft.Page):
-        App.instance = self
-        AppContext.set(self)
         self.page = page
+        self.page.data = self
         self.mll = minecraft_launcher_lib
         self.log = Logger()
         self.sleep = sleep
         self._terminating = False
+        self._startup_tasks: list[object] = []
 
         self._bootstrap_state()
         ui.set_current_theme(self.theme)
@@ -59,6 +57,8 @@ class App:
         self.config = self.state.config
         self.theme = self.state.theme
         self.feedback = self.state.feedback
+        self.instance_operations = self.state.instance_operations
+        self.shared_resources = self.state.shared_resources
         self.catalog = self.state.catalog
         self.modrinth_mods = self.state.modrinth_mods
         self.ui_sound = self.state.ui_sound
@@ -69,6 +69,15 @@ class App:
         self.profiles = self.state.profiles
         self.versions = self.state.versions
         self.updater = self.state.updater
+        from launcher.application.version_runtime import VersionRuntime
+        from launcher.core.api import TensaCraftAPI
+        from launcher.core.game import Game
+        from launcher.core.launcher import Launcher
+
+        self.launcher = Launcher(self)
+        self.game = Game(self)
+        self.tensa_api = TensaCraftAPI(self)
+        self.versions.bind_runtime(VersionRuntime(self))
 
     def _configure_page(self) -> None:
         self.page.fonts = ui.configured_page_fonts() or None
@@ -119,14 +128,13 @@ class App:
         self.version_card = ui.VersionCard()
         self.install_callback = InstallCallback
 
-    def _build_stateful_models(self) -> None:
+    def _build_stateful_models(self, *, schedule_java_refresh: bool = True) -> None:
         self.java_versions = self.config.get(JavaPreferencesService.LAUNCHER_CACHE_KEY, [])
-        self.initialize_app_variables()
+        self.initialize_app_variables(schedule_java_refresh=schedule_java_refresh)
 
     def _build_shell(self) -> None:
         self.setup_navigation()
-        self.current_page = Home(self)
-        self.show_page(self.current_page)
+        self.show_page(Home(self))
 
         minecraft_dir_error = getattr(self.util, "minecraft_dir_error", None)
         if minecraft_dir_error:
@@ -144,9 +152,9 @@ class App:
         threading.Thread(target=auth_refresh, daemon=True).start()
         check_updates = self.config.get("check_updates", self.config.get("auto_update", "yes"))
         if check_updates == "yes":
-            self.page.run_task(self.updater.check_for_updates_async)
+            App._track_startup_task(self, self.page.run_task(self.updater.check_for_updates_async))
 
-    def initialize_app_variables(self):
+    def initialize_app_variables(self, *, schedule_java_refresh: bool = True):
         self.java_versions = self.config.get(JavaPreferencesService.LAUNCHER_CACHE_KEY, []) or []
 
         last_scan = self.config.get(JavaPreferencesService.LAUNCHER_CACHE_TS_KEY, 0)
@@ -162,7 +170,7 @@ class App:
             or JavaPreferencesService.has_raw_launcher_runtime_labels(self.java_versions)
             or (time.time() - last_scan_ts > self.JAVA_VERSIONS_TTL_SEC)
         )
-        if should_refresh:
+        if schedule_java_refresh and should_refresh:
             threading.Thread(target=self._refresh_java_versions, daemon=True).start()
 
     def _refresh_java_versions(self) -> None:
@@ -184,9 +192,26 @@ class App:
         if not callable(center):
             return
         if inspect.iscoroutinefunction(center):
-            self.page.run_task(center)
+            App._track_startup_task(self, self.page.run_task(center))
             return
         center()
+
+    def _track_startup_task(self, task: object | None) -> None:
+        startup_tasks = getattr(self, "_startup_tasks", None)
+        if task is not None and startup_tasks is not None:
+            startup_tasks.append(task)
+
+    def _cancel_startup_tasks(self) -> None:
+        tasks = tuple(self._startup_tasks)
+        self._startup_tasks.clear()
+        for task in tasks:
+            cancel = getattr(task, "cancel", None)
+            if not callable(cancel):
+                continue
+            try:
+                cancel()
+            except Exception as exc:
+                self.log.debug(f"Startup task cancellation failed during restart: {exc!r}")
 
     def _configure_window_lifecycle(self) -> None:
         window = getattr(self.page, "window", None)
@@ -298,12 +323,17 @@ class App:
         ]
         self.navigation.set_destinations(destinations)
 
-    def show_page(self, page):
-        previous_page = getattr(self, "current_page", None)
-        before_hide = getattr(previous_page, "before_hide", None)
+    def _dispose_current_page(self) -> None:
+        current_page = getattr(self, "current_page", None)
+        if current_page is None:
+            return
+        before_hide = getattr(current_page, "before_hide", None)
         if callable(before_hide):
             before_hide()
+        self.current_page = None
 
+    def show_page(self, page):
+        self._dispose_current_page()
         self.current_page = page
 
         # Створюємо новий контент для сторінки
@@ -417,8 +447,17 @@ class App:
         ui.show_window_when_ready(self.page)
 
     def restart(self):
+        self._dispose_current_page()
+        self._cancel_startup_tasks()
+        self._clear_install_session_state()
         self.page.scroll = None
-        self.__init__(self.page)
+        self._bootstrap_state()
+        ui.set_current_theme(self.theme)
+        self._configure_page()
+        self._center_window()
+        self._build_ui_services()
+        self._build_stateful_models(schedule_java_refresh=False)
+        self._build_shell()
         self.run()
 
     def stop(self):

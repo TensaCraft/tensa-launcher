@@ -13,7 +13,7 @@ The launcher may contact:
 
 ## Diagnostic Reports
 
-When a user chooses to submit a launcher report, the launcher sends diagnostic information needed to investigate the issue. Reports can include launcher logs, selected diagnostic text, platform information, and user-provided contact or description fields.
+When a user chooses to submit a launcher report, the launcher sends diagnostic information needed to investigate the issue. Reports can include launcher logs, selected diagnostic text, platform information, and user-provided contact or description fields. The launcher redacts known access-token formats and replaces the local home-directory prefix before upload.
 
 Users should remove passwords, tokens, personal data, and unrelated screenshots before submitting attachments.
 

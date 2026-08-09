@@ -125,17 +125,19 @@ class CurseForgeImportModal:
     async def _import_version_async(self, name: str, mc_version: str, selected_source_path: str, source_kind: str, operation) -> None:
         final_message = self.trans("installation_complete")
         try:
-            version = Version(
-                name,
-                {
-                    "name": name,
-                    "version": mc_version,
-                    "client": "curseforge",
-                    "options": {
-                        "curseforge_source_path": selected_source_path,
-                        "curseforge_source_type": source_kind,
+            version = self.app.versions.prepare(
+                Version(
+                    name,
+                    {
+                        "name": name,
+                        "version": mc_version,
+                        "client": "curseforge",
+                        "options": {
+                            "curseforge_source_path": selected_source_path,
+                            "curseforge_source_type": source_kind,
+                        },
                     },
-                },
+                )
             )
             await run_blocking(version.install)
         except Exception as exc:

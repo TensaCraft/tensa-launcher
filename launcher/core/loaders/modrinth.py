@@ -3,13 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-import minecraft_launcher_lib
-from minecraft_launcher_lib._internal_types.mrpack_types import MrpackIndex
-
 from launcher.application.feedback import OperationHandle
+from launcher.application.instance_operations import (
+    InstanceOperationBusy,
+    InstanceOperationLease,
+)
 from launcher.application.modrinth_pack import ModrinthPackService
+from launcher.application.version_profile_state import (
+    capture_version_profile,
+    restore_version_profile,
+)
 from launcher.core.api import ModrinthAPI
-from launcher.core.async_downloader import AsyncDownloader
+from launcher.core.async_downloader import AsyncDownloader, DownloadTask
+
 from .base import BaseLoader
 
 if TYPE_CHECKING:
@@ -17,9 +23,12 @@ if TYPE_CHECKING:
 
 
 class ModrinthLoader(BaseLoader):
-    def __init__(self) -> None:
-        super().__init__()
-        self.pack_service = ModrinthPackService()
+    def __init__(self, *, app: Any) -> None:
+        super().__init__(app=app)
+        self.pack_service = ModrinthPackService(
+            downloader_factory=AsyncDownloader,
+            logger=self.app.log,
+        )
 
     def get_id(self) -> str:
         return "modrinth"
@@ -28,15 +37,43 @@ class ModrinthLoader(BaseLoader):
         return "Modrinth"
 
     def install(
-            self,
-            version: Version,
-            callback: Optional[Any] = None,
-            java_path: Optional[str] = None,
-            loader_version: Optional[str] = None,
-            operation: OperationHandle | None = None,
+        self,
+        version: Version,
+        callback: Optional[Any] = None,
+        java_path: Optional[str] = None,
+        loader_version: Optional[str] = None,
+        operation: OperationHandle | None = None,
+        lease: InstanceOperationLease | None = None,
+    ) -> None:
+        game_path = self.get_game_path(version.version_id)
+        try:
+            with self._instance_operation(game_path, "modrinth_pack_install", lease=lease):
+                self._ensure_instance_idle(game_path, version.name)
+                self._install_locked(
+                    version,
+                    callback=callback,
+                    java_path=java_path,
+                    loader_version=loader_version,
+                    operation=operation,
+                )
+        except InstanceOperationBusy as exc:
+            raise RuntimeError(
+                self.app.trans("instance_operation_busy", version=version.name)
+            ) from exc
+
+    def _install_locked(
+        self,
+        version: Version,
+        callback: Optional[Any] = None,
+        java_path: Optional[str] = None,
+        loader_version: Optional[str] = None,
+        operation: OperationHandle | None = None,
     ) -> None:
         owns_operation = operation is None
         previous_operation = self._feedback_operation
+        version_snapshot = capture_version_profile(version)
+        profile_committed = False
+        content_committed = False
         if operation is None:
             operation = self.begin_feedback_operation(status=self.app.trans("installation_started") if self.app else None)
         else:
@@ -50,43 +87,123 @@ class ModrinthLoader(BaseLoader):
             if not data or "files" not in data:
                 raise ValueError(f"Could not retrieve Modrinth data for {version.id} / {version.version}")
 
-            mrpack_url = next((f["url"] for f in data["files"] if f.get("filename", "").endswith(".mrpack")), None)
-            if not mrpack_url:
+            release_files = data.get("files")
+            if not isinstance(release_files, list):
+                raise ValueError("Modrinth version files have an invalid format")
+            mrpack_file = next(
+                (
+                    item
+                    for item in release_files
+                    if isinstance(item, dict) and str(item.get("filename") or "").endswith(".mrpack")
+                ),
+                None,
+            )
+            if not isinstance(mrpack_file, dict) or not mrpack_file.get("url"):
                 raise ValueError(f"No .mrpack file found in Modrinth data for {version.id} / {version.version}")
 
-            file_mrpack_path = game_path / f"{version.version}.mrpack"
-            minecraft_launcher_lib.mrpack.download_file(mrpack_url, str(file_mrpack_path))
+            file_mrpack_path = game_path / ".tensalauncher-pack.mrpack"
+            hashes = mrpack_file.get("hashes") or {}
+            if not isinstance(hashes, dict):
+                hashes = {}
+            hash_algorithm = next(
+                (algorithm for algorithm in ("sha512", "sha256", "sha1") if hashes.get(algorithm)),
+                None,
+            )
+            if hash_algorithm is None:
+                raise ValueError("Modrinth pack archive is missing a supported hash")
+            archive_size = self.pack_service.normalized_size(mrpack_file.get("size"))
+            if archive_size is None:
+                raise ValueError("Modrinth pack archive is missing a positive declared size")
+            archive_result = AsyncDownloader(max_workers=1).download_files(
+                [
+                    DownloadTask(
+                        url=self.pack_service.validated_download_url(mrpack_file["url"]),
+                        destination=file_mrpack_path,
+                        expected_size=archive_size,
+                        expected_hash=str(hashes.get(hash_algorithm) or ""),
+                        expected_hash_algorithm=hash_algorithm,
+                        task_id="modrinth-pack",
+                    )
+                ],
+                skip_existing=False,
+            )
+            if archive_result["failed"] or archive_result["errors"]:
+                file_mrpack_path.unlink(missing_ok=True)
+                details = "; ".join(archive_result["errors"][:3]) or "download failed"
+                raise RuntimeError(f"Failed to download Modrinth pack: {details}")
 
             # 2) Прочитати індекс та визначити залежності
             self.app.log.info(f"Installing modpack to {game_path}")
-            index = self.pack_service.read_index(str(file_mrpack_path))
-            mc_ver, loader_id, loader_ver = self.pack_service.resolve_loader(index)
+            try:
+                index = self.pack_service.read_index(str(file_mrpack_path))
+                mc_ver, loader_id, loader_ver = self.pack_service.resolve_loader(index)
 
-            # 3) Розпакувати overrides
-            self._extract_overrides(file_mrpack_path, game_path)
+                launch_version = mc_ver
 
-            # 4) Завантажити файли модів та ресурспаків
-            self._download_modpack_files(index, game_path, operation=operation)
+                def install_runtime() -> None:
+                    nonlocal launch_version, loader_ver
+                    if loader_id and loader_ver:
+                        loader_ver = self._install_mod_loader_for_mrpack(
+                            mc_ver,
+                            loader_id,
+                            loader_ver,
+                            operation=operation,
+                        )
+                        launch_version = self.pack_service.build_launch_version(
+                            loader_id,
+                            mc_ver,
+                            loader_ver,
+                        )
+                    else:
+                        self._install_minecraft_if_needed(mc_ver, operation=operation)
 
-            # 5) Видалити .mrpack файл
-            file_mrpack_path.unlink(missing_ok=True)
+                    self.app.log.info(
+                        f"Modpack installed with launch version: {launch_version}"
+                    )
 
-            # 6) Встановити loader
-            launch_version = mc_ver
-            if loader_id and loader_ver:
-                loader_ver = self._install_mod_loader_for_mrpack(mc_ver, loader_id, loader_ver, operation=operation)
-                launch_version = self.pack_service.build_launch_version(loader_id, mc_ver, loader_ver)
-            else:
-                # Vanilla Minecraft - встановити якщо потрібно
-                self._install_minecraft_if_needed(mc_ver, operation=operation)
+                def commit_profile() -> None:
+                    nonlocal profile_committed
+                    self._update_version_entity(
+                        version,
+                        game_path,
+                        mc_ver,
+                        loader_id,
+                        loader_ver,
+                    )
+                    profile_committed = True
 
-            self.app.log.info(f"Modpack installed with launch version: {launch_version}")
-
-            # 7) Оновити Version entity
-            self._update_version_entity(version, game_path, mc_ver, loader_id, loader_ver)
+                self.pack_service.install_content(
+                    mrpack_path=file_mrpack_path,
+                    index=index,
+                    game_path=game_path,
+                    progress_callback=lambda completed, total, current_file: (
+                        self._update_feedback_operation(
+                            status=current_file,
+                            progress=completed,
+                            max_progress=total,
+                            operation=operation,
+                        )
+                    ),
+                    before_activate=install_runtime,
+                    commit_callback=commit_profile,
+                )
+                content_committed = True
+            finally:
+                file_mrpack_path.unlink(missing_ok=True)
 
             if callback:
                 callback()
+        except Exception as exc:
+            if not content_committed:
+                restore_version_profile(version, version_snapshot)
+                if profile_committed:
+                    try:
+                        version.save()
+                    except Exception as rollback_error:
+                        raise RuntimeError(
+                            f"{exc}; Modrinth profile rollback failed: {rollback_error}"
+                        ) from rollback_error
+            raise
         finally:
             if owns_operation:
                 self.finish_feedback_operation(operation)
@@ -121,60 +238,6 @@ class ModrinthLoader(BaseLoader):
 
         return actual_loader_version
 
-    def _extract_overrides(self, mrpack_path: Path, game_path: Path) -> None:
-        """Розпаковує overrides з .mrpack файлу в game directory."""
-        self.pack_service.extract_overrides(mrpack_path, game_path, self.app.log)
-
-    def _download_modpack_files(
-        self,
-        index: MrpackIndex,
-        game_path: Path,
-        *,
-        operation: OperationHandle | None = None,
-    ) -> None:
-        """Завантажує моди та ресурспаки з mrpack індексу паралельно."""
-        files = index.get("files", [])
-        if not files:
-            self.app.log.info("No files to download")
-            return
-
-        total_files = len(files)
-        self.app.log.info(f"Preparing to download {total_files} modpack files")
-
-        download_tasks = self.pack_service.build_download_tasks(index, game_path)
-
-        if not download_tasks:
-            self.app.log.info("No files need to be downloaded")
-            return
-
-        # Асинхронне завантаження
-        self.app.log.info(f"Starting parallel download of {len(download_tasks)} files")
-        downloader = AsyncDownloader(max_workers=6)  # Більше потоків для modpack
-
-        def progress_callback(completed, total, current_file):
-            self._update_feedback_operation(
-                status=current_file,
-                progress=completed,
-                max_progress=total,
-                operation=operation,
-            )
-
-        result = downloader.download_files(
-            download_tasks,
-            progress_callback=progress_callback,
-            skip_existing=True
-        )
-
-        self.app.log.info(
-            f"Downloaded {result['success']} files, "
-            f"skipped {result['skipped']} existing files, "
-            f"{result['failed']} failed"
-        )
-
-        if result['errors']:
-            for error in result['errors'][:5]:
-                self.app.log.error(f"Download error: {error}")
-
     def _update_version_entity(
             self,
             version: Version,
@@ -184,8 +247,6 @@ class ModrinthLoader(BaseLoader):
             loader_ver: Optional[str]
     ) -> None:
         """Оновлює Version entity з інформацією про встановлений модпак."""
-        from launcher.core import Launcher
-
         version.path = str(game_path)
         version.version = mc_ver
 
@@ -194,12 +255,12 @@ class ModrinthLoader(BaseLoader):
             version.loader_version = loader_ver
 
             mll_key = self.pack_service.loader_key(loader_id) or "minecraft"
-            loader_obj = Launcher.get_loader(mll_key)
+            loader_obj = self.app.launcher.get_loader(mll_key)
             version.client = loader_obj.get_name()
         else:
             version.loader = mc_ver
             version.loader_version = None
-            version.client = Launcher.get_loader("minecraft").get_name()
+            version.client = self.app.launcher.get_loader("minecraft").get_name()
 
         version.save()
 

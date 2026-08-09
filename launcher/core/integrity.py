@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Any, Dict, List, Optional
 
 import minecraft_launcher_lib
 import minecraft_launcher_lib._helper as minecraft_launcher_helper
@@ -50,7 +50,7 @@ class IntegrityChecker:
         mc_version: Optional[str] = None,
         *,
         check_java: bool = True,
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         Комплексна перевірка версії.
 
@@ -116,7 +116,7 @@ class IntegrityChecker:
             result['components']['libraries'] = libraries_valid
             if not libraries_valid:
                 result['valid'] = False
-                result['issues'].append(f"Some libraries are missing or corrupted")
+                result['issues'].append("Some libraries are missing or corrupted")
         else:
             result['components']['libraries'] = False
 
@@ -130,7 +130,7 @@ class IntegrityChecker:
         result['components']['java'] = java_valid
         if not java_valid:
             result['valid'] = False
-            result['issues'].append(f"Java runtime missing or corrupted")
+            result['issues'].append("Java runtime missing or corrupted")
 
         if result['valid']:
             Logger.info(f"Version {version_id} integrity check passed")
@@ -300,7 +300,7 @@ class IntegrityChecker:
     def repair_version(
         self,
         version_id: str,
-        callback: Optional[any] = None,
+        callback: Optional[Any] = None,
         force_reinstall: bool = False
     ) -> bool:
         """
@@ -341,7 +341,7 @@ class IntegrityChecker:
             Logger.error(f"Error repairing version {version_id}: {e}")
             return False
 
-    def repair_java_runtime(self, version_id: str, callback: Optional[any] = None) -> bool:
+    def repair_java_runtime(self, version_id: str, callback: Optional[Any] = None) -> bool:
         """
         Відновлює Java runtime для версії.
 

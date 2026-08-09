@@ -1,24 +1,90 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import json
+import os
+import threading
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
 import requests
 
-from launcher.core.async_downloader import DownloadTask
-from launcher.core.api.tensacraft import TensaCraftAPI
 import launcher.core.loaders.tensacraft as tensacraft_module
+from launcher.application.file_sync_journal import FileSyncJournal
+from launcher.application.instance_operations import InstanceOperationCoordinator
+from launcher.core.api.tensacraft import TensaCraftAPI
+from launcher.core.async_downloader import DownloadTask
 from launcher.pages.home import Home
-from launcher.shared.app_context import AppContext
+
+
+def test_tensacraft_sync_snapshot_excludes_runtime_locks(fake_app, monkeypatch, tmp_path: Path):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    runtime = SimpleNamespace(lock=threading.Lock())
+    version = SimpleNamespace(
+        id="aeronautics",
+        name="Aeronautics",
+        version="1.21.1",
+        loader="neoforge-21.1.230",
+        loader_version="21.1.230",
+        client="TensaCraft",
+        path=str(tmp_path / "instance"),
+        options={"gpuMode": "dgpu"},
+        image=None,
+        force_update=True,
+        _runtime=runtime,
+    )
+
+    def fail_after_snapshot(current):
+        current.name = "Changed"
+        raise RuntimeError("metadata unavailable")
+
+    monkeypatch.setattr(loader, "_find_version_payload", fail_after_snapshot)
+    loader.begin_feedback_operation = lambda **_kwargs: None
+    loader.finish_feedback_operation = lambda *_args, **_kwargs: None
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        loader._sync_update_locked(version)
+
+    assert version.name == "Aeronautics"
+    assert version._runtime is runtime
+
+
+def test_tensacraft_sync_accepts_launch_borrowed_lease(fake_app, monkeypatch, tmp_path: Path):
+    fake_app.instance_operations = InstanceOperationCoordinator()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_path = tmp_path / "instance"
+    version = SimpleNamespace(path=str(version_path), version_id="demo", name="Demo")
+    calls = []
+    monkeypatch.setattr(
+        loader,
+        "_sync_update_locked",
+        lambda current, force=False: calls.append((current, force)),
+    )
+
+    with fake_app.instance_operations.operation(version_path, "launch") as lease:
+        loader.sync_update(version, force=True, lease=lease)
+        assert fake_app.instance_operations.active_kind(version_path) == "launch"
+
+    assert calls == [(version, True)]
+    assert fake_app.instance_operations.active_kind(version_path) is None
+
+
+def test_tensacraft_sync_rejects_concurrent_instance_operation(fake_app, tmp_path: Path):
+    fake_app.instance_operations = InstanceOperationCoordinator()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_path = tmp_path / "instance"
+    version = SimpleNamespace(path=str(version_path), version_id="demo", name="Demo")
+
+    with fake_app.instance_operations.operation(version_path, "launch"):
+        with pytest.raises(RuntimeError, match="instance_operation_busy"):
+            loader.sync_update(version)
 
 
 def test_tensacraft_sync_update_shows_progress_for_noop_check(fake_app, monkeypatch, tmp_path: Path):
-    AppContext.set(fake_app)
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
 
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     mods_dir = version_root / "mods"
     mods_dir.mkdir(parents=True, exist_ok=True)
@@ -39,7 +105,6 @@ def test_tensacraft_sync_update_shows_progress_for_noop_check(fake_app, monkeypa
 
     starts = []
     closes = []
-    sync_calls = []
     progress_updates = []
     operation = SimpleNamespace()
 
@@ -75,8 +140,6 @@ def test_tensacraft_sync_update_shows_progress_for_noop_check(fake_app, monkeypa
         "launcher.core.async_downloader.AsyncDownloader._should_skip",
         lambda self, task, verify_sha1=False: True,
     )
-    loader._sync_mods = lambda *_args, **_kwargs: sync_calls.append(True)
-
     loader.sync_update(version)
 
     assert starts == [
@@ -92,7 +155,6 @@ def test_tensacraft_sync_update_shows_progress_for_noop_check(fake_app, monkeypa
     ]
     assert closes == [(operation, None, False)]
     assert progress_updates == []
-    assert sync_calls == []
 
 
 def test_tensacraft_sync_update_allows_running_game_dir_when_no_update_needed(
@@ -100,8 +162,7 @@ def test_tensacraft_sync_update_allows_running_game_dir_when_no_update_needed(
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     version_root.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -131,10 +192,10 @@ def test_tensacraft_sync_update_allows_running_game_dir_when_no_update_needed(
             "options": {},
         }
     }
-    loader._prepare_file_sync = lambda *_args, **_kwargs: {
-        "api_available": True,
-        "has_changes": False,
-    }
+    loader._prepare_file_sync = lambda *_args, **_kwargs: tensacraft_module.TensaCraftContentPlan(
+        root=version_root,
+        api_available=True,
+    )
     loader.payload.loader_changed = lambda *_args, **_kwargs: False
     loader.runtime.has_runtime = lambda *_args, **_kwargs: True
     loader.payload.merge_sync_payload = lambda *_args, **_kwargs: None
@@ -152,8 +213,7 @@ def test_tensacraft_sync_update_blocks_running_game_dir_when_files_need_update(
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     version_root.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -183,10 +243,11 @@ def test_tensacraft_sync_update_blocks_running_game_dir_when_files_need_update(
             "options": {},
         }
     }
-    loader._prepare_file_sync = lambda *_args, **_kwargs: {
-        "api_available": True,
-        "has_changes": True,
-    }
+    loader._prepare_file_sync = lambda *_args, **_kwargs: tensacraft_module.TensaCraftContentPlan(
+        root=version_root,
+        api_available=True,
+        force_changes=True,
+    )
     loader.payload.loader_changed = lambda *_args, **_kwargs: False
     loader.runtime.has_runtime = lambda *_args, **_kwargs: True
     loader.payload.merge_sync_payload = lambda *_args, **_kwargs: None
@@ -200,11 +261,71 @@ def test_tensacraft_sync_update_blocks_running_game_dir_when_files_need_update(
     assert sync_calls == []
 
 
+def test_tensacraft_sync_blocks_running_game_before_recovering_interrupted_files(
+    fake_app,
+    monkeypatch,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_root = tmp_path / "instance"
+    current = version_root / "mods" / "managed.jar"
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b"old")
+    journal = FileSyncJournal(version_root)
+    journal.begin_transaction(
+        operation="sync",
+        replacements=["mods/managed.jar"],
+        stale=[],
+    )
+    staged = journal.stage_path("mods/managed.jar")
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"new")
+    journal.mark_prepared()
+    payload = journal.read()
+    transaction_root = version_root / ".tensalauncher-sync" / payload["transaction_id"]
+    backup = transaction_root / "backup" / "mods" / "managed.jar"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(current, backup)
+    os.replace(staged, current)
+    payload["status"] = "applying"
+    payload["entries"][0].update({"had_original": True, "state": "applied"})
+    journal.path.write_text(json.dumps(payload), encoding="utf-8")
+    version = SimpleNamespace(
+        id="aeronautics",
+        version="1.21.1",
+        loader="fabric-loader-0.16-1.21.1",
+        loader_version="0.16",
+        client="TensaCraft",
+        path=str(version_root),
+        options={},
+        image=None,
+        save=lambda: None,
+    )
+    loader.api.get_versions = lambda _key: {
+        "client": {
+            "version": "1.21.1",
+            "loader": "fabric",
+            "loader_version": "0.16",
+            "options": {},
+        }
+    }
+    monkeypatch.setattr(
+        "launcher.core.game.Game.is_game_dir_active",
+        lambda _game_path: True,
+    )
+
+    with pytest.raises(RuntimeError, match="tensacraft_game_directory_running"):
+        loader.sync_update(version)
+
+    assert current.read_bytes() == b"new"
+    assert backup.read_bytes() == b"old"
+    assert journal.read()["status"] == "applying"
+
+
 def test_tensacraft_sync_update_installs_api_pinned_neoforge_build(fake_app, monkeypatch, tmp_path: Path):
-    AppContext.set(fake_app)
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
 
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     version_root.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -262,10 +383,9 @@ def test_tensacraft_sync_update_installs_api_pinned_neoforge_build(fake_app, mon
 
 
 def test_tensacraft_sync_update_preserves_user_custom_options(fake_app, monkeypatch, tmp_path: Path):
-    AppContext.set(fake_app)
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
 
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     mods_dir = version_root / "mods"
     mods_dir.mkdir(parents=True, exist_ok=True)
@@ -333,10 +453,9 @@ def test_tensacraft_sync_update_preserves_user_custom_options(fake_app, monkeypa
 
 
 def test_tensacraft_existing_java_path_requires_usable_launcher_runtime(fake_app, monkeypatch):
-    AppContext.set(fake_app)
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
 
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     loader.runtime.get_runtime_name = lambda *_args, **_kwargs: "java-runtime-delta"
     loader.runtime.get_executable_path = lambda *_args, **_kwargs: "C:/LauncherJava/bin/java.exe"
     loader.runtime.runtime_is_usable = lambda *_args, **_kwargs: False
@@ -345,10 +464,9 @@ def test_tensacraft_existing_java_path_requires_usable_launcher_runtime(fake_app
 
 
 def test_tensacraft_sync_update_applies_api_forced_profile_fields(fake_app, monkeypatch, tmp_path: Path):
-    AppContext.set(fake_app)
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
 
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     mods_dir = version_root / "mods"
     mods_dir.mkdir(parents=True, exist_ok=True)
@@ -421,10 +539,9 @@ def test_tensacraft_sync_update_applies_api_forced_profile_fields(fake_app, monk
 
 
 def test_tensacraft_sync_update_opens_progress_for_file_changes(fake_app, monkeypatch, tmp_path: Path):
-    AppContext.set(fake_app)
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
 
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     mods_dir = version_root / "mods"
     mods_dir.mkdir(parents=True, exist_ok=True)
@@ -469,7 +586,17 @@ def test_tensacraft_sync_update_opens_progress_for_file_changes(fake_app, monkey
             "download_url": "https://example.com/existing.jar",
         }
     ]
-    loader.api.get_force_update_manifest = lambda *_args, **_kwargs: None
+    loader.api.get_force_update_manifest = lambda *_args, **_kwargs: {
+        "directories": [{"path": "mods/", "sync_scope": "directory"}],
+        "files": [
+            {
+                "name": "existing.jar",
+                "path": "mods/",
+                "relative_path": "mods/existing.jar",
+                "download_url": "https://example.com/existing.jar",
+            }
+        ],
+    }
     loader.runtime.has_runtime = lambda *_args, **_kwargs: True
     loader.runtime.get_runtime_name = lambda *_args, **_kwargs: "java-runtime"
     loader.runtime.get_executable_path = lambda *_args, **_kwargs: "C:/Java/bin/java.exe"
@@ -502,28 +629,25 @@ def test_tensacraft_sync_files_reports_download_failures_without_success_alert(
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     version_root.mkdir(parents=True)
     alerts = []
     fake_app.feedback.info = lambda message, **_kwargs: alerts.append(message)
     fake_app.feedback.warning = lambda message, **_kwargs: alerts.append(message)
 
-    sync_plan = {
-        "api_available": True,
-        "managed_directories": set(),
-        "stale_paths": [],
-        "download_tasks": [
+    sync_plan = tensacraft_module.TensaCraftContentPlan(
+        root=version_root,
+        api_available=True,
+        download_tasks=(
             DownloadTask(
                 url="https://example.com/broken.jar",
                 destination=version_root / "mods" / "broken.jar",
                 task_id="mods/broken.jar",
-            )
-        ],
-        "eligible_files": 1,
-        "has_changes": True,
-    }
+            ),
+        ),
+        eligible_files=1,
+    )
 
     class FailingDownloader:
         def __init__(self, *args, **kwargs):
@@ -550,8 +674,7 @@ def test_tensacraft_sync_files_reports_stale_removal_failures_without_success_al
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     stale_file = version_root / "mods" / "stale.jar"
     stale_file.parent.mkdir(parents=True)
@@ -560,23 +683,22 @@ def test_tensacraft_sync_files_reports_stale_removal_failures_without_success_al
     fake_app.feedback.info = lambda message, **_kwargs: alerts.append(message)
     fake_app.feedback.warning = lambda message, **_kwargs: alerts.append(message)
 
-    sync_plan = {
-        "api_available": True,
-        "managed_directories": {Path("mods")},
-        "stale_paths": [stale_file],
-        "download_tasks": [],
-        "eligible_files": 1,
-        "has_changes": True,
-    }
+    sync_plan = tensacraft_module.TensaCraftContentPlan(
+        root=version_root,
+        api_available=True,
+        managed_directories=frozenset({PurePosixPath("mods")}),
+        stale_paths=(PurePosixPath("mods/stale.jar"),),
+        eligible_files=1,
+    )
 
-    original_unlink = Path.unlink
+    original_replace = os.replace
 
-    def fail_unlink(path, *args, **kwargs):
-        if path == stale_file:
+    def fail_replace(source, destination):
+        if Path(source) == stale_file:
             raise PermissionError("file is locked")
-        return original_unlink(path, *args, **kwargs)
+        return original_replace(source, destination)
 
-    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    monkeypatch.setattr("launcher.application.file_sync_journal.os.replace", fail_replace)
 
     with pytest.raises(RuntimeError, match="stale.jar: file is locked"):
         loader._sync_files(SimpleNamespace(path=str(version_root)), "aeronautics", sync_plan)
@@ -584,13 +706,92 @@ def test_tensacraft_sync_files_reports_stale_removal_failures_without_success_al
     assert "syncing_files_complete" not in alerts
 
 
+def test_tensacraft_sync_rolls_back_files_when_profile_commit_fails(fake_app, tmp_path: Path):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_root = tmp_path / "instance"
+    stale_file = version_root / "mods" / "stale.jar"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_bytes(b"old")
+    sync_plan = tensacraft_module.TensaCraftContentPlan(
+        root=version_root,
+        api_available=True,
+        managed_directories=frozenset({PurePosixPath("mods")}),
+        stale_paths=(PurePosixPath("mods/stale.jar"),),
+        eligible_files=1,
+    )
+
+    with pytest.raises(OSError, match="profile is locked"):
+        loader._sync_files(
+            SimpleNamespace(path=str(version_root)),
+            "aeronautics",
+            sync_plan,
+            commit_callback=lambda: (_ for _ in ()).throw(OSError("profile is locked")),
+        )
+
+    assert stale_file.read_bytes() == b"old"
+    assert FileSyncJournal(version_root).read()["status"] == "rolled_back"
+
+
+def test_tensacraft_sync_restores_in_memory_profile_when_commit_fails(
+    fake_app,
+    monkeypatch,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version = SimpleNamespace(
+        id="aeronautics",
+        version="1.21.1",
+        loader="fabric-loader-0.16-1.21.1",
+        loader_version="0.16",
+        client="TensaCraft",
+        path=str(tmp_path / "instance"),
+        options={"gpuMode": "integrated"},
+        image=None,
+        force_update=False,
+        save=lambda: (_ for _ in ()).throw(OSError("profile is locked")),
+    )
+    original = dict(vars(version))
+    original["options"] = dict(version.options)
+    loader.api.get_versions = lambda _key: {
+        "client": {
+            "version": "1.21.1",
+            "loader": "fabric",
+            "loader_version": "0.16",
+            "force_update": True,
+            "force_update_profile_fields": ["gpu_preference"],
+            "gpu_preference": "dgpu",
+        }
+    }
+    loader.payload.loader_changed = lambda *_args, **_kwargs: False
+    loader._prepare_file_sync = lambda *_args, **_kwargs: tensacraft_module.TensaCraftContentPlan(
+        root=Path(version.path),
+        api_available=True,
+        eligible_files=1,
+        force_changes=True,
+    )
+    loader._existing_java_path = lambda *_args, **_kwargs: "C:/Java/bin/java.exe"
+    loader._get_version_java_path = lambda *_args, **_kwargs: "C:/Java/bin/java.exe"
+    loader._ensure_game_directory_idle = lambda *_args, **_kwargs: None
+
+    def fail_commit(_version, _key, _plan, **kwargs):
+        kwargs["commit_callback"]()
+
+    monkeypatch.setattr(loader, "_sync_files", fail_commit)
+
+    with pytest.raises(OSError, match="profile is locked"):
+        loader.sync_update(version)
+
+    assert version.force_update is original["force_update"]
+    assert version.options == original["options"]
+    assert version.id == original["id"]
+
+
 def test_tensacraft_force_sync_removes_extra_files_from_locked_directory(
     fake_app,
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     managed_dir = version_root / "kubejs" / "server_scripts"
     managed_dir.mkdir(parents=True)
@@ -634,8 +835,7 @@ def test_tensacraft_force_sync_uses_force_update_manifest_directories(
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     managed_dir = version_root / "kubejs"
     managed_dir.mkdir(parents=True)
@@ -677,8 +877,7 @@ def test_tensacraft_force_sync_preserves_api_allowed_local_files(
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     mods_dir = version_root / "mods"
     shaderpacks_dir = version_root / "shaderpacks"
@@ -762,8 +961,7 @@ def test_tensacraft_force_sync_keeps_siblings_for_single_managed_file(
     monkeypatch,
     tmp_path: Path,
 ):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     config_dir = version_root / "config"
     config_dir.mkdir(parents=True)
@@ -793,12 +991,87 @@ def test_tensacraft_force_sync_keeps_siblings_for_single_managed_file(
 
     assert (config_dir / "managed.toml").exists()
     assert (config_dir / "custom.toml").exists()
-    assert plan["has_changes"] is False
+    assert plan.has_changes is False
+
+
+def test_tensacraft_sync_without_management_metadata_preserves_unknown_local_mods(
+    fake_app,
+    monkeypatch,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_root = tmp_path / "instance"
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True)
+    local_mod = mods_dir / "local-user-mod.jar"
+    local_mod.write_bytes(b"local")
+    version = SimpleNamespace(path=str(version_root))
+    loader.api.get_force_update_manifest = lambda *_args, **_kwargs: None
+    loader.api.get_version_files = lambda _key: [
+        {
+            "name": "managed.jar",
+            "path": "mods/",
+            "relative_path": "mods/managed.jar",
+            "download_url": "https://example.com/managed.jar",
+            "sha256": "1" * 64,
+        }
+    ]
+    monkeypatch.setattr(
+        "launcher.core.async_downloader.AsyncDownloader._should_skip",
+        lambda self, task, verify_sha1=False: True,
+    )
+
+    plan = loader._prepare_file_sync(version, "aeronautics")
+    loader._sync_files(version, "aeronautics", plan)
+
+    assert local_mod.read_bytes() == b"local"
+    assert plan.stale_paths == ()
+
+
+def test_tensacraft_repair_journal_forces_existing_managed_file_download(
+    fake_app,
+    monkeypatch,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_root = tmp_path / "instance"
+    mods_dir = version_root / "mods"
+    mods_dir.mkdir(parents=True)
+    (mods_dir / "sodium.jar").write_bytes(b"broken")
+
+    version = SimpleNamespace(path=str(version_root))
+    loader.api.get_force_update_manifest = lambda _key, include_directory_files=True: {
+        "directories": [{"path": "mods/", "sync_scope": "directory"}],
+        "files": [
+            {
+                "name": "sodium.jar",
+                "path": "mods/",
+                "relative_path": "mods/sodium.jar",
+                "download_url": "https://example.com/sodium.jar",
+                "size": 6,
+            }
+        ],
+    }
+    loader.api.get_version_files = lambda _key: (_ for _ in ()).throw(
+        AssertionError("force-update manifest should be used")
+    )
+    monkeypatch.setattr(
+        "launcher.core.async_downloader.AsyncDownloader._should_skip",
+        lambda self, task, verify_sha1=False: True,
+    )
+    FileSyncJournal(version_root).mark_repair_required(
+        reason="missing_mod_dependency",
+        details={"diagnostic_path": str(version_root / "logs" / "latest.log")},
+    )
+
+    plan = loader._prepare_file_sync(version, "aeronautics")
+
+    assert plan.has_changes is True
+    assert [task.task_id for task in plan.download_tasks] == ["mods/sodium.jar"]
 
 
 def test_tensacraft_install_prefers_saved_pack_id_over_mc_version(fake_app):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     requested = []
 
     version = SimpleNamespace(
@@ -828,8 +1101,7 @@ def test_tensacraft_install_prefers_saved_pack_id_over_mc_version(fake_app):
 
 
 def test_tensacraft_install_recovers_pack_id_from_name_when_local_id_is_not_pack_id(fake_app, monkeypatch, tmp_path):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     requested = []
     saved = []
     version_root = tmp_path / "instance"
@@ -873,7 +1145,7 @@ def test_tensacraft_install_recovers_pack_id_from_name_when_local_id_is_not_pack
     loader.get_game_path = lambda _version_id: version_root
     loader.api.get_versions = fake_get_versions
     loader.api.get_version_files = lambda version_key: [] if version_key == "aeronautics" else None
-    monkeypatch.setattr("launcher.core.Launcher.get_loader", lambda _loader_name: FakeBaseLoader())
+    monkeypatch.setattr(fake_app.launcher, "get_loader", lambda _loader_name: FakeBaseLoader())
 
     loader.install(version)
 
@@ -883,8 +1155,7 @@ def test_tensacraft_install_recovers_pack_id_from_name_when_local_id_is_not_pack
 
 
 def test_tensacraft_install_blocks_when_game_directory_is_running(fake_app, monkeypatch, tmp_path: Path):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
     version_root = tmp_path / "instance"
     requested = []
 
@@ -915,9 +1186,80 @@ def test_tensacraft_install_blocks_when_game_directory_is_running(fake_app, monk
     assert requested == []
 
 
-def test_tensacraft_install_error_includes_first_download_failure(fake_app):
-    AppContext.set(fake_app)
-    loader = tensacraft_module.TensaCraftLoader()
+def test_tensacraft_pack_content_is_activated_from_transaction_staging(
+    fake_app,
+    monkeypatch,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version_root = tmp_path / "instance"
+    destination = version_root / "mods" / "managed.jar"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"old")
+    staged_destinations = []
+
+    class SuccessfulDownloader:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def download_files(self, tasks, *args, **kwargs):
+            for task in tasks:
+                staged_destinations.append(task.destination)
+                task.destination.parent.mkdir(parents=True, exist_ok=True)
+                task.destination.write_bytes(b"new")
+            return {
+                "success": len(tasks),
+                "failed": 0,
+                "skipped": 0,
+                "errors": [],
+            }
+
+    monkeypatch.setattr(tensacraft_module, "AsyncDownloader", SuccessfulDownloader)
+
+    loader._download_pack_files(
+        version_root,
+        [
+            {
+                "name": "managed.jar",
+                "relative_path": "mods/managed.jar",
+                "download_url": "https://example.com/managed.jar",
+                "size": 3,
+            }
+        ],
+        "syncing_files",
+    )
+
+    assert destination.read_bytes() == b"new"
+    assert staged_destinations
+    assert all(path != destination for path in staged_destinations)
+    assert FileSyncJournal(version_root).read()["status"] == "complete"
+
+
+def test_tensacraft_pack_content_rejects_duplicate_destinations(
+    fake_app,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    duplicate = {
+        "name": "managed.jar",
+        "relative_path": "mods/managed.jar",
+        "download_url": "https://example.com/managed.jar",
+    }
+
+    with pytest.raises(RuntimeError, match="duplicate destinations"):
+        loader._download_pack_files(
+            tmp_path / "instance",
+            [duplicate, dict(duplicate)],
+            "syncing_files",
+        )
+
+
+def test_tensacraft_install_error_includes_first_download_failure(
+    fake_app,
+    monkeypatch,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
 
     version = SimpleNamespace(
         id="tensa-lite",
@@ -932,7 +1274,7 @@ def test_tensacraft_install_error_includes_first_download_failure(fake_app):
 
     loader.begin_feedback_operation = lambda *_args, **_kwargs: None
     loader.finish_feedback_operation = lambda *_args, **_kwargs: None
-    loader.get_game_path = lambda _version_id: Path("instance")
+    loader.get_game_path = lambda _version_id: tmp_path / "instance"
     loader.api.get_versions = lambda _version_key: {
         "client": {
             "id": "tensa-lite",
@@ -957,12 +1299,13 @@ def test_tensacraft_install_error_includes_first_download_failure(fake_app):
         def download_files(self, *args, **kwargs):
             return {"success": 0, "failed": 1, "skipped": 0, "errors": ["client.json: Permission denied"]}
 
-    import launcher.core as core_module
-
     original_downloader = tensacraft_module.AsyncDownloader
-    original_get_loader = core_module.Launcher.get_loader
     tensacraft_module.AsyncDownloader = FailingDownloader
-    core_module.Launcher.get_loader = staticmethod(lambda _name: SimpleNamespace(install=lambda **kwargs: None))
+    monkeypatch.setattr(
+        fake_app.launcher,
+        "get_loader",
+        lambda _name: SimpleNamespace(install=lambda **kwargs: None),
+    )
     try:
         try:
             loader.install(version)
@@ -972,11 +1315,9 @@ def test_tensacraft_install_error_includes_first_download_failure(fake_app):
             raise AssertionError("Expected install to fail when pack downloads fail")
     finally:
         tensacraft_module.AsyncDownloader = original_downloader
-        core_module.Launcher.get_loader = original_get_loader
 
 
 def test_tensacraft_api_retries_transient_timeout(fake_app, monkeypatch):
-    AppContext.set(fake_app)
     TensaCraftAPI._packs_cache = None
     TensaCraftAPI._files_cache = {}
     TensaCraftAPI._force_update_cache = {}
@@ -998,12 +1339,11 @@ def test_tensacraft_api_retries_transient_timeout(fake_app, monkeypatch):
     monkeypatch.setattr("launcher.core.api.tensacraft.requests.get", fake_get)
     monkeypatch.setattr("launcher.core.api.tensacraft.time.sleep", lambda _seconds: None)
 
-    assert TensaCraftAPI().list_versions() == [{"client": {"id": "aeronautics"}}]
+    assert TensaCraftAPI(fake_app).list_versions() == [{"client": {"id": "aeronautics"}}]
     assert len(calls) == 2
 
 
 def test_tensacraft_api_fetches_force_update_manifest_with_directory_files(fake_app, monkeypatch):
-    AppContext.set(fake_app)
     TensaCraftAPI._packs_cache = None
     TensaCraftAPI._files_cache = {}
     TensaCraftAPI._force_update_cache = {}
@@ -1034,7 +1374,7 @@ def test_tensacraft_api_fetches_force_update_manifest_with_directory_files(fake_
 
     monkeypatch.setattr("launcher.core.api.tensacraft.requests.get", fake_get)
 
-    manifest = TensaCraftAPI().get_force_update_manifest("aeronautics", include_directory_files=True)
+    manifest = TensaCraftAPI(fake_app).get_force_update_manifest("aeronautics", include_directory_files=True)
 
     assert manifest == {
         "directories": [{"path": "mods/", "sync_scope": "directory"}],
@@ -1158,20 +1498,18 @@ def test_home_skips_pending_remote_tensacraft_pack(fake_app, monkeypatch):
     fake_app.pending_tensacraft_pack_ids = {"aeronautics"}
     fake_app.versions = SimpleNamespace(all=lambda: [])
 
-    class FakeTensaCraftAPI:
-        def list_versions(self):
-            return [
-                {
-                    "name": "aeronautics",
-                    "client": {
-                        "id": "aeronautics",
-                        "name": "Aeronautics",
-                        "description": "Aeronautics Create mods server TensaCraft",
-                    },
-                }
-            ]
-
-    monkeypatch.setattr("launcher.pages.home.TensaCraftAPI", FakeTensaCraftAPI)
+    fake_app.tensa_api = SimpleNamespace(
+        list_versions=lambda: [
+            {
+                "name": "aeronautics",
+                "client": {
+                    "id": "aeronautics",
+                    "name": "Aeronautics",
+                    "description": "Aeronautics Create mods server TensaCraft",
+                },
+            }
+        ]
+    )
 
     asyncio.run(page._load_tensacraft_versions())
 

@@ -3,7 +3,6 @@ import flet as ft
 from launcher import ui
 from launcher.application.tensacraft_catalog import TensaCraftCatalogService
 from launcher.application.tensacraft_install_state import mark_pending, pending_pack_ids, unmark_pending
-from launcher.core.api import TensaCraftAPI
 from launcher.core.game import Game
 from launcher.core.versions import Version
 from launcher.pages.launch_feedback import handle_launch_response
@@ -139,7 +138,7 @@ class Home:
         if not self.grid:
             return
         try:
-            packs = await run_blocking(TensaCraftAPI().list_versions)
+            packs = await run_blocking(self.app.tensa_api.list_versions)
         except Exception as exc:
             self.app.log.error(f"Failed to fetch TensaCraft versions: {exc}")
             return
@@ -355,9 +354,11 @@ class Home:
         handle_launch_response(self.app, resp)
 
     def _install_tensacraft_version(self, version_name: str, pack_id: str) -> Version:
-        new_version = Version(
-            version_name,
-            {"name": version_name, "version": pack_id, "client": "tensacraft"},
+        new_version = self.app.versions.prepare(
+            Version(
+                version_name,
+                {"name": version_name, "version": pack_id, "client": "tensacraft"},
+            )
         )
         new_version.install()
         return (

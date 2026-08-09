@@ -47,11 +47,12 @@ class TensaCraftCatalogService:
 
     @staticmethod
     def build_stub(pack: dict, pack_id: str) -> Version:
-        client = pack.get("client") if isinstance(pack.get("client"), dict) else {}
+        raw_client = pack.get("client")
+        client = raw_client if isinstance(raw_client, dict) else {}
         name = str(pack.get("title") or client.get("name") or pack.get("name") or pack_id).strip()
         image = pack.get("image")
-        if not image and isinstance(pack.get("client"), dict):
-            image = pack["client"].get("image")
+        if not image:
+            image = client.get("image")
         version = Version(
             name,
             {
@@ -60,11 +61,11 @@ class TensaCraftCatalogService:
                 "client": "TensaCraft",
                 "id": pack_id,
                 "image": image,
+                "is_remote": True,
+                "remote_pack_id": pack_id,
+                "description": TensaCraftCatalogService.pack_description(pack),
             },
         )
-        version.is_remote = True
-        version.remote_pack_id = pack_id
-        version.description = TensaCraftCatalogService.pack_description(pack)
         return version
 
     @staticmethod

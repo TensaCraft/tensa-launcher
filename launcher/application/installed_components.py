@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import importlib
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,13 +10,8 @@ from typing import Any, Callable, Iterable
 from launcher.core.integrity import IntegrityChecker
 from launcher.models.logger import Logger
 
-
 GameVersionsProvider = Callable[[], Iterable[Any]]
-
-
-def _get_launcher_loader(loader_id: str) -> Any:
-    launcher_class = importlib.import_module("launcher.core.launcher").Launcher
-    return launcher_class.get_loader(loader_id)
+LoaderProvider = Callable[[str], Any]
 
 
 @dataclass(frozen=True)
@@ -58,6 +53,17 @@ class InstalledComponentsService:
         "quilt": "Quilt",
         "unknown": "Unknown",
     }
+    _WINDOWS_FORBIDDEN_NAME_CHARS = frozenset('<>:"/\\|?*')
+    _WINDOWS_RESERVED_NAMES = frozenset(
+        {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+    )
 
     def __init__(
         self,
@@ -65,11 +71,13 @@ class InstalledComponentsService:
         *,
         games_dir: str | Path | None = None,
         versions_provider: GameVersionsProvider | None = None,
+        loader_provider: LoaderProvider | None = None,
     ) -> None:
         self.minecraft_dir = Path(minecraft_dir)
         self.versions_dir = self.minecraft_dir / "versions"
         self.games_dir = Path(games_dir) if games_dir else self.minecraft_dir / "games"
         self._versions_provider = versions_provider or (lambda: [])
+        self._loader_provider = loader_provider
         self.integrity = IntegrityChecker(self.minecraft_dir)
 
     def list_installed(self) -> list[InstalledComponent]:
@@ -92,13 +100,16 @@ class InstalledComponentsService:
         target = self._component_dir(version_id)
         if not target.exists():
             return
+        self._read_component_manifest(target, requested_id=version_id)
         shutil.rmtree(target)
         self._clear_installed_cache()
 
     def verify_component(self, component: InstalledComponent) -> dict[str, Any]:
+        self._validate_component_reference(component)
         return self.integrity.check_version(component.version_id, component.minecraft_version)
 
     def reinstall_component(self, component: InstalledComponent, operation: Any | None = None) -> InstalledComponent:
+        self._validate_component_reference(component)
         return self.install_component(
             component.kind,
             component.minecraft_version or component.version_id,
@@ -122,11 +133,11 @@ class InstalledComponentsService:
             raise ValueError("Minecraft version is required")
 
         if loader_id == "minecraft":
-            loader = _get_launcher_loader("minecraft")
+            loader = self._get_loader("minecraft")
             loader._install_minecraft_if_needed(minecraft_version, force_check=force_check, operation=operation)
             installed_version_id = minecraft_version
         elif loader_id in {"fabric", "forge", "neoforge", "quilt"}:
-            loader = _get_launcher_loader(loader_id)
+            loader = self._get_loader(loader_id)
             installed_version_id, _actual_loader_version = loader._install_mod_loader(
                 minecraft_version,
                 loader_id,
@@ -177,8 +188,9 @@ class InstalledComponentsService:
         return path
 
     def get_component(self, version_id: str) -> InstalledComponent | None:
+        identity = self._identity_key(self._validated_component_id(version_id))
         for component in self.list_installed():
-            if component.version_id == version_id:
+            if self._identity_key(component.version_id) == identity:
                 return component
         return None
 
@@ -214,15 +226,12 @@ class InstalledComponentsService:
         for version_dir in self.versions_dir.iterdir():
             if not version_dir.is_dir():
                 continue
-            manifest_path = version_dir / f"{version_dir.name}.json"
-            if not manifest_path.exists():
-                continue
             try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                Logger.warning(f"Skipping unreadable Minecraft version manifest {manifest_path}: {exc}")
+                manifest = self._read_component_manifest(version_dir, requested_id=version_dir.name)
+            except (FileNotFoundError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                Logger.warning(f"Skipping unsafe Minecraft version directory {version_dir}: {exc}")
                 continue
-            version_id = str(manifest.get("id") or version_dir.name).strip() or version_dir.name
+            version_id = str(manifest["id"])
             manifests.append((version_id, version_dir, manifest))
         return manifests
 
@@ -334,15 +343,103 @@ class InstalledComponentsService:
             return []
 
     def _component_dir(self, version_id: str) -> Path:
-        clean_id = str(version_id or "").strip()
-        if not clean_id or clean_id in {".", ".."}:
-            raise ValueError("Invalid component id")
+        clean_id = self._validated_component_id(version_id)
+        root = self.versions_dir.resolve(strict=False)
+        candidate = root / clean_id
+        if candidate.is_symlink():
+            raise ValueError(f"Component path uses an unsupported symbolic link: {version_id}")
 
-        root = self.versions_dir.resolve()
-        target = (root / clean_id).resolve()
-        if target == root or root not in target.parents:
+        target = candidate.resolve(strict=False)
+        if target.parent != root:
             raise ValueError(f"Component path escapes versions directory: {version_id}")
+
+        if not target.exists() and self._identity_key("A") == self._identity_key("a") and root.is_dir():
+            matches = [
+                child
+                for child in root.iterdir()
+                if child.is_dir() and self._identity_key(child.name) == self._identity_key(clean_id)
+            ]
+            if len(matches) > 1:
+                raise RuntimeError(f"Ambiguous component directories for id: {version_id}")
+            if matches:
+                target = matches[0].resolve(strict=False)
+                if target.parent != root or matches[0].is_symlink():
+                    raise ValueError(f"Component path escapes versions directory: {version_id}")
         return target
+
+    @classmethod
+    def _validated_component_id(cls, value: object) -> str:
+        component_id = str(value or "")
+        if not component_id or component_id != component_id.strip():
+            raise ValueError("Invalid component id")
+        if len(component_id) > 180:
+            raise ValueError("Invalid component id: value is too long")
+        if component_id in {".", ".."} or component_id.endswith((" ", ".")):
+            raise ValueError(f"Invalid component id: {component_id!r}")
+        if any(character in cls._WINDOWS_FORBIDDEN_NAME_CHARS for character in component_id):
+            raise ValueError(f"Invalid component id: {component_id!r}")
+        if any(ord(character) < 32 for character in component_id):
+            raise ValueError("Invalid component id: control characters are not allowed")
+        if component_id.split(".", 1)[0].upper() in cls._WINDOWS_RESERVED_NAMES:
+            raise ValueError("Invalid component id: reserved file name")
+        if Path(component_id).name != component_id or Path(component_id).is_absolute():
+            raise ValueError(f"Invalid component id: {component_id!r}")
+        return component_id
+
+    @staticmethod
+    def _identity_key(value: object) -> str:
+        return os.path.normcase(str(value))
+
+    def _read_component_manifest(self, version_dir: Path, *, requested_id: object) -> dict[str, Any]:
+        requested = self._validated_component_id(requested_id)
+        root = self.versions_dir.resolve(strict=False)
+        if version_dir.is_symlink():
+            raise ValueError("Component directory cannot be a symbolic link")
+        resolved_dir = version_dir.resolve(strict=False)
+        if resolved_dir.parent != root:
+            raise ValueError("Stored component path escapes versions directory")
+        stored_id = self._validated_component_id(resolved_dir.name)
+        expected_identity = self._identity_key(requested)
+        if self._identity_key(stored_id) != expected_identity:
+            raise RuntimeError(
+                f"Component directory id does not match requested id: {stored_id!r} != {requested!r}"
+            )
+
+        manifest_path = resolved_dir / f"{stored_id}.json"
+        if not manifest_path.is_file() and self._identity_key("A") == self._identity_key("a"):
+            matches = [
+                path
+                for path in resolved_dir.glob("*.json")
+                if self._identity_key(path.stem) == self._identity_key(stored_id)
+            ]
+            if len(matches) > 1:
+                raise RuntimeError(f"Ambiguous component manifests for id: {stored_id}")
+            if matches:
+                manifest_path = matches[0]
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Component manifest not found: {manifest_path}")
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"Component manifest is not an object: {manifest_path}")
+        manifest_id = self._validated_component_id(manifest.get("id"))
+        if self._identity_key(manifest_id) != expected_identity:
+            raise RuntimeError(
+                f"Component manifest id does not match requested id: {manifest_id!r} != {requested!r}"
+            )
+        return manifest
+
+    def _validate_component_reference(self, component: InstalledComponent) -> Path:
+        expected_path = self._component_dir(component.version_id)
+        stored_path = Path(component.path)
+        if stored_path.is_symlink():
+            raise ValueError("Stored component path cannot be a symbolic link")
+        if self._identity_key(stored_path.resolve(strict=False)) != self._identity_key(expected_path):
+            raise RuntimeError(
+                f"Stored component path does not match component id: {stored_path} != {expected_path}"
+            )
+        self._read_component_manifest(expected_path, requested_id=component.version_id)
+        return expected_path
 
     @staticmethod
     def _directory_size(path: Path) -> int:
@@ -382,12 +479,17 @@ class InstalledComponentsService:
         }
         return names.get(value, value)
 
-    @staticmethod
-    def _apply_runtime_path(version: Any, component: InstalledComponent, *, operation: Any | None = None) -> None:
+    def _apply_runtime_path(
+        self,
+        version: Any,
+        component: InstalledComponent,
+        *,
+        operation: Any | None = None,
+    ) -> None:
         if component.kind == "minecraft":
             return
         try:
-            loader = _get_launcher_loader(component.kind)
+            loader = self._get_loader(component.kind)
             java_path = loader._get_version_java_path(component.minecraft_version or version.version, operation=operation)
         except Exception as exc:
             Logger.warning(f"Unable to resolve Java runtime path for {component.version_id}: {exc}")
@@ -398,6 +500,11 @@ class InstalledComponentsService:
                 options = {}
                 version.options = options
             options["executablePath"] = java_path
+
+    def _get_loader(self, loader_id: str) -> Any:
+        if self._loader_provider is None:
+            raise RuntimeError("A launcher loader provider is required for component installation")
+        return self._loader_provider(loader_id)
 
     @staticmethod
     def _clear_installed_cache() -> None:

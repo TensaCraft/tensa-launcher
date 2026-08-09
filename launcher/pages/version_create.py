@@ -14,7 +14,6 @@ from launcher.application.version_creation import (
     VersionCreationCatalogService,
     unique_version_name,
 )
-from launcher.core.api import TensaCraftAPI
 from launcher.core.versions import Version
 from launcher.ui.core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
 from launcher.ui.patterns.loader_builds import (
@@ -67,6 +66,7 @@ class VersionCreatePage:
             minecraft_dir,
             games_dir=games_dir,
             versions_provider=app.versions.all,
+            loader_provider=app.launcher.get_loader,
         )
 
         self.app.header.set_params(
@@ -302,7 +302,7 @@ class VersionCreatePage:
         )
 
     def _fetch_tensacraft_options(self) -> list[VersionCreateOption]:
-        packs = TensaCraftAPI().list_versions()
+        packs = self.app.tensa_api.list_versions()
         options: list[VersionCreateOption] = []
         for pack in packs:
             if not isinstance(pack, dict):
@@ -679,7 +679,7 @@ class VersionCreatePage:
         selected_loader_version = self._selected_loader_version(option)
         if selected_loader_version and option.loader_id not in {"minecraft", "tensacraft"}:
             data["loader_version"] = selected_loader_version
-        version = Version(name, data)
+        version = self.app.versions.prepare(Version(name, data))
         if option.loader_id == "tensacraft":
             version.install()
             return

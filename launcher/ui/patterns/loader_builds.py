@@ -9,7 +9,6 @@ from launcher.application.version_creation import VersionCreateOption
 
 from ..controls.dropdown import Dropdown
 
-
 LoaderBuildSelection = MutableMapping[str, str]
 LoaderBuildChangeHandler = Callable[[VersionCreateOption, Any], None]
 

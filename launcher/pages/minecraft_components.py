@@ -37,12 +37,17 @@ class MinecraftComponentsPage:
         self.page = app.page
         self.trans = app.trans
         minecraft_dir = getattr(getattr(app, "paths", None), "minecraft_dir", None) or app.util.minecraft_dir
-        self.service = InstalledComponentsService(minecraft_dir, versions_provider=app.versions.all)
+        self.service = InstalledComponentsService(
+            minecraft_dir,
+            versions_provider=app.versions.all,
+            loader_provider=app.launcher.get_loader,
+        )
         self.catalog = VersionCreationCatalogService()
         self.active_mode = "installed"
         self.active_install_tab = "minecraft"
         self.include_unstable_versions = False
         self.installed_components: list[InstalledComponent] = []
+        self._installed_scan_failed = False
         self.options_by_tab: dict[str, list[VersionCreateOption]] = {}
         self.loaded_state_by_tab: dict[str, tuple[str, bool, bool]] = {}
         self.selected_loader_builds: dict[str, str] = {}
@@ -54,6 +59,8 @@ class MinecraftComponentsPage:
         self.operation_pending = False
         self.install_dialog = None
         self.install_target: VersionCreateOption | None = None
+        self._refresh_generation = 0
+        self._disposed = False
 
         self.app.header.set_params(
             title=self.trans("minecraft_components_title"),
@@ -78,16 +85,73 @@ class MinecraftComponentsPage:
         self.content_list = ui.ListView(expand=True, spacing=8, padding=ft.Padding.only(top=8, bottom=18))
         self.content = self._build_content()
         self.refresh_installed(update=False)
-        self._rebuild_content()
 
     def view(self):
         return self.content
 
     def refresh_installed(self, *, update: bool = True) -> None:
-        self.installed_components = self.service.list_installed()
+        if self._disposed:
+            return
+        self._refresh_generation += 1
+        generation = self._refresh_generation
+        self.content_list.controls = [
+            self._state_row(self.trans("loading"), ft.Icons.HOURGLASS_TOP),
+        ]
+        if update:
+            schedule_update(self.page)
+
+        try:
+            task = run_task(self.page, self._refresh_installed_async, generation, update)
+        except Exception:
+            task = None
+        if task is None:
+            try:
+                components = self.service.list_installed()
+            except Exception as exc:
+                self._apply_refresh_error(exc, generation, update=update)
+            else:
+                self._apply_installed_components(components, generation, update=update)
+
+    async def _refresh_installed_async(self, generation: int, update: bool) -> None:
+        try:
+            components = await run_blocking(self.service.list_installed)
+        except Exception as exc:
+            self._apply_refresh_error(exc, generation, update=update)
+        else:
+            self._apply_installed_components(components, generation, update=update)
+
+    def _apply_installed_components(
+        self,
+        components: list[InstalledComponent],
+        generation: int,
+        *,
+        update: bool,
+    ) -> None:
+        if not self._refresh_is_active(generation):
+            return
+        self.installed_components = components
+        self._installed_scan_failed = False
         self._rebuild_content()
         if update:
             schedule_update(self.page)
+
+    def _apply_refresh_error(self, error: Exception, generation: int, *, update: bool) -> None:
+        if not self._refresh_is_active(generation):
+            return
+        self.installed_components = []
+        self._installed_scan_failed = True
+        self.app.log.error(f"Unable to scan installed Minecraft components: {error!r}")
+        self._rebuild_content()
+        if update:
+            schedule_update(self.page)
+
+    def _refresh_is_active(self, generation: int) -> bool:
+        return not self._disposed and generation == self._refresh_generation
+
+    def before_hide(self) -> None:
+        self._disposed = True
+        self._refresh_generation += 1
+        self.load_generation += 1
 
     def _build_content(self) -> ft.Control:
         return ui.Container(
@@ -182,6 +246,8 @@ class MinecraftComponentsPage:
         self.content_list.controls = self._build_install_controls()
 
     def _build_installed_controls(self) -> list[ft.Control]:
+        if self._installed_scan_failed:
+            return [self._state_row(self.trans("unknown_error"), ft.Icons.ERROR_OUTLINE)]
         if not self.installed_components:
             return [self._state_row(self.trans("minecraft_components_empty"), ft.Icons.INBOX_OUTLINED)]
         return [self._build_component_row(component) for component in self.installed_components]
@@ -308,7 +374,7 @@ class MinecraftComponentsPage:
             )
         ]
 
-    def _filter_button(self, *, label: str, icon: str, selected: bool, on_click) -> ft.Control:
+    def _filter_button(self, *, label: str, icon: ft.IconData, selected: bool, on_click) -> ft.Control:
         return ui.Button(
             text=label,
             icon=icon,
@@ -796,7 +862,7 @@ class MinecraftComponentsPage:
             return True
         return False
 
-    def _state_row(self, text: str, icon: str) -> ft.Control:
+    def _state_row(self, text: str, icon: ft.IconData) -> ft.Control:
         return ui.Container(
             content=ui.Row(
                 controls=[
@@ -813,7 +879,7 @@ class MinecraftComponentsPage:
         )
 
     @staticmethod
-    def _loader_icon(kind: str) -> str:
+    def _loader_icon(kind: str) -> ft.IconData:
         return {
             "minecraft": ft.Icons.GRASS,
             "fabric": ft.Icons.EXTENSION,
