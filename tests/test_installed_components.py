@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from launcher.application.installed_components import InstalledComponentsService
+from launcher.application.installed_components import InstalledComponent, InstalledComponentsService
 
 
 def _write_version_manifest(minecraft_dir: Path, version_id: str, payload: dict) -> None:
@@ -213,3 +213,103 @@ def test_component_install_uses_injected_session_loader(tmp_path: Path):
 
     assert component.version_id == "1.21.1"
     assert calls == [("1.21.1", True, None)]
+
+
+def test_install_profile_component_persists_only_after_success(monkeypatch, tmp_path: Path):
+    component = InstalledComponent(
+        version_id="neoforge-21.1.236",
+        kind="neoforge",
+        loader_name="NeoForge",
+        minecraft_version="1.21.1",
+        loader_version="21.1.236",
+        inherits_from="1.21.1",
+        path=tmp_path / "minecraft" / "versions" / "neoforge-21.1.236",
+        size_bytes=0,
+        modified_at=None,
+        used_by=(),
+        dependent_components=(),
+    )
+    saved = []
+    profile = SimpleNamespace(
+        version_id="aeronautics",
+        version="1.21.1",
+        loader="neoforge-21.1.230",
+        client="NeoForge",
+        loader_version="21.1.230",
+        options={},
+        save=lambda: saved.append(True),
+    )
+    service = InstalledComponentsService(tmp_path / "minecraft", versions_provider=lambda: [])
+    monkeypatch.setattr(service, "install_component", lambda *_args, **_kwargs: component)
+    monkeypatch.setattr(service, "_apply_runtime_path", lambda *_args, **_kwargs: profile.options.update(java="managed"))
+
+    result = service.install_profile_component(profile, "neoforge", "1.21.1", loader_version="21.1.236")
+
+    assert result is component
+    assert profile.version == "1.21.1"
+    assert profile.loader == "neoforge-21.1.236"
+    assert profile.client == "NeoForge"
+    assert profile.loader_version == "21.1.236"
+    assert profile.options == {"java": "managed"}
+    assert saved == [True]
+
+
+def test_install_profile_component_keeps_profile_when_install_fails(monkeypatch, tmp_path: Path):
+    saved = []
+    profile = SimpleNamespace(
+        version_id="aeronautics",
+        version="1.21.1",
+        loader="neoforge-21.1.230",
+        client="NeoForge",
+        loader_version="21.1.230",
+        options={},
+        save=lambda: saved.append(True),
+    )
+    service = InstalledComponentsService(tmp_path / "minecraft", versions_provider=lambda: [])
+
+    def fail_install(*_args, **_kwargs):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(service, "install_component", fail_install)
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        service.install_profile_component(profile, "neoforge", "1.21.1", loader_version="21.1.236")
+
+    assert profile.loader == "neoforge-21.1.230"
+    assert profile.loader_version == "21.1.230"
+    assert saved == []
+
+
+def test_profile_component_refreshes_managed_java_for_vanilla(tmp_path: Path):
+    java_calls = []
+
+    class Loader:
+        @staticmethod
+        def _get_version_java_path(minecraft_version, operation=None):
+            java_calls.append((minecraft_version, operation))
+            return "C:/runtime/javaw.exe"
+
+    service = InstalledComponentsService(
+        tmp_path / "minecraft",
+        versions_provider=lambda: [],
+        loader_provider=lambda loader_id: Loader() if loader_id == "minecraft" else None,
+    )
+    profile = SimpleNamespace(version="1.21.1", options={})
+    component = InstalledComponent(
+        version_id="1.21.1",
+        kind="minecraft",
+        loader_name="Minecraft",
+        minecraft_version="1.21.1",
+        loader_version=None,
+        inherits_from=None,
+        path=tmp_path / "minecraft" / "versions" / "1.21.1",
+        size_bytes=0,
+        modified_at=None,
+        used_by=(),
+        dependent_components=(),
+    )
+
+    service._apply_runtime_path(profile, component, operation="operation")
+
+    assert profile.options["executablePath"] == "C:/runtime/javaw.exe"
+    assert java_calls == [("1.21.1", "operation")]

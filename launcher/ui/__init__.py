@@ -40,7 +40,13 @@ from .forms import (
     initial_directory_from_path,
 )
 from .layout import Column, Container, GridView, ListView, PageContainer, ResponsiveRow, Row
-from .modals import CurseForgeImportModal, ModpackInstallModal, VersionCopyModal, VersionInstallModal
+from .modals import (
+    CurseForgeImportModal,
+    ModpackInstallModal,
+    VersionComponentModal,
+    VersionCopyModal,
+    VersionInstallModal,
+)
 from .navigation import Footer, Header, Sidebar
 from .patterns import VersionCard
 from .theme import (
@@ -100,6 +106,7 @@ __all__ = [
     "UiTheme",
     "UiTokens",
     "VersionCard",
+    "VersionComponentModal",
     "VersionCopyModal",
     "VersionInstallModal",
     "build_field",

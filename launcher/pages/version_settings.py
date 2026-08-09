@@ -2,9 +2,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import flet as ft
-import minecraft_launcher_lib
 
 from launcher import ui
+from launcher.application.installed_components import InstalledComponent, InstalledComponentsService
 from launcher.application.java_preferences import JavaPreferencesService
 from launcher.application.java_runtime import JavaRuntimeService
 from launcher.application.memory_preferences import MemoryPreferencesService
@@ -84,18 +84,14 @@ class VersionSettingsPage:
         max_ram_gb, _min_ram_gb = self.app.version_options.parse_jvm_arguments(jvm_arguments)
         custom_arguments = tuple(self.app.version_options.extract_custom_arguments(jvm_arguments))
         self.memory_limits = MemoryPreferencesService.detect_limits()
-        loader_ids = tuple(
-            loader.get("id")
-            for loader in minecraft_launcher_lib.utils.get_installed_versions(
-                str(self._minecraft_dir())
-            )
-        )
+        self.components = self._build_components_service()
+        installed_components = self.components.list_installed()
         selected_java_path = self.version.options.get("executablePath", "")
         server_config = (self.version.options or {}).get("server") or {}
         self._build_name_control()
         self._build_memory_controls(max_ram_gb)
         self._build_java_controls(selected_java_path)
-        self._build_loader_control(loader_ids)
+        self._build_loader_control(installed_components)
         self._build_server_controls(
             str(server_config.get("host", "")),
             str(server_config["port"]) if server_config.get("port") is not None else "",
@@ -189,20 +185,82 @@ class VersionSettingsPage:
             size=self.app.theme.text_size_sm,
         )
 
-    def _build_loader_control(self, loader_ids: tuple[Any, ...]) -> None:
-        loader_items = [{"text": loader_id, "key": loader_id} for loader_id in loader_ids]
+    def _build_loader_control(self, components: list[InstalledComponent]) -> None:
+        self.installed_components = {component.version_id: component for component in components}
+        loader_items = [
+            {"text": self._component_label(component), "key": component.version_id}
+            for component in components
+        ]
+        current_loader = str(self.version.loader or "")
+        if current_loader and current_loader not in self.installed_components:
+            loader_items.append({"text": current_loader, "key": current_loader})
         self.loaders_select = ui.build_field(
             self.app,
             ui.FieldSpec(
                 type="dropdown",
                 key="loader",
                 label=self.app.trans("loaders_label"),
-                value=self.version.loader or "",
+                value=current_loader,
                 options=loader_items,
                 width=None,
             ),
             on_change=lambda _e: None,
         )
+        self.change_component_button = ui.Button(
+            text=self.app.trans("version_component_change_action"),
+            icon=ft.Icons.DOWNLOAD_OUTLINED,
+            variant="outline",
+            tone="neutral",
+            width=None,
+            on_click=lambda _event: self.component_modal.show(),
+        )
+        self.component_modal = ui.VersionComponentModal(
+            self.app,
+            self.version,
+            self.components,
+            on_installed=self._on_component_installed,
+        )
+        self.loader_control = ui.Column(
+            [self.loaders_select, self.change_component_button],
+            spacing=self.app.theme.spacing_sm,
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+
+    def _build_components_service(self) -> InstalledComponentsService:
+        minecraft_dir = self._minecraft_dir()
+        paths = getattr(self.app, "paths", None)
+        games_dir = getattr(paths, "games_dir", None) if paths is not None else None
+        if not games_dir:
+            games_dir = getattr(getattr(self.app, "util", None), "games_path", None)
+        return InstalledComponentsService(
+            minecraft_dir,
+            games_dir=games_dir or minecraft_dir / "games",
+            versions_provider=self.app.versions.all,
+            loader_provider=self.app.launcher.get_loader,
+        )
+
+    def _component_label(self, component: InstalledComponent) -> str:
+        if component.kind == "minecraft":
+            return f"Minecraft {component.minecraft_version or component.version_id}"
+        version = component.minecraft_version or self.version.version or ""
+        build = component.loader_version or component.version_id
+        return f"{component.loader_name} {version} ({build})"
+
+    def _on_component_installed(self, component: InstalledComponent) -> None:
+        self.installed_components[component.version_id] = component
+        self.loaders_select.options = [
+            ft.dropdown.Option(text=self._component_label(installed), key=installed.version_id)
+            for installed in sorted(
+                self.installed_components.values(),
+                key=lambda item: (item.loader_name.casefold(), item.version_id.casefold()),
+            )
+        ]
+        self.loaders_select.value = component.version_id
+        self._update_java_path_display()
+        if callable(self.on_saved):
+            self.on_saved(self.version)
+        schedule_update(self.page)
 
     def _build_server_controls(self, server_host: str, server_port: str) -> None:
         self.server_host = ui.build_field(
@@ -380,6 +438,7 @@ class VersionSettingsPage:
     def before_hide(self) -> None:
         if not self.version:
             return
+        self.component_modal.dispose()
         self.mod_diagnostics.dispose()
         self.file_picker.dispose()
 
@@ -455,7 +514,7 @@ class VersionSettingsPage:
                 description=self.app.trans("version_section_general_desc"),
                 controls=[
                     self.layout.wrap_control(self.name, {"sm": 12, "md": 6, "lg": 6}),
-                    self.layout.wrap_control(self.loaders_select, {"sm": 12, "md": 6, "lg": 6}),
+                    self.layout.wrap_control(self.loader_control, {"sm": 12, "md": 6, "lg": 6}),
                     self.layout.wrap_control(self._build_icon_picker(), {"sm": 12, "md": 6, "lg": 4}),
                 ],
             ),
@@ -873,6 +932,11 @@ class VersionSettingsPage:
             return
 
         name = (self.name.value or "").strip()
+        selected_component = self.installed_components.get(str(self.loaders_select.value or ""))
+        if selected_component is not None:
+            self.version.version = selected_component.minecraft_version or selected_component.version_id
+            self.version.client = selected_component.loader_name
+            self.version.loader_version = selected_component.loader_version
         payload = VersionOptionsPayload(
             name=name,
             java_path=self._selected_custom_java_path(),

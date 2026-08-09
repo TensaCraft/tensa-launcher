@@ -172,12 +172,32 @@ class InstalledComponentsService:
             operation=operation,
         )
         version.path = str(self.game_path(getattr(version, "version_id", "") or getattr(version, "id", "")))
-        version.loader = component.version_id
-        version.client = component.loader_name
-        version.loader_version = component.loader_version
-        self._apply_runtime_path(version, component, operation=operation)
-        version.save()
+        self._apply_profile_component(version, component, operation=operation)
         return version
+
+    def install_profile_component(
+        self,
+        version: Any,
+        loader_id: object,
+        minecraft_version: str,
+        *,
+        loader_version: str | None = None,
+        operation: Any | None = None,
+    ) -> InstalledComponent:
+        """Install a component and switch an existing profile to it.
+
+        Profile metadata is changed only after the technical component has
+        installed successfully, so a failed download cannot leave a profile
+        pointing at a component that does not exist.
+        """
+        component = self.install_component(
+            loader_id,
+            minecraft_version,
+            loader_version=loader_version,
+            operation=operation,
+        )
+        self._apply_profile_component(version, component, operation=operation)
+        return component
 
     def game_path(self, version_id: str) -> Path:
         game_id = str(version_id or "").strip()
@@ -486,8 +506,6 @@ class InstalledComponentsService:
         *,
         operation: Any | None = None,
     ) -> None:
-        if component.kind == "minecraft":
-            return
         try:
             loader = self._get_loader(component.kind)
             java_path = loader._get_version_java_path(component.minecraft_version or version.version, operation=operation)
@@ -500,6 +518,20 @@ class InstalledComponentsService:
                 options = {}
                 version.options = options
             options["executablePath"] = java_path
+
+    def _apply_profile_component(
+        self,
+        version: Any,
+        component: InstalledComponent,
+        *,
+        operation: Any | None = None,
+    ) -> None:
+        version.version = component.minecraft_version or component.version_id
+        version.loader = component.version_id
+        version.client = component.loader_name
+        version.loader_version = component.loader_version
+        self._apply_runtime_path(version, component, operation=operation)
+        version.save()
 
     def _get_loader(self, loader_id: str) -> Any:
         if self._loader_provider is None:
