@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -95,18 +97,29 @@ class JavaRuntimeService:
         return runtime_info.get("name")
 
     def get_executable_path(self, runtime_name: str) -> str | None:
+        active_root = self._active_runtime_root(runtime_name)
+        if active_root is not None:
+            java_path = self._library_executable_path(runtime_name, active_root)
+            if java_path:
+                return java_path
+            self._clear_active_runtime(runtime_name)
+
+        return self._library_executable_path(runtime_name, self.minecraft_dir)
+
+    @staticmethod
+    def _library_executable_path(runtime_name: str, install_root: str | Path) -> str | None:
         try:
             java_path = minecraft_launcher_lib.runtime.get_executable_path(
                 runtime_name,
-                str(self.minecraft_dir),
+                str(install_root),
             )
         except Exception:
             java_path = None
         if java_path:
             return java_path
 
-        runtime_path = self.minecraft_dir / "runtime" / runtime_name
-        java_executable = self.find_java_executable(runtime_path)
+        runtime_path = Path(install_root) / "runtime" / runtime_name
+        java_executable = JavaRuntimeService.find_java_executable(runtime_path)
         return str(java_executable) if java_executable else None
 
     def runtime_is_complete(self, runtime_name: str, java_path: str | Path | None = None) -> bool:
@@ -117,16 +130,12 @@ class JavaRuntimeService:
         such as `lib/jawt.lib` are missing; in that state the runtime must be
         repaired instead of being reused.
         """
-        runtime_root = self.minecraft_dir / "runtime" / runtime_name
-        if not runtime_root.exists():
-            return False
-
         if java_path:
             manifest = self._manifest_for_executable(runtime_name, java_path)
             return bool(manifest and self._runtime_manifest_is_complete(manifest, manifest.parent / runtime_name))
 
-        manifests = list(runtime_root.rglob(f"{runtime_name}.sha1"))
-        return any(self._runtime_manifest_is_complete(manifest, manifest.parent / runtime_name) for manifest in manifests)
+        resolved_java = self.get_executable_path(runtime_name)
+        return bool(resolved_java and self.runtime_is_complete(runtime_name, resolved_java))
 
     def runtime_is_usable(self, runtime_name: str, java_path: str | Path | None = None) -> bool:
         if not java_path:
@@ -191,19 +200,20 @@ class JavaRuntimeService:
         return False
 
     def _manifest_for_executable(self, runtime_name: str, java_path: str | Path) -> Path | None:
-        runtime_root = (self.minecraft_dir / "runtime" / runtime_name).resolve()
+        minecraft_root = self.minecraft_dir.resolve()
         try:
             path = Path(java_path).resolve()
         except OSError:
             return None
 
+        try:
+            if not path.is_relative_to(minecraft_root):
+                return None
+        except OSError:
+            return None
+
         for parent in path.parents:
             if parent.name != runtime_name:
-                continue
-            try:
-                if not parent.is_relative_to(runtime_root):
-                    continue
-            except OSError:
                 continue
             manifest = parent.parent / f"{runtime_name}.sha1"
             if manifest.is_file():
@@ -316,9 +326,7 @@ class JavaRuntimeService:
                 return java_path
             self._log("warning", f"Java runtime {runtime_name} is incomplete, reinstalling")
             self._remove_runtime(runtime_name)
-
-        runtime_root = self.minecraft_dir / "runtime" / runtime_name
-        if java_path or runtime_root.exists():
+        elif (self.minecraft_dir / "runtime" / runtime_name).exists():
             self._log("warning", f"Java runtime {runtime_name} is incomplete, reinstalling")
             self._remove_runtime(runtime_name)
 
@@ -355,28 +363,139 @@ class JavaRuntimeService:
         return self.get_executable_path(runtime_name)
 
     def _install_runtime_with_repair(self, runtime_name: str, callback: Any = None) -> bool:
+        installed, last_error = self._install_runtime_at(
+            runtime_name,
+            self.minecraft_dir,
+            callback=callback,
+            remove_between_attempts=True,
+        )
+        if installed:
+            self._clear_active_runtime(runtime_name)
+            self._cleanup_runtime_generations(runtime_name)
+            return True
+
+        if last_error is not None and self._should_install_isolated(last_error):
+            self._log(
+                "warning",
+                f"Installing Java runtime {runtime_name} in an isolated directory: {last_error}",
+            )
+            installed, isolated_error = self._install_isolated_runtime(runtime_name, callback=callback)
+            if installed:
+                return True
+            last_error = isolated_error or last_error
+
+        if last_error is not None:
+            self._log("error", f"Failed to install Java runtime {runtime_name}: {last_error}")
+        return False
+
+    def _install_runtime_at(
+        self,
+        runtime_name: str,
+        install_root: Path,
+        *,
+        callback: Any = None,
+        remove_between_attempts: bool = False,
+    ) -> tuple[bool, Exception | None]:
         last_error: Exception | None = None
         for attempt in range(1, 3):
             try:
                 minecraft_launcher_lib.runtime.install_jvm_runtime(
                     runtime_name,
-                    str(self.minecraft_dir),
+                    str(install_root),
                     callback=callback,
                 )
-                java_path = self.get_executable_path(runtime_name)
+                java_path = self._library_executable_path(runtime_name, install_root)
                 if java_path and Path(java_path).is_file() and self.runtime_is_complete(runtime_name, java_path):
-                    return True
+                    return True, None
                 last_error = RuntimeError(f"Java runtime {runtime_name} is incomplete after install")
             except Exception as exc:
                 last_error = exc
 
             if attempt == 1:
                 self._log("warning", f"Retrying Java runtime installation {runtime_name}: {last_error}")
-                self._remove_runtime(runtime_name)
+                if remove_between_attempts:
+                    self._remove_runtime(runtime_name)
+                else:
+                    shutil.rmtree(install_root, ignore_errors=True)
 
-        if last_error is not None:
-            self._log("error", f"Failed to install Java runtime {runtime_name}: {last_error}")
-        return False
+        return False, last_error
+
+    def _install_isolated_runtime(self, runtime_name: str, callback: Any = None) -> tuple[bool, Exception | None]:
+        generation_root = self._runtime_generation_dir(runtime_name) / uuid.uuid4().hex
+        installed, error = self._install_runtime_at(
+            runtime_name,
+            generation_root,
+            callback=callback,
+        )
+        if not installed:
+            shutil.rmtree(generation_root, ignore_errors=True)
+            return False, error
+
+        self._write_active_runtime(runtime_name, generation_root)
+        self._cleanup_runtime_generations(runtime_name, keep=generation_root)
+        return True, None
+
+    @staticmethod
+    def _should_install_isolated(error: Exception) -> bool:
+        if isinstance(error, PermissionError):
+            return True
+        if isinstance(error, OSError) and error.errno in {13, 16, 32}:
+            return True
+        message = str(error).lower()
+        return "incomplete after install" in message or any(
+            marker in message
+            for marker in (
+                "permission denied",
+                "access is denied",
+                "being used by another process",
+                "process cannot access the file",
+            )
+        )
+
+    def _runtime_generation_dir(self, runtime_name: str) -> Path:
+        return self.minecraft_dir / "runtime" / ".generations" / runtime_name
+
+    def _active_runtime_marker(self, runtime_name: str) -> Path:
+        return self.minecraft_dir / "runtime" / ".active" / f"{runtime_name}.txt"
+
+    def _active_runtime_root(self, runtime_name: str) -> Path | None:
+        marker = self._active_runtime_marker(runtime_name)
+        try:
+            relative = Path(marker.read_text(encoding="utf-8").strip())
+            runtime_root = (self.minecraft_dir / "runtime").resolve()
+            generation_root = (self.minecraft_dir / relative).resolve()
+            allowed_root = self._runtime_generation_dir(runtime_name).resolve()
+            if not generation_root.is_relative_to(runtime_root) or not generation_root.is_relative_to(allowed_root):
+                return None
+            if generation_root.is_dir():
+                return generation_root
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def _write_active_runtime(self, runtime_name: str, generation_root: Path) -> None:
+        marker = self._active_runtime_marker(runtime_name)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        relative = generation_root.resolve().relative_to(self.minecraft_dir.resolve())
+        temporary = marker.with_name(f"{marker.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(str(relative), encoding="utf-8")
+        os.replace(temporary, marker)
+
+    def _clear_active_runtime(self, runtime_name: str) -> None:
+        try:
+            self._active_runtime_marker(runtime_name).unlink(missing_ok=True)
+        except OSError as exc:
+            self._log("warning", f"Could not clear active Java runtime marker {runtime_name}: {exc}")
+
+    def _cleanup_runtime_generations(self, runtime_name: str, keep: Path | None = None) -> None:
+        root = self._runtime_generation_dir(runtime_name)
+        if not root.is_dir():
+            return
+        keep_resolved = keep.resolve() if keep is not None else None
+        for generation in root.iterdir():
+            if keep_resolved is not None and generation.resolve() == keep_resolved:
+                continue
+            shutil.rmtree(generation, ignore_errors=True)
 
     def _remove_runtime(self, runtime_name: str) -> None:
         runtime_root = (self.minecraft_dir / "runtime" / runtime_name).resolve()

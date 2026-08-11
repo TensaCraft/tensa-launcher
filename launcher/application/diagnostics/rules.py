@@ -123,6 +123,7 @@ def default_engine() -> DiagnosticEngine:
         Rule("files.locked", _locked_file),
         Rule("mods.module_conflict", _module_conflict),
         Rule("mods.broken_mixin", _broken_mixin),
+        Rule("mods.player_interaction", _player_interaction_failure),
         Rule("mods.ftb_chunks_local_data", _ftb_chunks_local_data),
         Rule("mods.create_block_entity_rendering", _create_block_entity_rendering),
         Rule("mods.missing_dependency", _missing_dependency),
@@ -312,6 +313,33 @@ def _broken_mixin(case: DiagnosticCase) -> Iterable[Finding]:
             message_key="launch_diagnostic_mod_incompatibility",
             evidence=_evidence(text, ("IllegalClassLoadError", "mixin is missing from")),
             actions=_mod_issue_actions(case),
+        ),
+    )
+
+
+def _player_interaction_failure(case: DiagnosticCase) -> Iterable[Finding]:
+    text, lowered = _case_text(case)
+    if not (
+        "java.lang.nullpointerexception" in lowered
+        and "this.minecraft.player" in lowered
+        and "multiplayergamemode.ensurehassentcarrieditem" in lowered
+    ):
+        return ()
+    return (
+        Finding(
+            id="mods.player_interaction",
+            kind="mod_interaction_error",
+            severity="warning",
+            confidence=Confidence.EXACT,
+            priority=125,
+            title_key="launch_diagnostic_player_interaction_title",
+            message_key="launch_diagnostic_player_interaction",
+            evidence=_evidence(
+                text,
+                ("NullPointerException", "ensureHasSentCarriedItem", "MultiPlayerGameModeMixin"),
+            ),
+            actions=_mod_issue_actions(case),
+            suppresses=("graphics.initialization",),
         ),
     )
 

@@ -238,6 +238,56 @@ def test_java_runtime_install_succeeds_when_installer_creates_executable(tmp_pat
     assert installs == [runtime_name, runtime_name]
 
 
+def test_java_runtime_uses_isolated_generation_when_existing_runtime_is_locked(tmp_path: Path, monkeypatch):
+    runtime_name = "java-runtime-delta"
+    canonical_java = (
+        tmp_path / "runtime" / runtime_name / "windows-x64" / runtime_name / "bin" / "java.exe"
+    )
+    canonical_java.parent.mkdir(parents=True)
+    canonical_java.write_bytes(b"partial")
+
+    def executable_path(name, install_root):
+        candidate = Path(install_root) / "runtime" / name / "windows-x64" / name / "bin" / "java.exe"
+        return str(candidate) if candidate.is_file() else None
+
+    installs: list[Path] = []
+
+    def fake_install(name, install_root, callback=None):
+        root = Path(install_root)
+        installs.append(root)
+        if root == tmp_path:
+            raise PermissionError(13, "Permission denied", str(canonical_java.parent / "ucrtbase.dll"))
+
+        platform_dir = root / "runtime" / name / "windows-x64"
+        runtime_dir = platform_dir / name
+        bin_dir = runtime_dir / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "java.exe").write_bytes(b"exe")
+        _write_windows_loader_dlls(bin_dir)
+        (runtime_dir / "lib").mkdir(parents=True)
+        (runtime_dir / "lib" / "jawt.lib").write_bytes(b"lib")
+        _write_runtime_manifest(platform_dir, name, include_jawt=True)
+
+    monkeypatch.setattr("minecraft_launcher_lib.runtime.get_version_runtime_information", lambda *_a, **_k: {"name": runtime_name})
+    monkeypatch.setattr("minecraft_launcher_lib.runtime.get_executable_path", executable_path)
+    monkeypatch.setattr("minecraft_launcher_lib.runtime.install_jvm_runtime", fake_install)
+
+    service = JavaRuntimeService(tmp_path, DummyLogger())
+    java_path = service.ensure_runtime("1.21.1", "1.21.1")
+
+    assert java_path is not None
+    assert ".generations" in Path(java_path).parts
+    assert Path(java_path).is_file()
+    assert service.get_executable_path(runtime_name) == java_path
+    assert service.runtime_is_complete(runtime_name, java_path) is True
+    assert installs.count(tmp_path) == 2
+    assert len([root for root in installs if root != tmp_path]) == 1
+
+    installs.clear()
+    assert service.ensure_runtime("1.21.1", "1.21.1") == java_path
+    assert installs == []
+
+
 def test_java_runtime_removes_empty_runtime_before_reinstall(tmp_path: Path, monkeypatch):
     runtime_name = "java-runtime-epsilon"
     platform_dir = tmp_path / "runtime" / runtime_name / "windows-x64"

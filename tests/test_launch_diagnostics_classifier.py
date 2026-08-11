@@ -50,6 +50,20 @@ def test_launch_diagnostics_does_not_treat_sodium_name_as_graphics_failure() -> 
     assert diagnosis.kind == "unknown"
 
 
+def test_launch_diagnostics_classifies_player_interaction_mixin_failure_before_sodium() -> None:
+    diagnosis = classify_launch_failure(
+        'java.lang.NullPointerException: Cannot invoke "LocalPlayer.getInventory()" '
+        'because "this.minecraft.player" is null\n'
+        "at net.minecraft.client.multiplayer.MultiPlayerGameMode.ensureHasSentCarriedItem(MultiPlayerGameMode.java:284)\n"
+        "pl:mixin:APP:simulatedcoasters.mixins.json:MultiPlayerGameModeMixin from mod simulatedcoasters\n"
+        "sodium-neoforge.jar | Sodium | sodium | 0.8.13 | Manifest: NOSIGNATURE"
+    )
+
+    assert diagnosis.kind == "mod_interaction_error"
+    assert diagnosis.severity == "warning"
+    assert "NullPointerException" in diagnosis.evidence[0]
+
+
 def test_launch_diagnostics_classifies_channel_mismatch() -> None:
     diagnosis = classify_launch_failure(
         "Не вдалося з'єднатися з каналом моду \"Create Connected\". "

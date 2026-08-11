@@ -238,6 +238,8 @@
   "launch_diagnostic_vulkan_gpu": "VulkanMod did not find a graphics device with the required Vulkan support. Update the GPU driver or update, reconfigure, or disable VulkanMod; this is not a Sodium dependency error.",
   "launch_diagnostic_mod_incompatibility_title": "Incompatible mod versions",
   "launch_diagnostic_mod_incompatibility": "The mod loader stopped before launch because installed mod versions conflict. Update or replace the mods listed in the diagnostics; changing the graphics driver will not fix this conflict.",
+  "launch_diagnostic_player_interaction_title": "Player interaction mod conflict",
+  "launch_diagnostic_player_interaction": "The game accessed the inventory before the local player finished loading. Check or update the interaction and control mods named in the stack trace; Sodium and the graphics driver are not confirmed causes of this failure.",
   "launch_diagnostic_missing_mod_dependency_title": "Required mod is missing",
   "launch_diagnostic_missing_mod_dependency": "The log points to a missing or corrupted required mod. The launcher will force a repair sync before the next start; close any running Minecraft windows if synchronization reports locked files.",
   "launch_diagnostic_channel_mismatch_title": "Client and server mod list differ",
