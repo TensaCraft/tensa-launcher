@@ -28,6 +28,7 @@ from launcher.models.logger import Logger
 
 DEFAULT_MAX_DOWNLOAD_SIZE = 8 * 1024 * 1024 * 1024
 _PARTIAL_METADATA_SCHEMA = 1
+_PARTIAL_FILE_IDENTITY_LENGTH = 24
 _CONTENT_RANGE_PATTERN = re.compile(
     r"^bytes\s+(\d+)-(\d+)/(\d+)$",
     re.IGNORECASE,
@@ -543,7 +544,7 @@ class AsyncDownloader:
 
     @classmethod
     def _partial_file_for(cls, task: DownloadTask) -> Path:
-        identity = cls._partial_identity(task)
+        identity = cls._partial_identity(task)[:_PARTIAL_FILE_IDENTITY_LENGTH]
         return task.destination.with_name(
             f"{task.destination.name}.part.{identity}.tmp"
         )

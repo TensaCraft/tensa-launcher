@@ -456,6 +456,25 @@ def test_async_downloader_partial_identity_changes_with_remote_artifact(tmp_path
     assert downloader._partial_file_for(base) != downloader._partial_file_for(different_hash)
 
 
+def test_async_downloader_partial_path_fits_reported_windows_install_root():
+    destination = Path(
+        "C:/Users/Player/AppData/Roaming/TensaLauncher/games/aeronautics__voxy_/"
+        ".tensalauncher-sync/9313b3b1af91463292848690067782f5/stage/config/"
+        "create_dragons_plus-simulated-extension-common.toml"
+    )
+    task = downloader_module.DownloadTask(
+        url="https://gigabait.uk/api/mods/download/aeronautics_voxy/example",
+        destination=destination,
+        expected_size=5,
+        expected_hash="a" * 64,
+        expected_hash_algorithm="sha256",
+    )
+
+    partial = downloader_module.AsyncDownloader._partial_file_for(task)
+
+    assert len(str(partial)) < 260
+
+
 def test_async_downloader_discards_incompatible_partial_state(monkeypatch, tmp_path: Path):
     destination = tmp_path / "client.jar"
     old_task = downloader_module.DownloadTask(
