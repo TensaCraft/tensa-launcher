@@ -15,7 +15,7 @@ dependencies = [
     "flet-desktop==0.86.5",
     "minecraft-launcher-lib==8.0",
     "packaging==26.3",
-    "pyobjc-framework-AVFoundation==12.2.1; platform_system == 'Darwin'",
+    "pyobjc-framework-AVFoundation==12.2.2; platform_system == 'Darwin'",
     "requests==2.34.2",
     "transliterate==1.10.2",
 ]
@@ -24,13 +24,13 @@ dependencies = [
 build = [
     "flet-cli==0.86.5",
     "pillow==12.3.0",
-    "pyinstaller==6.22.0",
+    "pyinstaller==6.22.2",
 ]
 dev = [
     "pillow==12.3.0",
     "pyright==1.1.411",
     "pytest==9.1.1",
-    "ruff==0.16.2",
+    "ruff==0.16.4",
 ]
 
 [project.scripts]
