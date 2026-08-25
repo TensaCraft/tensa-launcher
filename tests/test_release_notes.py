@@ -104,6 +104,6 @@ def test_previous_stable_release_tag_skips_prereleases(monkeypatch):
 
     assert release_notes.previous_stable_release_tag(
         "v4.0.32",
-        repo="TensaCraft/TensaLauncher",
+        repo="TensaCraft/tensa-launcher",
         token="token",
     ) == "v4.0.30"
