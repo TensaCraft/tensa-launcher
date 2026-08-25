@@ -284,6 +284,80 @@ def test_engine_classifies_create_block_entity_model_failure_without_graphics_ad
     assert [finding.id for finding in result.suppressed] == ["graphics.initialization"]
 
 
+def test_engine_reports_the_create_addon_block_that_failed_to_render() -> None:
+    result = default_engine().analyze(
+        _case(
+            "Description: Rendering Block Entity\n"
+            'java.lang.NullPointerException: Cannot invoke "BakedModel.getModelData(...)" because "model" is null\n'
+            "at net.createmod.catnip.impl.client.render.model.BakedModelBuffererImpl.bufferModel\n"
+            "Block: Block{create_vibrant_vaults:white_packager}[facing=east]"
+        )
+    )
+
+    assert result.primary.id == "mods.create_block_entity_rendering"
+    assert result.primary.message_key == "launch_diagnostic_create_rendering_block"
+    assert result.primary.params == {"block": "create_vibrant_vaults:white_packager"}
+
+
+def test_engine_classifies_create_configuration_payload_failure_without_generic_advice() -> None:
+    result = default_engine().analyze(
+        _case(
+            "java.util.concurrent.CompletionException: java.lang.UnsupportedOperationException: "
+            "Cannot retrieve the client player during the configuration phase.\n"
+            "at ponder@1.0.82/net.createmod.ponder.foundation.networking.NeoForgeNetworkHelper\n"
+            "Failed to process a synchronized task of the payload: create:server_speed\n"
+            "java.lang.NoClassDefFoundError: net/minecraft/client/player/LocalPlayer\n"
+            "A client channel requires state which is missing during configuration"
+        )
+    )
+
+    assert result.primary.id == "mods.create_configuration_payload"
+    assert [finding.id for finding in result.findings] == ["mods.create_configuration_payload"]
+
+
+def test_engine_does_not_treat_minecraft_class_failure_as_missing_runtime() -> None:
+    result = default_engine().analyze(
+        _case("java.lang.NoClassDefFoundError: net/minecraft/client/gui/screens/LoadingOverlay")
+    )
+
+    assert result.primary.id == "launch.unknown"
+
+
+def test_engine_does_not_infer_missing_dependency_without_a_parsed_requirement() -> None:
+    result = default_engine().analyze(
+        _case(
+            "The client requires configuration before joining the server.\n"
+            "Optional player state is missing during the configuration phase."
+        )
+    )
+
+    assert result.primary.id == "launch.unknown"
+
+
+def test_engine_does_not_infer_channel_mismatch_from_unrelated_lines() -> None:
+    result = default_engine().analyze(
+        _case(
+            "Failed to process a synchronized task of the payload: create:server_speed\n"
+            "Client player is missing during the configuration phase\n"
+            "Registered network channel create:main"
+        )
+    )
+
+    assert result.primary.id == "launch.unknown"
+
+
+def test_engine_ignores_graphics_words_inside_long_mixin_stack_line() -> None:
+    mixins = ",".join(f"renderer_{index}_failed_mixin" for index in range(80))
+    result = default_engine().analyze(
+        _case(
+            "at net.minecraft.client.Minecraft.run(Minecraft.java:825) "
+            f"{{pl:mixin:APP:{mixins}}}"
+        )
+    )
+
+    assert result.primary.id == "launch.unknown"
+
+
 def test_engine_bounds_evidence_for_reports() -> None:
     long_line = "OpenGL initialization failed: " + ("x" * 500)
     result = default_engine().analyze(_case(long_line))

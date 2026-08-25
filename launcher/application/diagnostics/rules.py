@@ -9,10 +9,6 @@ from typing import Callable
 from .engine import Detector, DiagnosticEngine
 from .model import ActionSafety, Confidence, DiagnosticCase, Finding, FixAction
 
-_MISSING_MINECRAFT = (
-    "noclassdeffounderror: net/minecraft",
-    "classnotfoundexception: net.minecraft",
-)
 _LOCKED_FILE = (
     "winerror 32",
     "being used by another process",
@@ -99,6 +95,7 @@ _MODULE_EXPORT_CONFLICT_RE = re.compile(
     r"(?i)modules\s+(?P<first>[a-z0-9_.-]+)\s+and\s+(?P<second>[a-z0-9_.-]+)\s+"
     r"export package\s+(?P<package>[a-z0-9_.-]+)\s+to module"
 )
+_BLOCK_ENTITY_RE = re.compile(r"(?im)^\s*Block:\s*Block\{(?P<block>[a-z0-9_.-]+:[a-z0-9_./-]+)\}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +122,7 @@ def default_engine() -> DiagnosticEngine:
         Rule("mods.broken_mixin", _broken_mixin),
         Rule("mods.player_interaction", _player_interaction_failure),
         Rule("mods.ftb_chunks_local_data", _ftb_chunks_local_data),
+        Rule("mods.create_configuration_payload", _create_configuration_payload),
         Rule("mods.create_block_entity_rendering", _create_block_entity_rendering),
         Rule("mods.missing_dependency", _missing_dependency),
         Rule("mods.incompatible", _mod_incompatibility),
@@ -138,7 +136,7 @@ def default_engine() -> DiagnosticEngine:
 def _missing_minecraft(case: DiagnosticCase) -> Iterable[Finding]:
     text, lowered = _case_text(case)
     exact_manifest_failure = "mod id: 'minecraft'" in lowered and "actual version: '[missing]'" in lowered
-    if not exact_manifest_failure and not _contains_any(lowered, _MISSING_MINECRAFT):
+    if not exact_manifest_failure:
         return ()
     return (
         Finding(
@@ -189,15 +187,13 @@ def _missing_dependency(case: DiagnosticCase) -> Iterable[Finding]:
 
     dependencies = _parse_missing_dependencies(text)
     if not dependencies:
-        return (_missing_dependency_finding(case, MissingDependency("", "", ""), fallback_text=text),)
+        return ()
     return tuple(_missing_dependency_finding(case, dependency) for dependency in dependencies)
 
 
 def _missing_dependency_finding(
     case: DiagnosticCase,
     missing: MissingDependency,
-    *,
-    fallback_text: str = "",
 ) -> Finding:
     dependency = missing.dependency
     is_fabric_api = dependency in {"fabric-api", "fabric_api", "fabricapi"}
@@ -221,20 +217,15 @@ def _missing_dependency_finding(
     ]
     if case.managed_pack:
         actions.append(FixAction("retry_sync", "repair_sync", ActionSafety.CONFIRM, "diagnostic_action_retry_sync"))
-    evidence = (
-        (missing.evidence[:300],)
-        if missing.evidence
-        else _evidence(fallback_text, ("requires", "not installed", "which is missing", "mandatory dependencies"))
-    )
     return Finding(
         id=finding_id,
         kind="missing_mod_dependency",
         severity="warning",
-        confidence=Confidence.EXACT if dependency else Confidence.HIGH,
+        confidence=Confidence.EXACT,
         priority=100,
         title_key="launch_diagnostic_missing_mod_dependency_title",
         message_key="launch_diagnostic_missing_mod_dependency",
-        evidence=evidence,
+        evidence=(missing.evidence[:300],),
         params=params,
         actions=tuple(actions),
         suppresses=("mods.incompatible.generic",),
@@ -375,6 +366,8 @@ def _create_block_entity_rendering(case: DiagnosticCase) -> Iterable[Finding]:
         and ("bakedmodelbuffererimpl" in lowered or "packagerrenderer" in lowered)
     ):
         return ()
+    block_match = _BLOCK_ENTITY_RE.search(text)
+    block = block_match.group("block") if block_match else ""
     return (
         Finding(
             id="mods.create_block_entity_rendering",
@@ -383,8 +376,14 @@ def _create_block_entity_rendering(case: DiagnosticCase) -> Iterable[Finding]:
             confidence=Confidence.EXACT,
             priority=120,
             title_key="launch_diagnostic_create_rendering_title",
-            message_key="launch_diagnostic_create_rendering",
-            evidence=_evidence(text, ("Rendering Block Entity", "BakedModel.getModelData", "BakedModelBuffererImpl")),
+            message_key=(
+                "launch_diagnostic_create_rendering_block" if block else "launch_diagnostic_create_rendering"
+            ),
+            evidence=_evidence(
+                text,
+                ("Rendering Block Entity", "BakedModel.getModelData", "BakedModelBuffererImpl", "Block: Block{"),
+            ),
+            params=MappingProxyType({"block": block}) if block else MappingProxyType({}),
             actions=(
                 FixAction(
                     "open_mod_manager",
@@ -393,7 +392,50 @@ def _create_block_entity_rendering(case: DiagnosticCase) -> Iterable[Finding]:
                     "diagnostic_action_open_mod_manager",
                 ),
             ),
-            suppresses=("graphics.initialization",),
+            suppresses=(
+                "runtime.minecraft.missing",
+                "mods.missing_dependency",
+                "network.channel_mismatch",
+                "graphics.initialization",
+            ),
+        ),
+    )
+
+
+def _create_configuration_payload(case: DiagnosticCase) -> Iterable[Finding]:
+    text, lowered = _case_text(case)
+    if not (
+        "cannot retrieve the client player during the configuration phase" in lowered
+        and (
+            "ponder@" in lowered
+            or "net.createmod" in lowered
+            or "payload: create:" in lowered
+        )
+    ):
+        return ()
+    return (
+        Finding(
+            id="mods.create_configuration_payload",
+            kind="mod_network_initialization_error",
+            severity="warning",
+            confidence=Confidence.EXACT,
+            priority=125,
+            title_key="launch_diagnostic_create_configuration_title",
+            message_key="launch_diagnostic_create_configuration",
+            evidence=_evidence(
+                text,
+                (
+                    "Cannot retrieve the client player during the configuration phase",
+                    "Failed to process a synchronized task of the payload",
+                ),
+            ),
+            actions=_mod_issue_actions(case),
+            suppresses=(
+                "runtime.minecraft.missing",
+                "mods.missing_dependency",
+                "network.channel_mismatch",
+                "graphics.initialization",
+            ),
         ),
     )
 
@@ -485,19 +527,9 @@ def _mod_incompatibility(case: DiagnosticCase) -> Iterable[Finding]:
 
 
 def _channel_mismatch(case: DiagnosticCase) -> Iterable[Finding]:
-    text, lowered = _case_text(case)
-    exact = (
-        "absent on client" in lowered
-        or "missing on client" in lowered
-        or "server requires" in lowered
-        or "не вдалося з'єднатися з каналом" in lowered
-    )
-    contextual = (
-        "channel" in lowered
-        and ("client" in lowered or "клієнт" in lowered)
-        and _contains_any(lowered, ("absent", "missing", "requires", "required", "відсут", "необхід"))
-    )
-    if not exact and not contextual:
+    text, _lowered = _case_text(case)
+    matching = [line for line in text.splitlines() if _is_channel_mismatch_line(line)]
+    if not matching:
         return ()
     return (
         Finding(
@@ -508,7 +540,7 @@ def _channel_mismatch(case: DiagnosticCase) -> Iterable[Finding]:
             priority=70,
             title_key="launch_diagnostic_channel_mismatch_title",
             message_key="launch_diagnostic_channel_mismatch",
-            evidence=_evidence(text, ("channel", "канал", "absent on client", "missing on client")),
+            evidence=tuple(line.strip()[:300] for line in matching[:4]),
             actions=(
                 (FixAction("retry_sync", "repair_sync", ActionSafety.CONFIRM, "diagnostic_action_retry_sync"),)
                 if case.managed_pack
@@ -552,7 +584,9 @@ def _graphics_failure(case: DiagnosticCase) -> Iterable[Finding]:
     matching = [
         line
         for line in text.splitlines()
-        if _contains_any(line.lower(), _GRAPHICS_SUBJECT) and _contains_any(line.lower(), _GRAPHICS_FAILURE)
+        if len(line) <= 1000
+        and _contains_any(line.lower(), _GRAPHICS_SUBJECT)
+        and _contains_any(line.lower(), _GRAPHICS_FAILURE)
     ]
     if not matching:
         return ()
@@ -575,6 +609,32 @@ def _graphics_failure(case: DiagnosticCase) -> Iterable[Finding]:
                 ),
             ),
         ),
+    )
+
+
+def _is_channel_mismatch_line(line: str) -> bool:
+    if len(line) > 1000:
+        return False
+    lowered = line.lower()
+    if "не вдалося з'єднатися з каналом" in lowered or "mismatched mod channel list" in lowered:
+        return True
+    return bool(
+        _contains_any(lowered, ("channel", "канал"))
+        and _contains_any(lowered, ("client", "server", "connection", "connect", "клієнт", "сервер"))
+        and _contains_any(
+            lowered,
+            (
+                "absent",
+                "missing",
+                "requires",
+                "required",
+                "rejected",
+                "mismatch",
+                "incompatible",
+                "відсут",
+                "необхід",
+            ),
+        )
     )
 
 
