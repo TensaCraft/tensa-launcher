@@ -160,6 +160,7 @@ def test_version_settings_sections_reuse_public_control_references(fake_app, mon
         page.open_instance_button,
         page.send_version_report_button,
         page.scan_mods_button,
+        page.force_tensa_sync_button,
     ):
         assert _contains_control(diagnostics_tab, control)
 

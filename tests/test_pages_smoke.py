@@ -1523,6 +1523,34 @@ def test_version_settings_page_opens_diagnostic_paths(fake_app, monkeypatch, tmp
     assert alerts == []
 
 
+def test_version_settings_force_sync_is_available_only_for_tensacraft(fake_app, monkeypatch):
+    monkeypatch.setattr(
+        "minecraft_launcher_lib.utils.get_installed_versions",
+        lambda _dir: [{"id": "fabric-loader-0.16"}],
+    )
+    monkeypatch.setattr("launcher.pages.version_settings.run_task", _run_task_immediately)
+    monkeypatch.setattr("launcher.pages.version_settings.run_blocking", _run_blocking_immediately)
+
+    version = fake_app.versions.all()[0]
+    page = VersionSettingsPage(fake_app, version.version_id)
+    assert page.force_tensa_sync_button.visible is False
+
+    calls = []
+    notices = []
+    version.client = "TensaCraft"
+    version.is_tensacraft = lambda: True
+    version.sync_update = lambda *, force=False: calls.append(force)
+    fake_app.feedback.info = lambda message, **_kwargs: notices.append(message)
+
+    page = VersionSettingsPage(fake_app, version.version_id)
+    assert page.force_tensa_sync_button.visible is True
+    asyncio.run(page._force_tensa_sync_async())
+
+    assert calls == [True]
+    assert notices == ["tensacraft_force_sync_complete"]
+    assert page.force_tensa_sync_button.disabled is False
+
+
 def test_version_settings_page_sends_manual_report_with_launch_logs(fake_app, monkeypatch, tmp_path):
     monkeypatch.setattr(
         "minecraft_launcher_lib.utils.get_installed_versions",

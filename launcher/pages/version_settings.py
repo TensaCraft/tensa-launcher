@@ -11,7 +11,7 @@ from launcher.application.memory_preferences import MemoryPreferencesService
 from launcher.application.version_options import VersionOptionsPayload
 from launcher.core import util
 from launcher.pages.mod_diagnostics import ModDiagnosticsController
-from launcher.ui.core.page_runtime import schedule_update
+from launcher.ui.core.page_runtime import run_blocking, run_task, schedule_update
 
 
 class VersionSettingsPage:
@@ -407,6 +407,15 @@ class VersionSettingsPage:
         )
         self.mod_diagnostics = ModDiagnosticsController(self.app, self.version, self._version_root)
         self.scan_mods_button = self.mod_diagnostics.button
+        self.force_tensa_sync_button = ui.Button(
+            text=self.app.trans("tensacraft_force_sync"),
+            icon=ft.Icons.SYNC,
+            variant="outline",
+            tone="neutral",
+            width=None,
+            visible=self.version.is_tensacraft(),
+            on_click=lambda _event: self._force_tensa_sync(),
+        )
 
     def _expand_controls(self) -> None:
         self.layout.expand_controls(
@@ -430,6 +439,7 @@ class VersionSettingsPage:
             self.open_launch_log_button,
             self.send_version_report_button,
             self.scan_mods_button,
+            self.force_tensa_sync_button,
         )
 
     def view(self):
@@ -585,6 +595,7 @@ class VersionSettingsPage:
                     self.layout.wrap_control(self.open_launch_log_button, {"sm": 12, "md": 6, "lg": 4}),
                     self.layout.wrap_control(self.send_version_report_button, {"sm": 12, "md": 6, "lg": 4}),
                     self.layout.wrap_control(self.scan_mods_button, {"sm": 12, "md": 6, "lg": 4}),
+                    self.layout.wrap_control(self.force_tensa_sync_button, {"sm": 12, "md": 6, "lg": 4}),
                 ],
             )
         )
@@ -717,6 +728,37 @@ class VersionSettingsPage:
         response = self.app.util.open_mc_dir(str(target))
         if response:
             self.app.feedback.warning(response)
+
+    def _force_tensa_sync(self) -> None:
+        if not self.version.is_tensacraft() or self.force_tensa_sync_button.disabled:
+            return
+        self._set_force_sync_busy(True)
+        try:
+            run_task(self.page, self._force_tensa_sync_async)
+        except Exception as exc:
+            self._set_force_sync_busy(False)
+            self.app.feedback.warning(
+                self.app.trans("tensacraft_force_sync_failed", error=str(exc)),
+            )
+
+    async def _force_tensa_sync_async(self) -> None:
+        try:
+            await run_blocking(self.version.sync_update, force=True)
+        except Exception as exc:
+            self.app.feedback.warning(
+                self.app.trans("tensacraft_force_sync_failed", error=str(exc)),
+            )
+        else:
+            self.app.feedback.info(self.app.trans("tensacraft_force_sync_complete"))
+        finally:
+            self._set_force_sync_busy(False)
+
+    def _set_force_sync_busy(self, busy: bool) -> None:
+        self.force_tensa_sync_button.disabled = busy
+        self.force_tensa_sync_button.content = self.app.trans(
+            "tensacraft_force_sync_running" if busy else "tensacraft_force_sync"
+        )
+        schedule_update(self.page)
 
     def _selected_java_value(self) -> str:
         return str(getattr(self.java_select, "value", self.AUTO_JAVA_VALUE) or self.AUTO_JAVA_VALUE).strip()
