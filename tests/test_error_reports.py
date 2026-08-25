@@ -118,6 +118,31 @@ def test_report_service_redacts_tokens_and_home_paths(fake_app, tmp_path, monkey
     assert payload["metadata"]["diagnostic_path"].startswith("<USER_HOME>")
 
 
+def test_report_service_preserves_start_and_end_of_large_attachment(fake_app, tmp_path, monkeypatch):
+    crash_report = tmp_path / "crash-report.txt"
+    crash_report.write_text(
+        "Description: root crash cause\n" + ("stack line\n" * 40000) + "System details at end\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("launcher.application.error_reports.Logger.log_file", tmp_path / "missing.log")
+
+    log = LauncherReportService(fake_app).collect_log_text(attachments=[crash_report])
+
+    assert "Description: root crash cause" in log
+    assert "System details at end" in log
+    assert "middle of file omitted" in log
+
+
+def test_report_service_preserves_start_and_end_when_combined_log_is_truncated() -> None:
+    text = "crash root\n" + ("x" * (LauncherReportService.INLINE_LOG_LIMIT_BYTES * 2)) + "\nlauncher tail"
+
+    truncated = LauncherReportService._truncate_utf8(text, LauncherReportService.INLINE_LOG_LIMIT_BYTES)
+
+    assert truncated.startswith("crash root")
+    assert truncated.endswith("launcher tail")
+    assert "middle of combined log omitted" in truncated
+
+
 def test_warning_alert_adds_send_report_action(fake_app):
     captured = {"dialogs": [], "reports": []}
     fake_app.page.show_dialog = lambda dialog: captured["dialogs"].append(dialog)

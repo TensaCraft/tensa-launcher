@@ -20,7 +20,7 @@ class LauncherReportService:
     ENDPOINT = "https://gigabait.uk/api/mods/launcher/logs"
     REQUEST_TIMEOUT = 15
     INLINE_LOG_LIMIT_BYTES = 1024 * 1024
-    FILE_TAIL_LIMIT_BYTES = 256 * 1024
+    FILE_EXCERPT_LIMIT_BYTES = 256 * 1024
     _SECRET_PATTERNS = (
         re.compile(r"(?i)(authorization\s*:\s*bearer\s+)([^\s]+)"),
         re.compile(r"(?i)(--accessToken\s+)([^\s]+)"),
@@ -149,32 +149,41 @@ class LauncherReportService:
             if attachment_path in included:
                 continue
             included.add(attachment_path)
-            self._append_file_tail(parts, f"diagnostic file: {attachment_path.name}", attachment_path)
+            self._append_file_excerpt(parts, f"diagnostic file: {attachment_path.name}", attachment_path)
 
         launcher_log = getattr(Logger, "log_file", None)
         if launcher_log:
             launcher_path = Path(launcher_log).resolve(strict=False)
             if launcher_path not in included:
-                self._append_file_tail(parts, "launcher app.log", launcher_path)
+                self._append_file_excerpt(parts, "launcher app.log", launcher_path)
 
         return "\n\n".join(part for part in parts if part).strip()
 
-    def _append_file_tail(self, parts: list[str], label: str, path: Path) -> None:
-        text = self._read_tail(path, self.FILE_TAIL_LIMIT_BYTES)
+    def _append_file_excerpt(self, parts: list[str], label: str, path: Path) -> None:
+        text = self._read_excerpt(path, self.FILE_EXCERPT_LIMIT_BYTES)
         if not text:
             return
         parts.append(f"--- {label} ---\n{text}")
 
     @staticmethod
-    def _read_tail(path: Path, limit_bytes: int) -> str:
-        if not path.exists() or not path.is_file():
+    def _read_excerpt(path: Path, limit_bytes: int) -> str:
+        if limit_bytes <= 0 or not path.exists() or not path.is_file():
             return ""
         try:
             size = path.stat().st_size
             with path.open("rb") as handle:
-                if size > limit_bytes:
-                    handle.seek(max(size - limit_bytes, 0))
-                data = handle.read(limit_bytes)
+                if size <= limit_bytes:
+                    data = handle.read(limit_bytes)
+                else:
+                    marker = b"\n--- middle of file omitted by TensaLauncher ---\n"
+                    if limit_bytes <= len(marker):
+                        return handle.read(limit_bytes).decode("utf-8", errors="replace").strip()
+                    available = limit_bytes - len(marker)
+                    head_size = available // 2
+                    tail_size = available - head_size
+                    head = handle.read(head_size)
+                    handle.seek(-tail_size, 2)
+                    data = head + marker + handle.read(tail_size)
             return data.decode("utf-8", errors="replace").strip()
         except OSError as exc:
             return f"Unable to read {path}: {exc!r}"
@@ -267,9 +276,13 @@ class LauncherReportService:
         data = text.encode("utf-8", errors="replace")
         if len(data) <= limit_bytes:
             return text
-        marker = "\n--- log truncated to last 1 MB ---\n".encode("utf-8")
-        tail = data[-max(limit_bytes - len(marker), 0):]
-        return (marker + tail).decode("utf-8", errors="replace")
+        marker = b"\n--- middle of combined log omitted by TensaLauncher ---\n"
+        if limit_bytes <= len(marker):
+            return data[: max(limit_bytes, 0)].decode("utf-8", errors="replace")
+        available = limit_bytes - len(marker)
+        head_size = available // 2
+        tail_size = available - head_size
+        return (data[:head_size] + marker + data[-tail_size:]).decode("utf-8", errors="replace")
 
     @staticmethod
     def _platform_name() -> str:
