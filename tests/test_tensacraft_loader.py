@@ -50,6 +50,29 @@ def test_tensacraft_sync_snapshot_excludes_runtime_locks(fake_app, monkeypatch, 
     assert version._runtime is runtime
 
 
+def test_tensacraft_force_sync_reports_unavailable_api(fake_app, monkeypatch, tmp_path: Path):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    version = SimpleNamespace(
+        id="aeronautics",
+        name="Aeronautics",
+        version="1.21.1",
+        loader="neoforge-21.1.230",
+        loader_version="21.1.230",
+        client="TensaCraft",
+        path=str(tmp_path / "instance"),
+        options={},
+        image=None,
+        force_update=True,
+    )
+    monkeypatch.setattr(loader, "_find_version_payload", lambda _version: None)
+    loader.begin_feedback_operation = lambda **_kwargs: None
+    loader.finish_feedback_operation = lambda *_args, **_kwargs: None
+
+    loader._sync_update_locked(version, force=False)
+    with pytest.raises(RuntimeError, match="tensacraft_sync_api_unavailable"):
+        loader._sync_update_locked(version, force=True)
+
+
 def test_tensacraft_sync_accepts_launch_borrowed_lease(fake_app, monkeypatch, tmp_path: Path):
     fake_app.instance_operations = InstanceOperationCoordinator()
     loader = tensacraft_module.TensaCraftLoader(app=fake_app)
@@ -1318,9 +1341,6 @@ def test_tensacraft_install_error_includes_first_download_failure(
 
 
 def test_tensacraft_api_retries_transient_timeout(fake_app, monkeypatch):
-    TensaCraftAPI._packs_cache = None
-    TensaCraftAPI._files_cache = {}
-    TensaCraftAPI._force_update_cache = {}
     calls = []
 
     class FakeResponse:
@@ -1344,9 +1364,6 @@ def test_tensacraft_api_retries_transient_timeout(fake_app, monkeypatch):
 
 
 def test_tensacraft_api_fetches_force_update_manifest_with_directory_files(fake_app, monkeypatch):
-    TensaCraftAPI._packs_cache = None
-    TensaCraftAPI._files_cache = {}
-    TensaCraftAPI._force_update_cache = {}
     calls = []
 
     class FakeResponse:
@@ -1361,13 +1378,17 @@ def test_tensacraft_api_fetches_force_update_manifest_with_directory_files(fake_
 
     def fake_get(url, **kwargs):
         calls.append((url, kwargs))
-        if url == "https://gigabait.uk/api/mods":
-            return FakeResponse([{"client": {"id": "aeronautics"}}])
         if url == "https://gigabait.uk/api/mods/aeronautics/force-update?include_directory_files=1":
             return FakeResponse(
-                {
-                    "directories": [{"path": "mods/", "sync_scope": "directory"}],
-                    "files": [{"relative_path": "mods/example.jar"}],
+                    {
+                        "directories": [{"path": "mods/", "sync_scope": "directory"}],
+                        "files": [
+                            {
+                                "relative_path": "mods/example.jar",
+                                "download_url": "https://example.com/example.jar",
+                                "sha256": "abc",
+                            }
+                        ],
                 }
             )
         raise AssertionError(f"Unexpected URL: {url}")
@@ -1378,15 +1399,135 @@ def test_tensacraft_api_fetches_force_update_manifest_with_directory_files(fake_
 
     assert manifest == {
         "directories": [{"path": "mods/", "sync_scope": "directory"}],
-        "files": [{"relative_path": "mods/example.jar"}],
+        "files": [
+            {
+                "relative_path": "mods/example.jar",
+                "download_url": "https://example.com/example.jar",
+                "sha256": "abc",
+            }
+        ],
     }
     assert calls == [
-        ("https://gigabait.uk/api/mods", {"timeout": TensaCraftAPI.REQUEST_TIMEOUT}),
         (
             "https://gigabait.uk/api/mods/aeronautics/force-update?include_directory_files=1",
             {"timeout": TensaCraftAPI.REQUEST_TIMEOUT},
         ),
     ]
+
+
+def test_tensacraft_api_does_not_cache_pack_metadata(fake_app, monkeypatch):
+    responses = iter(
+        [
+            [{"client": {"id": "aeronautics", "loader_version": "21.1.1"}}],
+            [{"client": {"id": "aeronautics", "loader_version": "21.1.2"}}],
+        ]
+    )
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self.payload
+
+    monkeypatch.setattr(
+        "launcher.core.api.tensacraft.requests.get",
+        lambda _url, **_kwargs: FakeResponse(next(responses)),
+    )
+
+    api = TensaCraftAPI(fake_app)
+    assert api.get_versions("aeronautics")["client"]["loader_version"] == "21.1.1"
+    assert api.get_versions("aeronautics")["client"]["loader_version"] == "21.1.2"
+
+
+def test_tensacraft_api_rejects_incomplete_force_update_manifest(fake_app, monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "summary": {"returned_files_count": 2, "directories_count": 0},
+                "directories": [],
+                "files": [
+                    {
+                        "relative_path": "mods/one.jar",
+                        "download_url": "https://example.com/one.jar",
+                        "sha256": "abc",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        "launcher.core.api.tensacraft.requests.get",
+        lambda _url, **_kwargs: FakeResponse(),
+    )
+
+    assert TensaCraftAPI(fake_app).get_force_update_manifest("aeronautics") is None
+
+
+def test_tensacraft_api_does_not_cache_sync_manifests(fake_app, monkeypatch):
+    calls = 0
+
+    class FakeResponse:
+        def __init__(self, index: int):
+            self.index = index
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "summary": {"returned_files_count": 1, "directories_count": 0},
+                "directories": [],
+                "files": [
+                    {
+                        "relative_path": f"mods/version-{self.index}.jar",
+                        "download_url": f"https://example.com/version-{self.index}.jar",
+                        "sha256": f"hash-{self.index}",
+                    }
+                ],
+            }
+
+    def fake_get(_url, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return FakeResponse(calls)
+
+    monkeypatch.setattr("launcher.core.api.tensacraft.requests.get", fake_get)
+
+    api = TensaCraftAPI(fake_app)
+    first = api.get_force_update_manifest("aeronautics")
+    second = api.get_force_update_manifest("aeronautics")
+
+    assert first is not None
+    assert second is not None
+    assert first["files"][0]["relative_path"] == "mods/version-1.jar"
+    assert second["files"][0]["relative_path"] == "mods/version-2.jar"
+    assert calls == 2
+
+
+def test_tensacraft_required_manifest_failure_does_not_use_legacy_file_list(
+    fake_app,
+    tmp_path: Path,
+):
+    loader = tensacraft_module.TensaCraftLoader(app=fake_app)
+    loader.api.get_force_update_manifest = lambda *_args, **_kwargs: None
+    loader.api.get_version_files = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("legacy file list must not replace a required manifest")
+    )
+
+    plan = loader.content.prepare(
+        tmp_path / "instance",
+        "aeronautics",
+        force_update_endpoint="https://example.com/force-update",
+    )
+
+    assert plan.api_available is False
+    assert plan.has_changes is False
 
 
 def test_home_tensacraft_install_error_report_includes_context(fake_app, monkeypatch):

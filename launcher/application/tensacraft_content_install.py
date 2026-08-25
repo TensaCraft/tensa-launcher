@@ -20,9 +20,15 @@ class TensaCraftContentAPI(Protocol):
         client: str,
         *,
         include_directory_files: bool = True,
+        endpoint: str | None = None,
     ) -> dict[str, Any] | None: ...
 
-    def get_version_files(self, client: str) -> list[dict[str, Any]] | None: ...
+    def get_version_files(
+        self,
+        client: str,
+        *,
+        endpoint: str | None = None,
+    ) -> list[dict[str, Any]] | None: ...
 
     def relative_path(self, file_data: dict[str, Any]) -> str: ...
 
@@ -138,21 +144,30 @@ class TensaCraftContentInstall:
         *,
         preserve_rules: Any = None,
         force: bool = False,
+        files_endpoint: str | None = None,
+        force_update_endpoint: str | None = None,
     ) -> TensaCraftContentPlan:
         root = Path(root).resolve()
         root.mkdir(parents=True, exist_ok=True)
         force_sync = bool(force or self.needs_recovery(root))
 
-        force_manifest = self.api.get_force_update_manifest(
-            version_key,
-            include_directory_files=True,
-        )
+        force_kwargs: dict[str, Any] = {"include_directory_files": True}
+        if force_update_endpoint:
+            force_kwargs["endpoint"] = force_update_endpoint
+        force_manifest = self.api.get_force_update_manifest(version_key, **force_kwargs)
+        if force_update_endpoint and force_manifest is None:
+            Logger.warning(
+                f"Required force-update manifest for {version_key} is unavailable"
+            )
+            return TensaCraftContentPlan(root=root, api_available=False)
         manifest_mode = force_manifest is not None
-        api_files = (
-            self._manifest_files(force_manifest)
-            if manifest_mode
-            else self.api.get_version_files(version_key)
-        )
+        if manifest_mode:
+            api_files = self._manifest_files(force_manifest)
+        else:
+            files_kwargs: dict[str, Any] = {}
+            if files_endpoint:
+                files_kwargs["endpoint"] = files_endpoint
+            api_files = self.api.get_version_files(version_key, **files_kwargs)
         normalized_preserve_rules = self._normalize_preserve_rules(
             preserve_rules
             if preserve_rules is not None

@@ -12,14 +12,6 @@ class TensaCraftAPI:
     REQUEST_TIMEOUT = 20
     REQUEST_RETRIES = 3
     RETRY_BACKOFF_SECONDS = 0.5
-    _packs_cache: list[dict[str, Any]] | None = None
-    _packs_cache_ts = 0.0
-    _packs_cache_ttl = 300.0
-    _files_cache: dict[str, tuple[float, list[dict[str, Any]] | None]] = {}
-    _files_cache_ttl = 60.0
-    _force_update_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
-    _force_update_cache_ttl = 60.0
-
     def __init__(self, app: Any) -> None:
         self.base_url = "https://gigabait.uk/api/mods"
         self.app = app
@@ -59,17 +51,11 @@ class TensaCraftAPI:
         return ""
 
     def list_versions(self) -> list[dict[str, Any]]:
-        now = time.time()
-        cache = type(self)
-        if cache._packs_cache is not None and (now - cache._packs_cache_ts) < cache._packs_cache_ttl:
-            return cache._packs_cache
         try:
             data = self._request_json(self.base_url)
             if not isinstance(data, list):
                 data = []
-            cache._packs_cache = [pack for pack in data if isinstance(pack, dict)]
-            cache._packs_cache_ts = now
-            return cache._packs_cache
+            return [pack for pack in data if isinstance(pack, dict)]
         except (requests.RequestException, ValueError) as exc:
             self.app.log.error(f"Error fetching Tensa packs: {exc}")
             return []
@@ -93,25 +79,16 @@ class TensaCraftAPI:
                 return pack
         return {}
 
-    def get_version_files(self, client: str) -> list[dict[str, Any]] | None:
-        pack = self.get_versions(client)
-        pack_id = self.pack_id(pack) if isinstance(pack, dict) else client
+    def get_version_files(
+        self,
+        client: str,
+        *,
+        endpoint: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        pack_id = client.strip()
         if not pack_id:
             return None
-
-        now = time.time()
-        cache = type(self)
-        cached = cache._files_cache.get(pack_id)
-        if cached is not None:
-            ts, data = cached
-            if (now - ts) < cache._files_cache_ttl:
-                return data
-
-        client_data = pack.get("client") if isinstance(pack, dict) else None
-        files_url = None
-        if isinstance(client_data, dict):
-            files_url = client_data.get("files_endpoint") or client_data.get("endpoint")
-        files_url = files_url or f"{self.base_url}/{pack_id}"
+        files_url = str(endpoint or "").strip() or f"{self.base_url}/{pack_id}"
 
         try:
             data = self._request_json(files_url)
@@ -121,7 +98,6 @@ class TensaCraftAPI:
                 files = [item for item in data if isinstance(item, dict)]
             else:
                 files = []
-            cache._files_cache[pack_id] = (now, files)
             return files
         except (requests.RequestException, ValueError) as exc:
             self.app.log.warning(f"Error fetching Tensa files for pack {pack_id}: {exc}")
@@ -139,43 +115,12 @@ class TensaCraftAPI:
         client: str,
         *,
         include_directory_files: bool = True,
+        endpoint: str | None = None,
     ) -> dict[str, Any] | None:
-        pack = self.get_versions(client)
-        pack_id = self.pack_id(pack) if isinstance(pack, dict) else client
+        pack_id = client.strip()
         if not pack_id:
             return None
-
-        cache_key = f"{pack_id}:files={int(include_directory_files)}"
-        now = time.time()
-        cache = type(self)
-        cached = cache._force_update_cache.get(cache_key)
-        if cached is not None:
-            ts, data = cached
-            if (now - ts) < cache._force_update_cache_ttl:
-                return data
-
-        client_data = pack.get("client") if isinstance(pack, dict) else None
-        force_url = None
-        endpoint_sources = []
-        if isinstance(client_data, dict):
-            endpoint_sources.append(client_data)
-        if isinstance(pack, dict):
-            endpoint_sources.append(pack)
-        for source in endpoint_sources:
-            for key in (
-                "force_update_endpoint",
-                "forceUpdateEndpoint",
-                "force_update_url",
-                "forceUpdateUrl",
-                "force-update_endpoint",
-            ):
-                value = source.get(key)
-                if isinstance(value, str) and value.strip():
-                    force_url = value.strip()
-                    break
-            if force_url:
-                break
-        force_url = force_url or f"{self.base_url}/{pack_id}/force-update"
+        force_url = str(endpoint or "").strip() or f"{self.base_url}/{pack_id}/force-update"
         if include_directory_files:
             force_url = self._with_query(force_url, {"include_directory_files": 1})
 
@@ -195,12 +140,42 @@ class TensaCraftAPI:
                 manifest = {"files": [item for item in data if isinstance(item, dict)], "directories": []}
             else:
                 manifest = {"files": [], "directories": []}
-            cache._force_update_cache[cache_key] = (now, manifest)
+            self._validate_force_update_manifest(manifest)
             return manifest
         except (requests.RequestException, ValueError) as exc:
             self.app.log.warning(f"Error fetching Tensa force-update manifest for pack {pack_id}: {exc}")
-            cache._force_update_cache[cache_key] = (now, None)
             return None
+
+    @classmethod
+    def _validate_force_update_manifest(cls, manifest: dict[str, Any]) -> None:
+        files = manifest.get("files")
+        directories = manifest.get("directories")
+        if not isinstance(files, list) or not isinstance(directories, list):
+            raise ValueError("Tensa force-update manifest has an invalid structure")
+
+        summary = manifest.get("summary")
+        if isinstance(summary, dict):
+            expected_files = cls._positive_count(summary.get("returned_files_count"))
+            expected_directories = cls._positive_count(summary.get("directories_count"))
+            if expected_files is not None and expected_files != len(files):
+                raise ValueError("Tensa force-update manifest file count does not match its summary")
+            if expected_directories is not None and expected_directories != len(directories):
+                raise ValueError("Tensa force-update manifest directory count does not match its summary")
+
+        for file_data in files:
+            relative_path = cls.relative_path(file_data)
+            download_url = str(file_data.get("download_url") or "").strip()
+            expected_hash, _algorithm = cls.expected_hash(file_data)
+            if not relative_path or not download_url or not expected_hash:
+                raise ValueError(f"Incomplete Tensa force-update file entry: {relative_path or '<missing path>'}")
+
+    @staticmethod
+    def _positive_count(value: Any) -> int | None:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 0 else None
 
     @staticmethod
     def relative_path(file_data: dict[str, Any]) -> str:

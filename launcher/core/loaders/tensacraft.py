@@ -104,7 +104,12 @@ class TensaCraftLoader(BaseLoader):
             else:
                 loader.install(version=version, loader_version=version.loader_version)
 
-            files = self.api.get_version_files(tensa_id)
+            files_endpoint = client_data.get("files_endpoint") or client_data.get("endpoint")
+            files = (
+                self.api.get_version_files(tensa_id, endpoint=files_endpoint)
+                if files_endpoint
+                else self.api.get_version_files(tensa_id)
+            )
             if files is None:
                 raise ValueError(f"Could not retrieve version files from API for {tensa_id}")
 
@@ -168,6 +173,8 @@ class TensaCraftLoader(BaseLoader):
             resolved = self._find_version_payload(version)
             if resolved is None:
                 Logger.warning(f"Skipping Tensa sync for {ver_key}: API pack metadata unavailable")
+                if force:
+                    raise RuntimeError(self.app.trans("tensacraft_sync_api_unavailable"))
                 return
             ver_key, req = resolved
             version_path = self._required_version_path(version)
@@ -196,9 +203,13 @@ class TensaCraftLoader(BaseLoader):
                 ver_key,
                 preserve_rules=client_data.get("preserve_rules"),
                 force=force or recovered,
+                files_endpoint=client_data.get("files_endpoint") or client_data.get("endpoint"),
+                force_update_endpoint=self._force_update_endpoint(client_data),
             )
             if not sync_plan.api_available:
                 Logger.warning(f"Skipping Tensa sync for {ver_key}: API files unavailable")
+                if force:
+                    raise RuntimeError(self.app.trans("tensacraft_sync_api_unavailable"))
                 return
 
             loader_changed = self.payload.loader_changed(version, client_data)
@@ -398,13 +409,31 @@ class TensaCraftLoader(BaseLoader):
         preserve_rules: Any = None,
         *,
         force: bool = False,
+        files_endpoint: str | None = None,
+        force_update_endpoint: str | None = None,
     ) -> TensaCraftContentPlan:
         return self.content.prepare(
             self._required_version_path(version),
             ver_key,
             preserve_rules=preserve_rules,
             force=force,
+            files_endpoint=files_endpoint,
+            force_update_endpoint=force_update_endpoint,
         )
+
+    @staticmethod
+    def _force_update_endpoint(client_data: dict[str, Any]) -> str | None:
+        for key in (
+            "force_update_endpoint",
+            "forceUpdateEndpoint",
+            "force_update_url",
+            "forceUpdateUrl",
+            "force-update_endpoint",
+        ):
+            value = client_data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
     def _sync_files(
         self,
