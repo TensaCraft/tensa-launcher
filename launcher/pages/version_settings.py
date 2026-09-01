@@ -8,6 +8,7 @@ from launcher.application.installed_components import InstalledComponent, Instal
 from launcher.application.java_preferences import JavaPreferencesService
 from launcher.application.java_runtime import JavaRuntimeService
 from launcher.application.memory_preferences import MemoryPreferencesService
+from launcher.application.tensacraft_profile_identity import TensaCraftProfileIdentity
 from launcher.application.version_options import VersionOptionsPayload
 from launcher.core import util
 from launcher.pages.mod_diagnostics import ModDiagnosticsController
@@ -974,10 +975,15 @@ class VersionSettingsPage:
             return
 
         name = (self.name.value or "").strip()
+        is_managed_tensacraft = TensaCraftProfileIdentity.is_managed(
+            self.version,
+            minecraft_dir=self._minecraft_dir(),
+        )
         selected_component = self.installed_components.get(str(self.loaders_select.value or ""))
         if selected_component is not None:
             self.version.version = selected_component.minecraft_version or selected_component.version_id
-            self.version.client = selected_component.loader_name
+            if not is_managed_tensacraft:
+                self.version.client = selected_component.loader_name
             self.version.loader_version = selected_component.loader_version
         payload = VersionOptionsPayload(
             name=name,
@@ -1003,6 +1009,11 @@ class VersionSettingsPage:
             self.app.feedback.warning(msg)
             return
 
+        if is_managed_tensacraft:
+            TensaCraftProfileIdentity.mark(
+                self.version,
+                TensaCraftProfileIdentity.pack_id(self.version),
+            )
         self.version.save()
         self.app.feedback.info(self.app.trans("version_updated"))
         if self.embedded:

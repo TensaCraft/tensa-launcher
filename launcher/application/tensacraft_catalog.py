@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from launcher.application.tensacraft_profile_identity import TensaCraftProfileIdentity
 from launcher.core.versions import Version
 
 
@@ -71,14 +72,19 @@ class TensaCraftCatalogService:
     @staticmethod
     def local_pack_ids(versions: list[Version]) -> set[str]:
         return {
-            version.id
+            pack_id
             for version in versions
-            if version.is_tensacraft() and version.id
+            if TensaCraftProfileIdentity.is_managed(version)
+            for pack_id in [TensaCraftProfileIdentity.pack_id(version)]
+            if pack_id
         }
 
     @staticmethod
     def find_local(versions: list[Version], pack_id: str) -> Version | None:
         for version in versions:
-            if version.is_tensacraft() and version.id == pack_id:
+            if (
+                TensaCraftProfileIdentity.is_managed(version)
+                and TensaCraftProfileIdentity.pack_id(version) == pack_id
+            ):
                 return version
         return None

@@ -49,7 +49,14 @@ def test_state_store_binds_util_before_config(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("launcher.state.Auth", lambda _app: "auth")
     monkeypatch.setattr("launcher.state.Profiles", lambda _app, **_kwargs: "profiles")
     monkeypatch.setattr("launcher.state.AutoUpdater", lambda _app: "updater")
-    monkeypatch.setattr("launcher.state.Versions", lambda **_kwargs: "versions")
+    profile = SimpleNamespace(version_id="aeronautics")
+    versions = SimpleNamespace(all=lambda: [profile])
+    repairs = []
+    monkeypatch.setattr("launcher.state.Versions", lambda **_kwargs: versions)
+    monkeypatch.setattr(
+        "launcher.state.TensaCraftProfileIdentity.repair",
+        lambda version, **kwargs: repairs.append((version, kwargs)) or False,
+    )
     monkeypatch.setattr("launcher.core.Launcher", FakeLauncher)
 
     state = StateStore.build(app)
@@ -59,4 +66,13 @@ def test_state_store_binds_util_before_config(monkeypatch, tmp_path: Path):
     assert state.util is fake_util
     assert callable(state.config.get)
     assert state.world_backups == "world_backups"
-    assert state.versions == "versions"
+    assert state.versions is versions
+    assert repairs == [
+        (
+            profile,
+            {
+                "minecraft_dir": layout.minecraft_dir,
+                "persist": True,
+            },
+        )
+    ]

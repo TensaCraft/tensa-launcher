@@ -1149,7 +1149,10 @@ def test_state_store_restores_saved_minecraft_dir_from_config(monkeypatch, tmp_p
     monkeypatch.setattr("launcher.state.Auth", lambda _app: "auth")
     monkeypatch.setattr("launcher.state.Profiles", lambda _app, **_kwargs: "profiles")
     monkeypatch.setattr("launcher.state.AutoUpdater", lambda _app: "updater")
-    monkeypatch.setattr("launcher.state.Versions", lambda **_kwargs: "versions")
+    monkeypatch.setattr(
+        "launcher.state.Versions",
+        lambda **_kwargs: SimpleNamespace(all=lambda: []),
+    )
     monkeypatch.setattr("launcher.core.Launcher", FakeLauncher)
 
     state = StateStore.build(fake_app)
@@ -1201,7 +1204,10 @@ def test_state_store_repairs_saved_runtime_package_minecraft_dir(monkeypatch, tm
     monkeypatch.setattr("launcher.state.Auth", lambda _app: "auth")
     monkeypatch.setattr("launcher.state.Profiles", lambda _app, **_kwargs: "profiles")
     monkeypatch.setattr("launcher.state.AutoUpdater", lambda _app: "updater")
-    monkeypatch.setattr("launcher.state.Versions", lambda **_kwargs: "versions")
+    monkeypatch.setattr(
+        "launcher.state.Versions",
+        lambda **_kwargs: SimpleNamespace(all=lambda: []),
+    )
     monkeypatch.setattr("launcher.core.Launcher", FakeLauncher)
 
     state = StateStore.build(fake_app)

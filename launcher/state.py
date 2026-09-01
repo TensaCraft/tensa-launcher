@@ -8,6 +8,7 @@ from launcher.application.feedback import FeedbackService
 from launcher.application.instance_operations import InstanceOperationCoordinator
 from launcher.application.modrinth_mods import ModrinthModsService
 from launcher.application.shared_resources import SharedResourceCoordinator
+from launcher.application.tensacraft_profile_identity import TensaCraftProfileIdentity
 from launcher.application.ui_sound import UiSoundService
 from launcher.application.version_content import VersionContentService
 from launcher.application.version_options import VersionOptionsService
@@ -60,6 +61,27 @@ class StateStore:
 
         instance_operations = InstanceOperationCoordinator()
         shared_resources = SharedResourceCoordinator()
+        versions = Versions(
+            storage_dir=layout.app_state_dir,
+            minecraft_dir=layout.minecraft_dir,
+        )
+        for version in versions.all():
+            try:
+                repaired = TensaCraftProfileIdentity.repair(
+                    version,
+                    minecraft_dir=layout.minecraft_dir,
+                    persist=True,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                app.log.warning(
+                    f"Unable to repair TensaCraft profile identity for "
+                    f"{version.version_id}: {exc}"
+                )
+            else:
+                if repaired:
+                    app.log.info(
+                        f"Repaired TensaCraft profile identity for {version.version_id}"
+                    )
         state = AppState(
             util=util,
             paths=layout,
@@ -82,10 +104,7 @@ class StateStore:
             ),
             auth=Auth(app),
             profiles=Profiles(app, storage_dir=layout.app_state_dir),
-            versions=Versions(
-                storage_dir=layout.app_state_dir,
-                minecraft_dir=layout.minecraft_dir,
-            ),
+            versions=versions,
             updater=AutoUpdater(app),
         )
         return state

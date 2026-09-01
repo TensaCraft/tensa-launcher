@@ -15,6 +15,7 @@ from launcher.application.tensacraft_content_install import (
     TensaCraftContentPlan,
 )
 from launcher.application.tensacraft_payload import TensaCraftPayloadService
+from launcher.application.tensacraft_profile_identity import TensaCraftProfileIdentity
 from launcher.application.version_profile_state import (
     capture_version_profile,
     restore_version_profile,
@@ -121,7 +122,7 @@ class TensaCraftLoader(BaseLoader):
             )
 
             version.path = str(game_path)
-            version.client = self.get_name()
+            TensaCraftProfileIdentity.mark(version, tensa_id)
             version.save()
 
             if callback:
@@ -263,6 +264,7 @@ class TensaCraftLoader(BaseLoader):
             )
             self.payload.merge_sync_payload(version, client_data, java_path=java_path)
             version.id = ver_key
+            TensaCraftProfileIdentity.mark(version, ver_key)
 
             if sync_plan.has_changes:
                 self._update_feedback_operation(

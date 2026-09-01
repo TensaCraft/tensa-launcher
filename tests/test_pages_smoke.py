@@ -17,6 +17,7 @@ from launcher.application.modrinth_mods import (
     ModrinthDependencyPlan,
     ModrinthInstallCandidate,
 )
+from launcher.application.tensacraft_catalog import TensaCraftCatalogService
 from launcher.application.version_creation import VersionCreateOption
 from launcher.pages.activity import ActivityPage, ActivityPanel
 from launcher.pages.home import Home
@@ -1477,6 +1478,48 @@ def test_version_settings_page_saves_auto_java_as_launcher_default(fake_app, mon
     page.save()
 
     assert "executablePath" not in version.options
+
+
+def test_version_settings_preserves_tensacraft_catalog_identity_after_edit(
+    fake_app,
+    monkeypatch,
+    tmp_path,
+):
+    component = InstalledComponent(
+        version_id="neoforge-21.1.248",
+        kind="neoforge",
+        loader_name="neoforge",
+        minecraft_version="1.21.1",
+        loader_version="21.1.248",
+        inherits_from="1.21.1",
+        path=tmp_path / "neoforge-21.1.248",
+        size_bytes=1,
+        modified_at=None,
+        used_by=(),
+        dependent_components=(),
+    )
+    monkeypatch.setattr(
+        "launcher.application.installed_components.InstalledComponentsService.list_installed",
+        lambda _self: [component],
+    )
+
+    version = fake_app.versions.all()[0]
+    version.client = "TensaCraft"
+    version.id = "aeronautics"
+    version.remote_pack_id = None
+    version.version = "1.21.1"
+    version.loader = component.version_id
+    version.loader_version = component.loader_version
+    version.is_tensacraft = lambda: "tensa" in (version.client or "").lower()
+    version.save = lambda: None
+
+    page = VersionSettingsPage(fake_app, version.version_id)
+    page.name.value = "Aeronautics edited"
+    page.save()
+
+    assert version.client == "TensaCraft"
+    assert version.remote_pack_id == "aeronautics"
+    assert TensaCraftCatalogService.local_pack_ids([version]) == {"aeronautics"}
 
 
 def test_version_settings_page_opens_diagnostic_paths(fake_app, monkeypatch, tmp_path):
