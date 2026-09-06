@@ -79,16 +79,24 @@ class BuildContext:
         capture_output: bool = False,
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
+        redact: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
-        self.log(" ".join(_quote(part) for part in cmd))
-        return subprocess.run(
-            cmd,
-            cwd=cwd or self.root_dir,
-            text=True,
-            check=check,
-            capture_output=capture_output,
-            env=env,
-        )
+        display_cmd = ["***" if part in redact else part for part in cmd]
+        self.log(" ".join(_quote(part) for part in display_cmd))
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd or self.root_dir,
+                text=True,
+                check=check,
+                capture_output=capture_output,
+                env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            exc.cmd = display_cmd
+            raise
+        result.args = display_cmd
+        return result
 
     @staticmethod
     def error(message: str) -> BuildError:
@@ -205,8 +213,7 @@ def create_workdirs(ctx: BuildContext) -> None:
 
 
 def install_dependencies(ctx: BuildContext) -> None:
-    # flet/pyinstaller still rely on pkg_resources in several workflows.
-    ctx.run([ctx.python_bin, "-m", "pip", "install", "--upgrade", "pip", "setuptools<81", "wheel"])
+    ctx.run([ctx.python_bin, "-m", "pip", "install", "--upgrade", "pip", "setuptools>=80", "wheel"])
     project = read_project_metadata(ctx)
     requirements = [str(req).strip() for req in project.get("dependencies", []) if str(req).strip()]
     requirements.extend(
@@ -220,7 +227,7 @@ def install_dependencies(ctx: BuildContext) -> None:
         [
             ctx.python_bin,
             "-c",
-            "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('pkg_resources') else 1)",
+            "import flet.cli, PyInstaller",
         ]
     )
 

@@ -173,7 +173,7 @@ def sign_windows_artifact_if_configured(ctx, artifact_path: Path) -> None:
     if password:
         command.extend(["/p", password])
     command.extend(["/tr", timestamp_url, "/td", "SHA256", str(artifact_path)])
-    ctx.run(command)
+    ctx.run(command, redact=(password,) if password else ())
 
 
 def build_target(ctx, args, base_artifact: Path) -> list[Path]:

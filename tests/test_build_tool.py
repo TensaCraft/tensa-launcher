@@ -7,6 +7,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 BUILD_TOOL_PATH = ROOT_DIR / ".tools" / "build.py"
 
@@ -66,6 +68,8 @@ def test_build_install_dependencies_does_not_reinstall_current_project():
 
     assert len(commands) == 3
     assert commands[0][:5] == ["python", "-m", "pip", "install", "--upgrade"]
+    assert "setuptools>=80" in commands[0]
+    assert commands[2][-1] == "import flet.cli, PyInstaller"
     assert commands[1][:4] == ["python", "-m", "pip", "install"]
     assert "-e" not in commands[1]
     assert ".[build]" not in commands[1]
@@ -407,6 +411,36 @@ def test_windows_signing_uses_timestamp_when_configured(monkeypatch, tmp_path):
             str(artifact),
         ]
     ]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_windows_signing_redacts_password_in_logs_and_errors(monkeypatch, tmp_path, capsys, failure):
+    build_tool = _load_build_tool()
+    builder = _load_module("build_windows_redaction_test", ROOT_DIR / ".tools" / "build_windows.py")
+    ctx = _build_context(build_tool, target="windows")
+    cert = tmp_path / "codesign.pfx"
+    cert.write_bytes(b"cert")
+    secret = "test-password-not-for-logs"
+    monkeypatch.setenv("TENSALAUNCHER_WINDOWS_CERT_PATH", str(cert))
+    monkeypatch.setenv("TENSALAUNCHER_WINDOWS_CERT_PASSWORD", secret)
+    monkeypatch.setattr(builder, "find_windows_sdk_tool", lambda _name: tmp_path / "signtool.exe")
+
+    def run(command, **kwargs):
+        assert command[command.index("/p") + 1] == secret
+        if failure:
+            raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(build_tool.subprocess, "run", run)
+    if failure:
+        with pytest.raises(subprocess.CalledProcessError) as raised:
+            builder.sign_windows_artifact_if_configured(ctx, tmp_path / "launcher.exe")
+        assert secret not in str(raised.value)
+    else:
+        builder.sign_windows_artifact_if_configured(ctx, tmp_path / "launcher.exe")
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert "***" in output
 
 
 def test_build_base_artifact_packs_root_bootstrap(tmp_path):
