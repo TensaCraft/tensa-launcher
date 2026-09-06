@@ -3519,17 +3519,18 @@ def test_mods_manager_installed_tab_does_not_auto_check_mod_updates(fake_app, mo
     mods_dir.mkdir(parents=True, exist_ok=True)
     (mods_dir / "example.jar").write_bytes(b"not a real jar")
     version.path = str(version_root)
-    scheduled = []
+    update_checks = []
 
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
     monkeypatch.setattr(
-        "launcher.pages.mods_manager_installed.run_task",
-        lambda _page, task, *args, **_kwargs: scheduled.append((task, args)),
+        fake_app.modrinth_mods,
+        "find_update",
+        lambda *args, **kwargs: update_checks.append((args, kwargs)),
     )
 
     page = ModsManagerPage(fake_app, version)
     page.is_loading = False
     page._rebuild_installed_mods()
 
-    assert scheduled == []
+    assert update_checks == []
     assert page.is_loading is False

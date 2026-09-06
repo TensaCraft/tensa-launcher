@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections.abc import Callable
 from datetime import datetime
@@ -75,6 +76,7 @@ class ModsManagerPage(
         self.selected_backup_world_path: Path | None = None
         self.installed_containers: dict[str, ft.ListView] = {}
         self.loaded_content_keys: set[str] = set()
+        self._pending_content_scans: dict[str, SessionTaskToken] = {}
         self.world_backups_loaded = False
         self.screenshots_loaded = False
         self.screenshots_container: ft.ListView | None = None
@@ -499,6 +501,7 @@ class ModsManagerPage(
             self._search_timer.cancel()
             self._search_timer = None
         self._session_tasks.close()
+        self._pending_content_scans.clear()
         if self.version_settings_page is not None:
             self.version_settings_page.before_hide()
 
@@ -718,7 +721,7 @@ class ModsManagerPage(
             if key == "mods":
                 if key not in self.loaded_content_keys and not self.is_loading:
                     self._rebuild_installed_mods(update=update)
-            elif key not in self.loaded_content_keys:
+            elif key not in self.loaded_content_keys and key not in self._pending_content_scans:
                 self._rebuild_installed_content(key, update=update)
             return
         if key == "backups":
@@ -753,14 +756,14 @@ class ModsManagerPage(
                     "",
                 )
 
-    def _scan_installed_content(self, key: str) -> list[Dict]:
-        if key == "mods":
-            return self.app.content.apply_modrinth_metadata(self.version, self._scan_installed_mods())
+    def _scan_installed_content(self, key: str, version, directory, mods_dir) -> list[Dict]:
         if key == "resourcepacks":
-            return self.app.content.apply_modrinth_metadata(self.version, self._scan_installed_resourcepacks())
-        if key == "shaders":
-            return self.app.content.apply_modrinth_metadata(self.version, self._scan_installed_shaderpacks())
-        return []
+            items = self.app.content.scan_installed_resourcepacks(directory)
+        elif key == "shaders":
+            items = self.app.content.scan_installed_shaderpacks(directory, mods_dir=mods_dir)
+        else:
+            return []
+        return self.app.content.apply_modrinth_metadata(version, items)
 
     def _rebuild_installed_content(self, key: str, *, update: bool = True) -> None:
         if key == "backups":
@@ -772,8 +775,79 @@ class ModsManagerPage(
             self._rebuild_installed_mods(update=update)
             return
 
-        items = self._scan_installed_content(key)
-        self._apply_installed_content(key, items, update=update)
+        token = self._session_tasks.begin(f"installed-{key}")
+        if token is None:
+            return
+        self._pending_content_scans[key] = token
+        scan = (token, self.version, key, getattr(self, self.content_configs[key]["directory_attr"]), self.mods_dir)
+        self.installed_containers[key].controls = [
+            ui.Container(
+                ui.ProgressRing(),
+                alignment=ft.Alignment.CENTER,
+                padding=self.app.theme.padding_md,
+                expand=True,
+            )
+        ]
+        if update and self._is_active:
+            schedule_update(self.page)
+        try:
+            task = self._run_session_task(self._load_installed_content_async, scan, update, token=token)
+        except Exception as exc:
+            self._finish_installed_content_scan(scan, exc, update=update)
+            return
+        if task is not None or not self._installed_content_scan_is_current(scan):
+            return
+
+        # Match the installed-mods fallback for headless pages without a task runtime.
+        try:
+            items = self._scan_installed_content(key, scan[1], scan[3], scan[4])
+        except Exception as exc:
+            self._finish_installed_content_scan(scan, exc, update=update)
+        else:
+            self._finish_installed_content_scan(scan, items, update=update)
+
+    def _installed_content_scan_is_current(self, scan) -> bool:
+        token, version, key, _directory, _mods_dir = scan
+        return (
+            self._session_tasks.is_current(token)
+            and self.version is version
+            and self._pending_content_scans.get(key) == token
+        )
+
+    async def _load_installed_content_async(self, scan, update: bool) -> None:
+        if not self._installed_content_scan_is_current(scan):
+            return
+        _token, version, key, directory, mods_dir = scan
+        try:
+            items = await run_blocking(self._scan_installed_content, key, version, directory, mods_dir)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._finish_installed_content_scan(scan, exc, update=update or self._is_active)
+        else:
+            self._finish_installed_content_scan(scan, items, update=update or self._is_active)
+
+    def _finish_installed_content_scan(self, scan, result: list[Dict] | Exception, *, update: bool) -> None:
+        if not self._installed_content_scan_is_current(scan):
+            return
+        key = scan[2]
+        self._pending_content_scans.pop(key, None)
+        update = update and self.current_content_key == key
+        if isinstance(result, Exception):
+            self.app.log.error(f"Failed to scan installed {key}: {result!r}")
+            self.installed_containers[key].controls = [
+                ui.Container(
+                    ui.Text(self.trans("unknown_error"), color=self.app.theme.error),
+                    alignment=ft.Alignment.CENTER,
+                    expand=True,
+                )
+            ]
+            if update and self._is_active:
+                schedule_update(self.page)
+            return
+        self._apply_installed_content(key, result, update=update)
+        if key == self.current_content_key and self._is_modrinth_tab_active():
+            self._refresh_visible_modrinth_search_results()
 
     def _apply_installed_content(self, key: str, items: list[Dict], *, update: bool) -> None:
         self.installed_items[key] = items
@@ -947,10 +1021,15 @@ class ModsManagerPage(
 
     def _after_embedded_version_save(self, version) -> None:
         self._cancel_installed_mods_scan()
-        self.loaded_content_keys.discard("mods")
+        for key in self._pending_content_scans:
+            self._session_tasks.invalidate(f"installed-{key}")
+        self._pending_content_scans.clear()
+        self.loaded_content_keys.difference_update(self.content_configs)
         self.version = version
         self.mods_supported = self._check_mods_support()
         self.mods_dir = self._get_mods_directory() if self.mods_supported else None
+        self.resourcepacks_dir = self._get_resourcepacks_directory()
+        self.shaderpacks_dir = self._get_shaderpacks_directory()
         self.app.header.set_params(title=self.trans("mods_manager_title", version=self.version.name))
 
     def _build_delete_version_panel(self) -> ft.Control:

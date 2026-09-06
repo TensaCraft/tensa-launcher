@@ -42,20 +42,33 @@ class ModsManagerSearchMixin:
 
         if self._search_timer is not None:
             self._search_timer.cancel()
-        self._search_timer = threading.Timer(0.35, self._trigger_search_from_timer)
-        self._search_timer.daemon = True
-        self._search_timer.start()
+        search_token = self.search_state.token
+        timer = threading.Timer(0.35, lambda: self._trigger_search_from_timer(timer, search_token))
+        self._search_timer = timer
+        timer.daemon = True
+        timer.start()
 
-    def _trigger_search_from_timer(self):
-        if not self._is_active or not self._is_modrinth_tab_active():
-            return
-        invoke_on_ui(self.page, self._search_mods)
+    def _trigger_search_from_timer(self, timer, search_token: int):
+        def search_if_current():
+            if (
+                self._search_timer is timer
+                and search_token == self.search_state.token
+                and self._is_active
+                and self._is_modrinth_tab_active()
+            ):
+                self._search_mods()
+
+        invoke_on_ui(self.page, search_if_current)
 
     def _load_search_page(self, offset: int):
         if not self._is_active:
             return
 
+        if self._search_timer is not None:
+            self._search_timer.cancel()
+            self._search_timer = None
         search_token = self.search_state.begin(self.search_state.query, offset)
+        self.search_result_items = []
         self.search_results_container.controls.clear()
         loading_indicator = ui.Container(
             ui.ProgressRing(),
@@ -65,19 +78,28 @@ class ModsManagerSearchMixin:
         self.search_results_container.controls.append(loading_indicator)
         self._update_search_pagination()
         schedule_update(self.page)
-        context = self._content_context()
-        threading.Thread(
-            target=self._search_mods_worker,
-            args=(
-                search_token,
-                self.search_state.query,
-                self.search_state.offset,
-                loading_indicator,
-                context["project_type"],
-                context["game_version"],
-            ),
-            daemon=True,
-        ).start()
+        try:
+            context = self._content_context()
+            facets = self.app.modrinth_mods.build_search_facets(
+                self.version,
+                project_type=context["project_type"],
+                game_version=context["game_version"],
+            )
+            threading.Thread(
+                target=self._search_mods_worker,
+                args=(
+                    search_token,
+                    self.search_state.query,
+                    self.search_state.offset,
+                    loading_indicator,
+                    facets,
+                    self.search_state.limit,
+                ),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self.app.log.error(f"Failed to start mod search: {exc}")
+            self._apply_search_error(search_token, loading_indicator, str(exc))
 
     def _search_mods_worker(
         self,
@@ -85,19 +107,17 @@ class ModsManagerSearchMixin:
         query: str,
         offset: int,
         loading_indicator,
-        project_type: str,
-        game_version: str,
+        facets: str,
+        limit: int,
     ):
+        if search_token != self.search_state.token or not self._is_active:
+            return
         try:
             result = self.app.catalog.search_mods(
                 query,
-                facets=self.app.modrinth_mods.build_search_facets(
-                    self.version,
-                    project_type=project_type,
-                    game_version=game_version,
-                ),
+                facets=facets,
                 offset=offset,
-                limit=self.search_state.limit,
+                limit=limit,
             )
         except Exception as exc:
             self.app.log.error(f"Failed to search mods: {exc}")
@@ -110,8 +130,8 @@ class ModsManagerSearchMixin:
         if search_token != self.search_state.token or not self._is_active:
             return
 
-        if loading_indicator in self.search_results_container.controls:
-            self.search_results_container.controls.remove(loading_indicator)
+        self.search_result_items = []
+        self.search_results_container.controls.clear()
         self.search_results_container.controls.append(
             ui.Container(
                 ui.Text(f"Error: {error_text}", color=self.app.theme.error),
@@ -127,8 +147,7 @@ class ModsManagerSearchMixin:
         if search_token != self.search_state.token or not self._is_active:
             return
 
-        if loading_indicator in self.search_results_container.controls:
-            self.search_results_container.controls.remove(loading_indicator)
+        self.search_results_container.controls.clear()
 
         self.search_state.apply(result)
         self.search_result_items = list(result.items)
@@ -172,6 +191,7 @@ class ModsManagerSearchMixin:
             self.app.feedback.info(self.trans("installation_already_running"))
             return
         context = self._content_context()
+        context["version"] = self.version
         self._schedule_modrinth_install(
             self.trans(context["config"]["installing_key"], name=mod.get("title", "content")),
             self._install_mod_async,
@@ -192,8 +212,10 @@ class ModsManagerSearchMixin:
             self.content_installing = False
 
     async def _install_mod_async(self, mod: Dict, context: dict | None = None):
-        context = context or self._content_context()
+        context = {"version": self.version, **(context or self._content_context())}
         try:
+            if context["version"] is not self.version:
+                return
             target_dir = context["directory"]
             if target_dir is None:
                 self.app.feedback.warning(self.trans("content_directory_unavailable"))
@@ -202,11 +224,13 @@ class ModsManagerSearchMixin:
             plan = await run_blocking(
                 self.app.modrinth_mods.build_dependency_plan,
                 mod,
-                self.version,
+                context["version"],
                 project_type=context["project_type"],
                 game_version=context["game_version"],
                 installed_items=context["installed_items"],
             )
+            if context["version"] is not self.version:
+                return
             if plan.main is None:
                 self._warn_modrinth_plan_failure(plan)
                 return
@@ -231,6 +255,9 @@ class ModsManagerSearchMixin:
         context: dict,
         selected_optional_dependencies: list[ModrinthInstallCandidate] | None = None,
     ):
+        context = {"version": self.version, **context}
+        if context["version"] is not self.version:
+            return
         if not plan.can_install:
             self._warn_modrinth_plan_failure(plan)
             return
@@ -251,6 +278,8 @@ class ModsManagerSearchMixin:
             plan.install_order_with_optional(selected_optional_dependencies),
             context,
         )
+        if context["version"] is not self.version:
+            return
 
         self.app.feedback.info(
             self.trans(context["config"]["installed_key"], name=main.title)
@@ -259,7 +288,6 @@ class ModsManagerSearchMixin:
             await self._refresh_installed_mods_after_mutation()
         else:
             self._rebuild_installed_content(context["key"])
-        self._refresh_visible_modrinth_search_results()
 
     async def _download_modrinth_candidate(self, candidate: ModrinthInstallCandidate, context: dict) -> Path | None:
         if candidate.action == "satisfied":
@@ -272,6 +300,7 @@ class ModsManagerSearchMixin:
         candidates: list[ModrinthInstallCandidate],
         context: dict,
     ) -> dict[str, Path]:
+        context = {"version": self.version, **context}
         return await run_blocking(
             self._install_modrinth_candidates_transaction_worker,
             candidates,
@@ -286,6 +315,7 @@ class ModsManagerSearchMixin:
         target_dir = context.get("directory")
         if target_dir is None:
             raise FileNotFoundError(self.trans("content_directory_unavailable"))
+        version = context["version"]
         installer = ModrinthContentInstaller(
             self.app.content,
             self.app.modrinth_mods,
@@ -293,18 +323,18 @@ class ModsManagerSearchMixin:
         )
         try:
             return installer.install(
-                self.version,
+                version,
                 candidates,
                 content_key=context["key"],
                 target_dir=Path(target_dir),
             )
         except ModrinthContentInstallBusy as exc:
             raise RuntimeError(
-                self.trans("instance_operation_busy", version=self.version.name)
+                self.trans("instance_operation_busy", version=version.name)
             ) from exc
         except ModrinthContentGameRunning as exc:
             raise RuntimeError(
-                self.trans("instance_game_running", version=self.version.name)
+                self.trans("instance_game_running", version=version.name)
             ) from exc
         except ModrinthContentBackupError as exc:
             raise RuntimeError(self.trans("backup_failed")) from exc
@@ -387,7 +417,12 @@ class ModsManagerSearchMixin:
         return f"https://modrinth.com/{project_type}/{identifier}"
 
     def _refresh_visible_modrinth_search_results(self) -> None:
-        if not self._is_modrinth_tab_active() or self.search_results_container is None:
+        if (
+            not self._is_active
+            or not self._is_modrinth_tab_active()
+            or self.search_results_container is None
+            or self.search_state.loading
+        ):
             return
         items = list(getattr(self, "search_result_items", []) or [])
         if not items:

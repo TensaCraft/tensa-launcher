@@ -96,7 +96,11 @@ def unregister_service(page: ft.Page, service: ft.Service) -> None:
 
 def schedule_update(page: ft.Page) -> None:
     updater = getattr(page, "update", None)
-    if callable(updater) and _is_on_page_loop(page):
+    try:
+        on_page_loop = _is_on_page_loop(page)
+    except RuntimeError:
+        return
+    if callable(updater) and on_page_loop:
         try:
             updater()
             return
@@ -106,6 +110,10 @@ def schedule_update(page: ft.Page) -> None:
     runner = getattr(page, "run_task", None)
     if callable(runner):
         async def _update():
+            try:
+                _page_loop(page)
+            except RuntimeError:
+                return
             update_now = getattr(page, "update", None)
             if callable(update_now):
                 update_now()
@@ -114,7 +122,7 @@ def schedule_update(page: ft.Page) -> None:
             runner(_update)
             return
         except (RuntimeError, TypeError):
-            pass
+            return
 
     if callable(updater):
         try:
@@ -169,18 +177,29 @@ async def run_blocking(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> 
                 await asyncio.shield(future)
             except asyncio.CancelledError:
                 continue
+            except Exception:
+                # A failed worker must not turn session cancellation into UI feedback.
+                break
         if not future.cancelled():
             future.exception()
         raise cancellation
 
 
 def invoke_on_ui(page: ft.Page, callback: Callable[..., Any], *args: Any, **kwargs: Any):
-    if _is_on_page_loop(page):
+    try:
+        on_page_loop = _is_on_page_loop(page)
+    except RuntimeError:
+        return None
+    if on_page_loop:
         return callback(*args, **kwargs)
 
     runner = getattr(page, "run_task", None)
     if callable(runner):
         async def _runner():
+            try:
+                _page_loop(page)
+            except RuntimeError:
+                return None
             result = callback(*args, **kwargs)
             if inspect.isawaitable(result):
                 return await result
@@ -189,7 +208,7 @@ def invoke_on_ui(page: ft.Page, callback: Callable[..., Any], *args: Any, **kwar
         try:
             return runner(_runner)
         except (RuntimeError, TypeError):
-            pass
+            return None
 
     return callback(*args, **kwargs)
 
