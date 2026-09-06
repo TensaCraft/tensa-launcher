@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,78 @@ def _verified_install_file(path: Path) -> ModInstallFile:
         file_hash=compute_file_hash(path, "sha512"),
         hash_algorithm="sha512",
     )
+
+
+def test_mod_scan_continues_when_one_file_disappears(tmp_path, monkeypatch):
+    vanished = tmp_path / "vanished.jar"
+    vanished.write_bytes(b"jar")
+    _write_mod_jar(tmp_path / "valid.jar", "fabric.mod.json", {"id": "valid", "version": "1"})
+    original_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == vanished:
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    items = VersionContentService(tmp_path, DummyLog()).scan_installed_mods(tmp_path)
+    assert [item["filename"] for item in items] == ["valid.jar"]
+
+
+def test_pack_scan_continues_when_one_file_disappears(tmp_path, monkeypatch):
+    vanished = tmp_path / "vanished.zip"
+    vanished.write_bytes(b"zip")
+    (tmp_path / "valid.zip").write_bytes(b"zip")
+    original_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == vanished:
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    items = VersionContentService(tmp_path, DummyLog()).scan_installed_resourcepacks(tmp_path)
+    assert [item["filename"] for item in items] == ["valid.zip"]
+
+
+def test_mod_metadata_reused_until_file_replaced(tmp_path, monkeypatch):
+    import launcher.application.version_content as content
+
+    path = _write_mod_jar(tmp_path / "mod.jar", "fabric.mod.json", {"id": "mod", "version": "1"})
+    service = VersionContentService(tmp_path, DummyLog())
+    inspect = content.inspect_mod_jar
+    calls = []
+
+    def inspect_counted(jar):
+        calls.append(jar)
+        return inspect(jar)
+
+    monkeypatch.setattr(content, "inspect_mod_jar", inspect_counted)
+    first = service.read_mod_metadata(path)
+    first["version"] = "changed by caller"
+    assert service.read_mod_metadata(path)["version"] == "1"
+    assert len(calls) == 1
+    old_stat = path.stat()
+    replacement = _write_mod_jar(tmp_path / "replacement.jar", "fabric.mod.json", {"id": "mod", "version": "2"})
+    os.utime(replacement, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    replacement.replace(path)
+    assert path.stat().st_size == old_stat.st_size
+    assert service.read_mod_metadata(path)["version"] == "2"
+    assert len(calls) == 2
+
+
+def test_mod_metadata_retries_invalid_archive_and_bounds_cache(tmp_path, monkeypatch):
+    service = VersionContentService(tmp_path, DummyLog())
+    monkeypatch.setattr(service, "MOD_METADATA_CACHE_SIZE", 2, raising=False)
+    path = tmp_path / "bad.jar"
+    path.write_bytes(b"bad")
+    assert service.read_mod_metadata(path) == {}
+    for index in range(3):
+        jar = _write_mod_jar(tmp_path / f"{index}.jar", "fabric.mod.json", {"id": f"mod{index}"})
+        service.read_mod_metadata(jar)
+    assert len(service._mod_metadata) <= 2
+    _write_mod_jar(path, "fabric.mod.json", {"id": "repaired"})
+    assert service.read_mod_metadata(path)["id"] == "repaired"
 
 
 def test_version_content_resolves_relative_directories(tmp_path: Path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -278,6 +279,52 @@ def test_install_profile_component_keeps_profile_when_install_fails(monkeypatch,
     assert profile.loader == "neoforge-21.1.230"
     assert profile.loader_version == "21.1.230"
     assert saved == []
+
+
+@pytest.mark.parametrize("fail_save", [False, True])
+def test_component_change_preserves_tensa_identity_and_rolls_back_failed_save(monkeypatch, tmp_path, fail_save):
+    from launcher.domain.version import Version
+
+    _write_version_manifest(tmp_path, "neoforge-21.1.236", {"inheritsFrom": "1.21.1"})
+    service = InstalledComponentsService(tmp_path)
+    component = service.get_component("neoforge-21.1.236")
+    profile = Version("aeronautics", {
+        "id": "aeronautics", "client": "TensaCraft", "loader": "neoforge-21.1.230",
+        "version": "1.21.1", "options": {"maximumRam": 8},
+    })
+    original = deepcopy(profile.to_dict())
+    persisted = []
+
+    def save(version):
+        if fail_save:
+            raise OSError("disk full")
+        persisted.append(version.to_dict())
+
+    profile.bind_persistence(save)
+    monkeypatch.setattr(service, "install_component", lambda *args, **kwargs: component)
+    monkeypatch.setattr(service, "_apply_runtime_path", lambda *args, **kwargs: profile.options.update(java="new"))
+    if fail_save:
+        with pytest.raises(OSError, match="disk full"):
+            service.install_profile_component(profile, "neoforge", "1.21.1")
+        assert profile.to_dict() == original
+    else:
+        service.install_profile_component(profile, "neoforge", "1.21.1")
+        assert profile.client == "TensaCraft"
+        assert profile.remote_pack_id == "aeronautics"
+        assert profile.loader == component.version_id
+        assert persisted == [profile.to_dict()]
+
+
+def test_component_lookup_retains_dependencies_without_scanning_other_contents(tmp_path, monkeypatch):
+    _write_version_manifest(tmp_path, "1.21.1", {})
+    _write_version_manifest(tmp_path, "neoforge-21.1.236", {"inheritsFrom": "1.21.1"})
+    service = InstalledComponentsService(tmp_path)
+    inspected = []
+    scan = service._directory_stats
+    monkeypatch.setattr(service, "_directory_stats", lambda path: inspected.append(path.name) or scan(path))
+    component = service.get_component("1.21.1")
+    assert component.dependent_components == ("neoforge-21.1.236",)
+    assert inspected == ["1.21.1"]
 
 
 def test_profile_component_refreshes_managed_java_for_vanilla(tmp_path: Path):

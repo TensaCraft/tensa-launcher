@@ -11,11 +11,9 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
-import minecraft_launcher_lib
 import minecraft_launcher_lib._helper as minecraft_launcher_helper
 
 from launcher.application.java_runtime import JavaRuntimeService
@@ -30,11 +28,6 @@ class IntegrityError(Exception):
 
 class IntegrityChecker:
     """Перевіряє цілісність Minecraft компонентів."""
-
-    _installed_cache = {"timestamp": 0.0, "versions": set()}
-    # Scanning the versions directory can be expensive on Windows (AV + large installs).
-    # Cache longer; we don't expect external installs/uninstalls during a launcher session.
-    _installed_cache_ttl = 300.0
 
     def __init__(self, minecraft_dir: Path):
         self.minecraft_dir = Path(minecraft_dir)
@@ -161,43 +154,56 @@ class IntegrityChecker:
     # ================================================================
 
     def _is_version_installed(self, version_id: str) -> bool:
-        """Перевіряє чи версія встановлена використовуючи minecraft_launcher_lib."""
-        try:
-            now = time.time()
-            cache = self._installed_cache
-            if (now - cache["timestamp"]) > self._installed_cache_ttl:
-                installed_versions = minecraft_launcher_lib.utils.get_installed_versions(
-                    str(self.minecraft_dir)
-                )
-                cache["versions"] = {
-                    version.get('id')
-                    for version in installed_versions
-                    if version.get('id')
-                }
-                cache["timestamp"] = now
-
-            if version_id in cache["versions"]:
-                return True
-
-            Logger.debug(f"Version {version_id} not found in installed versions")
+        """Read only the requested manifest; component verification remains separate."""
+        if not version_id or version_id in {".", ".."} or any(char in version_id for char in "/\\:\0"):
             return False
-        except Exception as e:
-            Logger.error(f"Failed to get installed versions: {e}")
-            # Fallback на перевірку файлів
-            version_dir = self.minecraft_dir / "versions" / version_id
-            return version_dir.exists()
 
-    def _check_version_manifest(self, version_id: str) -> bool:
-        """Перевіряє наявність та валідність JSON маніфесту версії."""
         version_json = self.minecraft_dir / "versions" / version_id / f"{version_id}.json"
-
-        if not version_json.exists():
-            Logger.debug(f"Version manifest not found: {version_json}")
-            return False
-
         try:
             with open(version_json, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeError) as e:
+            Logger.debug(f"Version manifest unavailable for {version_id}: {e}")
+            return False
+
+        return isinstance(data, dict) and data.get('id') == version_id
+
+    def _load_version_manifest(self, version_id: str) -> Dict[str, Any]:
+        """Validate local parents, then use the same metadata merge as MLL launch."""
+        data = None
+        current_id = version_id
+        seen = set()
+        try:
+            while True:
+                if (
+                    not isinstance(current_id, str) or not current_id or current_id in {".", ".."}
+                    or any(char in current_id for char in "/\\:\0") or current_id in seen
+                ):
+                    raise ValueError(f"Invalid or cyclic version inheritance: {current_id!r}")
+                seen.add(current_id)
+                path = self.minecraft_dir / "versions" / current_id / f"{current_id}.json"
+                with open(path, 'r', encoding='utf-8') as f:
+                    current = json.load(f)
+                if not isinstance(current, dict) or current.get('id') != current_id:
+                    raise ValueError(f"Invalid version manifest: {path}")
+                if data is None:
+                    data = current
+                if 'inheritsFrom' not in current:
+                    break
+                current_id = current['inheritsFrom']
+
+            # MLL 8.0 merges one parent at launch; do not invent different merge semantics.
+            # Avoid get_client_json(), which may fetch remote metadata for missing files.
+            if 'inheritsFrom' in data:
+                return dict(minecraft_launcher_helper.inherit_json(cast(Any, data), self.minecraft_dir))
+            return data
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+            raise IntegrityError(f"Failed to load local metadata for {version_id}: {e}") from e
+
+    def _check_version_manifest(self, version_id: str) -> bool:
+        """Перевіряє наявність та валідність JSON маніфесту версії."""
+        try:
+            data = self._load_version_manifest(version_id)
 
             # Перевірка обов'язкових полів
             required_fields = ['id', 'type', 'mainClass', 'libraries']
@@ -207,35 +213,33 @@ class IntegrityChecker:
                     return False
 
             return True
-        except (json.JSONDecodeError, IOError) as e:
+        except IntegrityError as e:
             Logger.debug(f"Failed to read version manifest: {e}")
             return False
 
     def _check_version_jar(self, version_id: str) -> bool:
         """Перевіряє наявність JAR файлу версії."""
-        version_jar = self.minecraft_dir / "versions" / version_id / f"{version_id}.jar"
-
-        if not version_jar.exists():
-            Logger.debug(f"Version JAR not found: {version_jar}")
+        try:
+            data = self._load_version_manifest(version_id)
+            jar_id = data.get('jar', version_id)
+            if (
+                not isinstance(jar_id, str) or not jar_id or jar_id in {".", ".."}
+                or any(char in jar_id for char in "/\\:\0")
+            ):
+                raise IntegrityError(f"Invalid JAR version id: {jar_id!r}")
+            version_jar = self.minecraft_dir / "versions" / jar_id / f"{jar_id}.jar"
+            if not version_jar.is_file() or version_jar.stat().st_size == 0:
+                Logger.debug(f"Version JAR missing or empty: {version_jar}")
+                return False
+            return True
+        except (IntegrityError, OSError) as e:
+            Logger.debug(f"Failed to check version JAR: {e}")
             return False
-
-        # Перевірка що файл не порожній
-        if version_jar.stat().st_size == 0:
-            Logger.debug(f"Version JAR is empty: {version_jar}")
-            return False
-
-        return True
 
     def _check_libraries(self, version_id: str) -> bool:
         """Перевіряє наявність всіх бібліотек."""
-        version_json = self.minecraft_dir / "versions" / version_id / f"{version_id}.json"
-
-        if not version_json.exists():
-            return False
-
         try:
-            with open(version_json, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            data = self._load_version_manifest(version_id)
 
             libraries = data.get('libraries', [])
             missing_libraries = []
@@ -390,6 +394,8 @@ class IntegrityChecker:
         path = artifact.get('path')
 
         if not path:
+            if lib.get('name'):
+                return Path(minecraft_launcher_helper.get_library_path(lib['name'], self.minecraft_dir))
             return None
 
         return self.minecraft_dir / "libraries" / path

@@ -41,7 +41,7 @@ class JavaRuntimeService:
         if version_id.startswith("neoforge-"):
             return version_id[9:]
 
-        return version_id.split("-")[0]
+        return version_id
 
     @staticmethod
     def _extract_mod_loader_minecraft_version(version_id: str) -> str | None:
@@ -49,16 +49,14 @@ class JavaRuntimeService:
             if not version_id.startswith(prefix):
                 continue
             value = version_id[len(prefix):]
-            known_version = JavaRuntimeService._match_known_minecraft_suffix(value)
-            if known_version:
-                return known_version
             for pattern in (
-                r"(?:(?<=-)|^)(\d+(?:\.\d+)+(?:-snapshot-\d+)?)$",
+                r"(?:(?<=-)|^)(\d+(?:\.\d+)+(?:-(?:snapshot-\d+|pre\d+|rc\d+))?)$",
                 r"(?:(?<=-)|^)(\d{2}w\d{2}[a-z])$",
             ):
                 match = re.search(pattern, value)
                 if match:
                     return match.group(1)
+            return JavaRuntimeService._match_known_minecraft_suffix(value)
         return None
 
     @staticmethod

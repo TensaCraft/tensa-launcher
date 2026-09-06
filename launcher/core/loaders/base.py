@@ -432,14 +432,12 @@ class BaseLoader(ABC):
         """Run minecraft-launcher-lib's base Minecraft installer."""
         mc_version = self._validated_version_id(mc_version, label="Minecraft version id")
         self.minecraft_dir.mkdir(parents=True, exist_ok=True)
-        IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
         install_minecraft_version_with_retries(
             mc_version,
             self.minecraft_dir,
             callback=self._install_callbacks(operation),
             attempts=self.MINECRAFT_INSTALL_ATTEMPTS,
         )
-        IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     def _minecraft_status(self, key: str, mc_version: str, fallback: str) -> str:
         trans = getattr(self.app, "trans", None)
@@ -513,7 +511,6 @@ class BaseLoader(ABC):
             self._install_minecraft_if_needed(mc_version, force_check=force_check, operation=operation)
         else:
             self._install_minecraft_if_needed(mc_version, force_check=force_check)
-        IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
         # Check whether the exact loader version is already installed
         installed_version_name = self._validated_version_id(
@@ -636,7 +633,6 @@ class BaseLoader(ABC):
                     f"{attempt}/{self.MOD_LOADER_INSTALL_ATTEMPTS} failed; retrying. "
                     f"{self._format_mod_loader_install_error(exc)}"
                 )
-                IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
                 try:
                     self._install_minecraft_if_needed(mc_version, force_check=True, operation=operation)
                 except Exception as repair_exc:

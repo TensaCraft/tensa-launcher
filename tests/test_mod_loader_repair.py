@@ -123,7 +123,6 @@ def test_neoforge_verify_does_not_rerun_installer_when_generated_client_artifact
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     version_id = "neoforge-21.1.228"
     mc_version = "1.21.1"
@@ -172,11 +171,6 @@ def test_neoforge_verify_does_not_rerun_installer_when_generated_client_artifact
         """,
     )
 
-    monkeypatch.setattr(
-        "minecraft_launcher_lib.utils.get_installed_versions",
-        lambda _minecraft_dir: [{"id": version_id}, {"id": mc_version}],
-    )
-
     loader = NeoForgeLoader(app=fake_app)
     loader.install_callback = lambda: {}
     loader.get_version_java_path = lambda _mc_version: "C:/LauncherJava/bin/java.exe"
@@ -215,7 +209,6 @@ def test_install_mod_loader_uses_requested_neoforge_version_instead_of_latest(fa
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -294,7 +287,6 @@ def test_install_mod_loader_ignores_external_java_path_for_installer(fake_app, m
     fake_app.util.minecraft_dir = minecraft_dir
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -329,7 +321,6 @@ def test_install_mod_loader_creates_minecraft_directory_before_fabric_installer(
     fake_app.util.minecraft_dir = minecraft_dir
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -361,7 +352,6 @@ def test_fabric_installer_process_output_is_captured(fake_app, monkeypatch, tmp_
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeBase:
         def get_installer_url(self, _mc_version, _loader_version):
@@ -646,7 +636,6 @@ def test_install_mod_loader_retries_incomplete_read_during_library_install(fake_
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -746,9 +735,12 @@ def test_vanilla_verify_trusts_installed_version_without_library_check(fake_app,
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
+    _write_json(
+        minecraft_dir / "versions" / "1.21.1" / "1.21.1.json",
+        json.dumps({"id": "1.21.1", "type": "release", "releaseTime": "2024-08-08T12:00:00+00:00"}),
+    )
 
     loader = MinecraftLoader(app=fake_app)
-    monkeypatch.setattr(loader.integrity_checker, "_is_version_installed", lambda _version_id: True)
     check_calls = []
     repairs = []
 
@@ -775,7 +767,6 @@ def test_install_mod_loader_repairs_base_minecraft_after_missing_library(fake_ap
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -829,7 +820,6 @@ def test_install_mod_loader_retries_neoforge_installer_process_failure(fake_app,
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -895,7 +885,6 @@ def test_install_mod_loader_refreshes_existing_neoforge_with_missing_libraries(f
     )
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -928,7 +917,6 @@ def test_install_mod_loader_requires_managed_java_before_installer(fake_app, mon
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -957,7 +945,6 @@ def test_install_mod_loader_repairs_managed_java_after_windows_loader_failure(fa
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     class FakeModLoader:
         def get_latest_loader_version(self, _mc_version):
@@ -1002,7 +989,6 @@ def test_install_mod_loader_suppresses_windows_error_dialogs(fake_app, monkeypat
     games_dir.mkdir(exist_ok=True)
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     events = []
 
@@ -1046,7 +1032,6 @@ def test_install_mod_loader_exposes_launcher_java_bin_to_installer_process(fake_
     java_path.write_bytes(b"exe")
     monkeypatch.setattr("launcher.core.loaders.base.util.minecraft_dir", str(minecraft_dir))
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
-    integrity_module.IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     observed_env = []
 

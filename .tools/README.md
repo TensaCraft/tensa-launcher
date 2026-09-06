@@ -48,6 +48,16 @@ python .tools/run_compile.py
 git diff --check
 ```
 
+Repeatable content scan benchmark (uses temporary fixtures, not player data):
+
+```bash
+python .tools/benchmark_content.py --mods 200
+```
+
+This reports median times for cold/repeated local JAR metadata scans and installed
+component discovery. It excludes downloads, content hash verification, and UI
+rendering; these numbers are not total launcher startup times.
+
 Git hooks:
 
 ```bash

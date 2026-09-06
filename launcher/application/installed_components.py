@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from launcher.application.tensacraft_profile_identity import TensaCraftProfileIdentity
+from launcher.application.version_profile_state import capture_version_profile, restore_version_profile
 from launcher.core.integrity import IntegrityChecker
 from launcher.models.logger import Logger
 
@@ -102,7 +105,6 @@ class InstalledComponentsService:
             return
         self._read_component_manifest(target, requested_id=version_id)
         shutil.rmtree(target)
-        self._clear_installed_cache()
 
     def verify_component(self, component: InstalledComponent) -> dict[str, Any]:
         self._validate_component_reference(component)
@@ -148,7 +150,6 @@ class InstalledComponentsService:
         else:
             raise ValueError(f"Unsupported component loader: {loader_id}")
 
-        self._clear_installed_cache()
         component = self.get_component(installed_version_id)
         if component is None:
             raise FileNotFoundError(f"Installed component not found: {installed_version_id}")
@@ -209,9 +210,15 @@ class InstalledComponentsService:
 
     def get_component(self, version_id: str) -> InstalledComponent | None:
         identity = self._identity_key(self._validated_component_id(version_id))
-        for component in self.list_installed():
-            if self._identity_key(component.version_id) == identity:
-                return component
+        manifests = list(self._installed_manifests())
+        for stored_id, version_dir, manifest in manifests:
+            if self._identity_key(stored_id) == identity:
+                return self._build_component(
+                    version_dir=version_dir,
+                    manifest=manifest,
+                    used_by=self._profile_usage().get(stored_id, ()),
+                    dependent_components=self._dependent_components(manifests).get(stored_id, ()),
+                )
         return None
 
     @classmethod
@@ -265,6 +272,7 @@ class InstalledComponentsService:
     ) -> InstalledComponent:
         version_id = str(manifest.get("id") or version_dir.name)
         kind, minecraft_version, loader_version = self._classify_manifest(version_id, manifest)
+        size_bytes, modified_at = self._directory_stats(version_dir)
         return InstalledComponent(
             version_id=version_id,
             kind=kind,
@@ -273,8 +281,8 @@ class InstalledComponentsService:
             loader_version=loader_version,
             inherits_from=self._manifest_inherits_from(manifest),
             path=version_dir,
-            size_bytes=self._directory_size(version_dir),
-            modified_at=self._modified_at(version_dir),
+            size_bytes=size_bytes,
+            modified_at=modified_at,
             used_by=tuple(sorted({name for name in used_by if name})),
             dependent_components=tuple(sorted({name for name in dependent_components if name})),
         )
@@ -462,22 +470,34 @@ class InstalledComponentsService:
         return expected_path
 
     @staticmethod
-    def _directory_size(path: Path) -> int:
+    def _directory_stats(path: Path) -> tuple[int, float | None]:
         total = 0
+        modified_at = None
+        pending = [path]
+        while pending:
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                            if entry.is_symlink() or entry.is_junction():
+                                continue
+                            modified_at = max(modified_at or info.st_mtime, info.st_mtime)
+                            if stat.S_ISDIR(info.st_mode):
+                                pending.append(Path(entry.path))
+                            elif stat.S_ISREG(info.st_mode):
+                                total += info.st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
         try:
-            for item in path.rglob("*"):
-                if item.is_file():
-                    total += item.stat().st_size
+            if modified_at is None:
+                modified_at = path.stat().st_mtime
         except OSError:
-            return total
-        return total
-
-    @staticmethod
-    def _modified_at(path: Path) -> float | None:
-        try:
-            return max((item.stat().st_mtime for item in path.rglob("*")), default=path.stat().st_mtime)
-        except OSError:
-            return None
+            return total, None
+        return total, modified_at
 
     @staticmethod
     def _component_sort_key(component: InstalledComponent) -> tuple[int, str]:
@@ -526,21 +546,25 @@ class InstalledComponentsService:
         *,
         operation: Any | None = None,
     ) -> None:
-        version.version = component.minecraft_version or component.version_id
-        version.loader = component.version_id
-        version.client = component.loader_name
-        version.loader_version = component.loader_version
-        self._apply_runtime_path(version, component, operation=operation)
-        version.save()
+        previous = capture_version_profile(version)
+        managed = TensaCraftProfileIdentity.is_managed(version, minecraft_dir=self.minecraft_dir)
+        try:
+            version.version = component.minecraft_version or component.version_id
+            version.loader = component.version_id
+            if managed:
+                TensaCraftProfileIdentity.mark(version, TensaCraftProfileIdentity.pack_id(version))
+            else:
+                version.client = component.loader_name
+            version.loader_version = component.loader_version
+            self._apply_runtime_path(version, component, operation=operation)
+            version.save()
+        except Exception:
+            restore_version_profile(version, previous)
+            raise
 
     def _get_loader(self, loader_id: str) -> Any:
         if self._loader_provider is None:
             raise RuntimeError("A launcher loader provider is required for component installation")
         return self._loader_provider(loader_id)
-
-    @staticmethod
-    def _clear_installed_cache() -> None:
-        IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
-
 
 __all__ = ["InstalledComponent", "InstalledComponentsService"]

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import shutil
+import stat
+from collections import OrderedDict
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from typing import Any, Sequence
 
 from launcher.application.mod_identity import (
@@ -21,10 +24,14 @@ class VersionContentService:
     MODRINTH_METADATA_FILE = "modrinth-content.json"
     MODRINTH_METADATA_SCHEMA_VERSION = 2
     IRIS_PROPERTIES_FILE = "iris.properties"
+    MOD_METADATA_CACHE_SIZE = 512
+    MOD_METADATA_MAX_CHARS = 4096
 
     def __init__(self, minecraft_dir: str | Path, logger) -> None:
         self.minecraft_dir = Path(minecraft_dir)
         self.log = logger
+        self._mod_metadata: OrderedDict[Path, tuple[tuple[int, ...], dict[str, Any]]] = OrderedDict()
+        self._metadata_lock = Lock()
 
     def _log(self, level: str, message: str) -> None:
         logger_method = getattr(self.log, level, None)
@@ -74,30 +81,23 @@ class VersionContentService:
             return []
 
         mods: list[dict[str, Any]] = []
-        seen_files: set[str] = set()
-
-        for mod_file in mods_dir.glob("*.jar"):
-            if mod_file.name.endswith(".disabled"):
+        for mod_file in mods_dir.iterdir():
+            name = mod_file.name.lower()
+            if not name.endswith((".jar", ".jar.disabled")):
                 continue
-            mod_info = {
-                "filename": mod_file.name,
-                "path": str(mod_file),
-                "size": mod_file.stat().st_size,
-                "enabled": True,
-            }
-            mod_info.update(self.read_mod_metadata(mod_file))
-            mods.append(mod_info)
-            seen_files.add(mod_file.stem)
-
-        for mod_file in mods_dir.glob("*.jar.disabled"):
-            base_name = mod_file.name[:-9]
-            if base_name in seen_files:
+            try:
+                file_stat = mod_file.stat()
+            except OSError as exc:
+                self._log("debug", f"Unable to inspect mod {mod_file.name}: {exc}")
                 continue
+            if not stat.S_ISREG(file_stat.st_mode):
+                continue
+            enabled = not name.endswith(".disabled")
             mod_info = {
-                "filename": base_name,
+                "filename": mod_file.name if enabled else mod_file.name[:-9],
                 "path": str(mod_file),
-                "size": mod_file.stat().st_size,
-                "enabled": False,
+                "size": file_stat.st_size,
+                "enabled": enabled,
             }
             mod_info.update(self.read_mod_metadata(mod_file))
             mods.append(mod_info)
@@ -156,60 +156,46 @@ class VersionContentService:
             return []
 
         packs: list[dict[str, Any]] = []
-        seen_files: set[str] = set()
-
-        for pack_file in directory.glob("*.zip"):
-            if pack_file.name.endswith(".disabled"):
+        for path in directory.iterdir():
+            name = path.name
+            try:
+                info = path.stat()
+                folder = stat.S_ISDIR(info.st_mode)
+                if folder:
+                    if name.startswith("."):
+                        continue
+                    size = 0
+                    for child in path.rglob("*"):
+                        try:
+                            child_info = child.stat()
+                            if stat.S_ISREG(child_info.st_mode):
+                                size += child_info.st_size
+                        except OSError as exc:
+                            self._log("debug", f"Unable to inspect pack entry {child}: {exc}")
+                    disabled = False
+                    default = not (directory / f"{name}.disabled").exists()
+                else:
+                    if not stat.S_ISREG(info.st_mode) or not name.lower().endswith((".zip", ".zip.disabled")):
+                        continue
+                    size = info.st_size
+                    disabled = name.lower().endswith(".disabled")
+                    if disabled:
+                        name = name[:-9]
+                    default = True
+            except OSError as exc:
+                self._log("debug", f"Unable to inspect pack {path}: {exc}")
                 continue
             packs.append(
                 {
-                    "filename": pack_file.name,
-                    "path": str(pack_file),
-                    "size": pack_file.stat().st_size,
-                    "type": file_type,
+                    "filename": name,
+                    "path": str(path),
+                    "size": size,
+                    "type": folder_type if folder else file_type,
                     "content_type": content_type,
-                    "enabled": self._pack_enabled(
-                        pack_file.name,
+                    "enabled": not disabled and self._pack_enabled(
+                        name,
                         enabled_entries,
-                        default=True,
-                        enabled_by_name=enabled_by_name,
-                    ),
-                    "toggle_supported": toggle_supported,
-                }
-            )
-            seen_files.add(pack_file.stem)
-
-        for pack_file in directory.glob("*.zip.disabled"):
-            base_name = pack_file.name[:-9]
-            if base_name in seen_files:
-                continue
-            packs.append(
-                {
-                    "filename": base_name,
-                    "path": str(pack_file),
-                    "size": pack_file.stat().st_size,
-                    "type": file_type,
-                    "content_type": content_type,
-                    "enabled": False,
-                    "toggle_supported": toggle_supported,
-                }
-            )
-
-        for pack_dir in directory.iterdir():
-            if not pack_dir.is_dir() or pack_dir.name.startswith("."):
-                continue
-            disabled_marker = directory / f"{pack_dir.name}.disabled"
-            packs.append(
-                {
-                    "filename": pack_dir.name,
-                    "path": str(pack_dir),
-                    "size": sum(file.stat().st_size for file in pack_dir.rglob("*") if file.is_file()),
-                    "type": folder_type,
-                    "content_type": content_type,
-                    "enabled": self._pack_enabled(
-                        pack_dir.name,
-                        enabled_entries,
-                        default=not disabled_marker.exists(),
+                        default=default,
                         enabled_by_name=enabled_by_name,
                     ),
                     "toggle_supported": toggle_supported,
@@ -448,18 +434,47 @@ class VersionContentService:
         return file_path
 
     def read_mod_metadata(self, jar_path: Path) -> dict[str, Any]:
+        # Display metadata only; ownership and installation still verify the file hash.
+        key = jar_path.absolute()
+        fingerprint = self._metadata_fingerprint(jar_path)
+        with self._metadata_lock:
+            cached = self._mod_metadata.get(key)
+            if fingerprint is not None and cached is not None and cached[0] == fingerprint:
+                self._mod_metadata.move_to_end(key)
+                return dict(cached[1])
+            self._mod_metadata.pop(key, None)
+
         inspection = inspect_mod_jar(jar_path)
         descriptor = inspection.primary_descriptor
         if descriptor is None:
             reason = inspection.error_kind.value if inspection.error_kind is not None else "missing descriptor"
             self._log("debug", f"Failed to read mod metadata from {jar_path.name}: {reason}")
             return {}
-        return {
+        metadata = {
             "name": descriptor.name or "",
             "version": descriptor.version or "",
             "description": descriptor.description or "",
             "id": descriptor.mod_id,
         }
+        if (
+            fingerprint is not None
+            and sum(len(value) for value in metadata.values()) <= self.MOD_METADATA_MAX_CHARS
+            and fingerprint == self._metadata_fingerprint(jar_path)
+        ):
+            with self._metadata_lock:
+                self._mod_metadata[key] = (fingerprint, dict(metadata))
+                self._mod_metadata.move_to_end(key)
+                while len(self._mod_metadata) > self.MOD_METADATA_CACHE_SIZE:
+                    self._mod_metadata.popitem(last=False)
+        return metadata
+
+    @staticmethod
+    def _metadata_fingerprint(path: Path) -> tuple[int, ...] | None:
+        try:
+            info = path.stat()
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
     def toggle_mod(self, mod: dict[str, Any]) -> bool:
         mod_path = Path(mod["path"])

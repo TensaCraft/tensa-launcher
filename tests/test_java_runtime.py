@@ -62,6 +62,24 @@ def test_java_runtime_extracts_minecraft_versions():
     assert service.extract_minecraft_version("neoforge-20.4.170-beta") == "20.4.170-beta"
 
 
+def test_java_version_parsing_preserves_prereleases_without_network(monkeypatch):
+    requests = []
+    monkeypatch.setattr(
+        "minecraft_launcher_lib.utils.get_version_list",
+        lambda: requests.append(True) or [],
+    )
+    for raw, expected in (
+        ("1.21.1-pre1", "1.21.1-pre1"),
+        ("26.2-snapshot-7", "26.2-snapshot-7"),
+        ("fabric-loader-0.19.1-1.21.1-rc1", "1.21.1-rc1"),
+        ("fabric-loader-0.19.1-1.21.1", "1.21.1"),
+        ("quilt-loader-0.30.0-beta.7-26.2-snapshot-7", "26.2-snapshot-7"),
+        ("fabric-loader-0.17.0-beta-25w20a", "25w20a"),
+    ):
+        assert JavaRuntimeService.extract_minecraft_version(raw) == expected
+    assert requests == []
+
+
 def test_java_runtime_finds_java_executable(tmp_path: Path):
     runtime_dir = tmp_path / "runtime" / "java-runtime" / "bin"
     runtime_dir.mkdir(parents=True)

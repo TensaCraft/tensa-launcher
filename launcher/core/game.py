@@ -32,6 +32,7 @@ from launcher.platform.java_process import java_process_env
 WINDOWS_CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 EARLY_EXIT_SECONDS = 5.0
 LOG_TAIL_LINES = 40
+LOG_TAIL_MAX_BYTES = 256 * 1024
 LAUNCH_DIAGNOSTICS_LOG = "tensalauncher-launch.log"
 LAUNCH_COOLDOWN_SECONDS = 3.0
 REPAIR_SYNC_DIAGNOSIS_KINDS = {"missing_mod_dependency", "locked_file"}
@@ -209,8 +210,6 @@ class Game:
                         return False
                 else:
                     loader.install(v, loader_version=v.loader_version)
-                    self._invalidate_installed_versions_cache()
-                self._invalidate_installed_versions_cache()
                 if not chk._is_version_installed(v.loader):
                     return False
                 if key in self.TECHNICAL_MOD_LOADERS and not self._technical_loader_ready_for_launch(chk, v.loader):
@@ -291,7 +290,6 @@ class Game:
             installer(mc_version, operation=operation)
         else:
             installer(mc_version)
-        self._invalidate_installed_versions_cache()
         return bool(chk._is_version_installed(mc_version))
 
     def _technical_loader_ready_for_launch(self, chk: object, version_id: str) -> bool:
@@ -321,12 +319,6 @@ class Game:
         return (version_dir / self.INCOMPLETE_INSTALL_MARKER).exists() and not (
             version_dir / self.SUCCESSFUL_INSTALL_MARKER
         ).exists()
-
-    @staticmethod
-    def _invalidate_installed_versions_cache() -> None:
-        from launcher.core.integrity import IntegrityChecker
-
-        IntegrityChecker._installed_cache = {"timestamp": 0.0, "versions": set()}
 
     # ------------------------------------------------------------------
     # Options
@@ -964,11 +956,16 @@ class Game:
         )
 
     def _tail_text(self, path: Optional[Path], max_lines: int = LOG_TAIL_LINES) -> str:
-        if path is None or not path.exists() or not path.is_file():
+        if path is None or max_lines <= 0:
             return ""
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception as exc:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - LOG_TAIL_MAX_BYTES))
+                lines = handle.read(LOG_TAIL_MAX_BYTES).decode("utf-8", errors="replace").splitlines()
+        except (FileNotFoundError, IsADirectoryError):
+            return ""
+        except OSError as exc:
             return f"Unable to read {path}: {exc!r}"
         return "\n".join(lines[-max_lines:]).strip()
 

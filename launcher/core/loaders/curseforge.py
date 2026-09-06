@@ -70,7 +70,7 @@ class CurseForgeLoader(BaseLoader):
                 override_entry_size=self.MAX_OVERRIDE_ENTRY_SIZE,
                 override_total_size=self.MAX_OVERRIDE_TOTAL_SIZE,
             ),
-            downloader_factory=lambda **kwargs: AsyncDownloader(**kwargs),
+            downloader_factory=AsyncDownloader,
             progress_callback=progress_callback,
         )
 

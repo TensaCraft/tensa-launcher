@@ -11,6 +11,17 @@ from launcher.application.launch_diagnostics import classify_launch_failure
 from launcher.core.game import Game
 
 
+def test_log_tail_bounds_large_lines_and_keeps_last_lines(fake_app, tmp_path):
+    path = tmp_path / "latest.log"
+    path.write_bytes(b"x" * (2 * 1024 * 1024) + b"\nfinal error\n")
+    game = Game(fake_app)
+    tail = game._tail_text(path)
+    assert tail.endswith("final error")
+    assert len(tail) <= 256 * 1024
+    assert game._tail_text(path, max_lines=1) == "final error"
+    assert game._tail_text(path, max_lines=0) == ""
+
+
 def test_game_launch_logs_early_process_exit(fake_app, monkeypatch, tmp_path):
     game_dir = tmp_path / "game"
     game_dir.mkdir()
