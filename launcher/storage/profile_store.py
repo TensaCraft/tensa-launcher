@@ -4,6 +4,7 @@ import hashlib
 import json
 import uuid
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from cryptography.fernet import Fernet
@@ -24,6 +25,7 @@ class Profiles:
     def __init__(self, app, storage_dir: Path | None = None) -> None:
         self.app = app
         self.storage_path = Path(storage_dir or self.app.util.app_state_dir) / "profiles.json"
+        self._lock = RLock()
         secret: str | bytes | None = None
         self.cipher_suite: Fernet | None = None
         self.encryption_error: CredentialEncryptionUnavailableError | None = None
@@ -218,7 +220,7 @@ class Profiles:
             return {}
         try:
             profiles = json.loads(self.storage_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self.app.log.error("Profiles file is corrupted; starting with empty profiles")
             return {}
         if not isinstance(profiles, dict):
@@ -239,60 +241,64 @@ class Profiles:
         return True
 
     def create_profile(self, profile_key: str, auth_data: dict[str, Any]) -> dict[str, Any]:
-        if not profile_key.strip():
-            self.app.log.error("Profile name is empty")
-            return {"status": False, "text": self.app.trans("profile_name_empty")}
-        auth_data = auth_data.copy()
-        if "id" not in auth_data:
-            auth_data["id"] = self.generate_offline_player_uuid(auth_data["name"])
-        candidate = {key: profile.copy() for key, profile in self.profiles.items()}
-        for profile in candidate.values():
-            profile["default"] = False
-        auth_data["default"] = True
-        secured_profile = self._encrypt_data(auth_data)
-        candidate[profile_key] = secured_profile
-        if not self._replace_profiles(candidate):
-            return {"status": False, "text": self.app.trans("profile_save_failed")}
-        if secured_profile.get("reauth_reason") == self.ENCRYPTION_UNAVAILABLE_REASON:
-            return {"status": False, "text": self.app.trans("profile_reauth_required")}
-        return {"status": True, "text": self.app.trans("profile_created")}
+        with self._lock:
+            if not profile_key.strip():
+                self.app.log.error("Profile name is empty")
+                return {"status": False, "text": self.app.trans("profile_name_empty")}
+            auth_data = auth_data.copy()
+            if "id" not in auth_data:
+                auth_data["id"] = self.generate_offline_player_uuid(auth_data["name"])
+            candidate = {key: profile.copy() for key, profile in self.profiles.items()}
+            for profile in candidate.values():
+                profile["default"] = False
+            auth_data["default"] = True
+            secured_profile = self._encrypt_data(auth_data)
+            candidate[profile_key] = secured_profile
+            if not self._replace_profiles(candidate):
+                return {"status": False, "text": self.app.trans("profile_save_failed")}
+            if secured_profile.get("reauth_reason") == self.ENCRYPTION_UNAVAILABLE_REASON:
+                return {"status": False, "text": self.app.trans("profile_reauth_required")}
+            return {"status": True, "text": self.app.trans("profile_created")}
 
     def edit_profile(self, profile_key: str, new_data: dict[str, Any]) -> dict[str, Any]:
-        if profile_key not in self.profiles:
-            return {"status": False, "text": self.app.trans("profile_not_found", profile_key=profile_key)}
-        if not new_data:
-            return {"status": False, "text": self.app.trans("no_update_data")}
-        profile = self._decrypt_data(self.profiles[profile_key])
-        self._preserve_failed_token_values(profile_key, profile, new_data)
-        profile.update(new_data)
-        candidate = {key: value.copy() for key, value in self.profiles.items()}
-        candidate[profile_key] = self._encrypt_data(profile)
-        if not self._replace_profiles(candidate):
-            return {"status": False, "text": self.app.trans("profile_save_failed")}
-        return {"status": True, "text": self.app.trans("profile_updated", profile_key=profile_key)}
+        with self._lock:
+            if profile_key not in self.profiles:
+                return {"status": False, "text": self.app.trans("profile_not_found", profile_key=profile_key)}
+            if not new_data:
+                return {"status": False, "text": self.app.trans("no_update_data")}
+            profile = self._decrypt_data(self.profiles[profile_key])
+            self._preserve_failed_token_values(profile_key, profile, new_data)
+            profile.update(new_data)
+            candidate = {key: value.copy() for key, value in self.profiles.items()}
+            candidate[profile_key] = self._encrypt_data(profile)
+            if not self._replace_profiles(candidate):
+                return {"status": False, "text": self.app.trans("profile_save_failed")}
+            return {"status": True, "text": self.app.trans("profile_updated", profile_key=profile_key)}
 
     def get_profile(self, profile_key: str) -> dict[str, Any]:
         return self._decrypt_data(self.profiles.get(profile_key, {}))
 
     def delete_profile(self, profile_key: str) -> bool:
-        if profile_key not in self.profiles:
-            return False
-        candidate = {
-            key: profile.copy()
-            for key, profile in self.profiles.items()
-            if key != profile_key
-        }
-        if len(candidate) == 1:
-            next(iter(candidate.values()))["default"] = True
-        return self._replace_profiles(candidate)
+        with self._lock:
+            if profile_key not in self.profiles:
+                return False
+            candidate = {
+                key: profile.copy()
+                for key, profile in self.profiles.items()
+                if key != profile_key
+            }
+            if len(candidate) == 1:
+                next(iter(candidate.values()))["default"] = True
+            return self._replace_profiles(candidate)
 
     def set_default_profile(self, default_profile_id: str) -> bool:
-        if default_profile_id not in self.profiles:
-            return False
-        candidate = {key: profile.copy() for key, profile in self.profiles.items()}
-        for profile_key, profile in candidate.items():
-            profile["default"] = profile_key == default_profile_id
-        return self._replace_profiles(candidate)
+        with self._lock:
+            if default_profile_id not in self.profiles:
+                return False
+            candidate = {key: profile.copy() for key, profile in self.profiles.items()}
+            for profile_key, profile in candidate.items():
+                profile["default"] = profile_key == default_profile_id
+            return self._replace_profiles(candidate)
 
     def get_default_profile(self, return_key: bool = False):
         for key, profile in self.profiles.items():

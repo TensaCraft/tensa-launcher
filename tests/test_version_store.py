@@ -258,3 +258,101 @@ def test_prepared_version_is_persisted_only_after_successful_save(tmp_path: Path
         ).get("demo")
         is not None
     )
+
+
+@pytest.mark.parametrize("payload", [None, [], [1], "invalid", 42, True])
+def test_load_skips_invalid_version_records_and_retains_valid_records(tmp_path: Path, payload: object) -> None:
+    path = tmp_path / "versions.json"
+    path.write_text(json.dumps({"invalid": payload, "valid": {"name": "Valid"}}), encoding="utf-8")
+
+    store = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft")
+
+    assert [version.version_id for version in store.all()] == ["valid"]
+    assert json.loads(path.read_text(encoding="utf-8"))["invalid"] == payload
+
+
+@pytest.mark.parametrize("options", [[1], "invalid", 42, True])
+def test_load_recovers_invalid_options_without_discarding_version(tmp_path: Path, options: object) -> None:
+    path = tmp_path / "versions.json"
+    path.write_text(json.dumps({"demo": {"name": "Demo", "options": options}}), encoding="utf-8")
+
+    version = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft").get("demo")
+
+    assert version is not None
+    assert version.name == "Demo"
+    assert version.options == {"gpuMode": "dgpu"}
+
+
+def test_invalid_utf8_versions_loads_as_empty(tmp_path: Path) -> None:
+    (tmp_path / "versions.json").write_bytes(b"\xff")
+
+    assert Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft").all() == []
+
+
+def test_save_preserves_external_version_fields_and_option_edits(tmp_path: Path) -> None:
+    path = tmp_path / "versions.json"
+    path.write_text(
+        json.dumps({"demo": {"name": "Demo", "future_field": True, "options": {"local": 1, "other": 1}}}),
+        encoding="utf-8",
+    )
+    store = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft")
+    version = store.get("demo")
+    assert version is not None
+    external = json.loads(path.read_text(encoding="utf-8"))
+    external["demo"].update({"name": "External name", "future_field": {"changed": True}})
+    external["demo"]["options"].update({"other": 2, "external": True})
+    path.write_text(json.dumps(external), encoding="utf-8")
+    version.options["local"] = 2
+
+    version.save()
+    version.save()
+
+    saved = json.loads(path.read_text(encoding="utf-8"))["demo"]
+    assert saved["name"] == "External name"
+    assert saved["future_field"] == {"changed": True}
+    assert saved["options"]["other"] == 2
+    assert saved["options"]["external"] is True
+    assert saved["options"]["local"] == 2
+
+
+@pytest.mark.parametrize("corrupted", [b"{", b"[]", b"\xff"])
+def test_save_recovers_cached_versions_when_file_is_corrupt(tmp_path: Path, corrupted: bytes) -> None:
+    store = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft")
+    first = Version("first", {"name": "First"})
+    store.add(first)
+    store.add(Version("second", {"name": "Second"}))
+    store.filepath.write_bytes(corrupted)
+    first.name = "Renamed"
+
+    first.save()
+
+    saved = json.loads(store.filepath.read_text(encoding="utf-8"))
+    assert set(saved) == {"first", "second"}
+    assert saved["first"]["name"] == "Renamed"
+
+
+def test_save_does_not_resurrect_version_removed_by_other_store(tmp_path: Path) -> None:
+    first = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft")
+    version = Version("demo", {"name": "Demo"})
+    first.add(version)
+    second = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft")
+    second.remove("demo", delete_files=False)
+
+    with pytest.raises(RuntimeError, match="removed"):
+        version.save()
+
+    assert json.loads(first.filepath.read_text(encoding="utf-8")) == {}
+
+
+def test_removed_version_cannot_be_saved_by_captured_callback(tmp_path: Path) -> None:
+    store = Versions(storage_dir=tmp_path, minecraft_dir=tmp_path / "minecraft")
+    version = Version("demo", {"name": "Demo"})
+    store.add(version)
+    pending_save = version._persist
+    assert pending_save is not None
+    store.remove("demo", delete_files=False)
+
+    with pytest.raises(RuntimeError, match="removed|not bound"):
+        pending_save(version)
+
+    assert json.loads(store.filepath.read_text(encoding="utf-8")) == {}

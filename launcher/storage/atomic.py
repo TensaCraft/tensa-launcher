@@ -4,9 +4,25 @@ import json
 import os
 import shutil
 import tempfile
+from _thread import RLock
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from weakref import WeakValueDictionary
+
+_LOCKS_GUARD = RLock()
+_LOCKS: WeakValueDictionary[Path, RLock] = WeakValueDictionary()
+
+
+def path_lock(path: Path) -> RLock:
+    """Share a process-local read/modify/write lock between stores of the same file."""
+    key = path.resolve()
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = RLock()
+            _LOCKS[key] = lock
+        return lock
 
 
 def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
@@ -78,4 +94,4 @@ def atomic_copy_file(source: Path, destination: Path) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-__all__ = ["atomic_copy_file", "atomic_write_json", "atomic_write_text"]
+__all__ = ["atomic_copy_file", "atomic_write_json", "atomic_write_text", "path_lock"]
