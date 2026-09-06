@@ -1,5 +1,82 @@
 # Code Audit
 
+## Follow-up: 2026-09-06
+
+This pass covers local content discovery, asynchronous page callbacks, persistence,
+runtime detection, diagnostics, and dependency/build compatibility. The application
+version and release/publication configuration are unchanged.
+
+- Local JAR display metadata uses a bounded, per-service cache (512 entries, at most
+  4096 characters per entry). File identity, size and timestamps invalidate entries;
+  failures are not cached. Mod ownership and installation still verify content hashes.
+  This does not introduce TensaCraft API or manifest caching.
+- Component size and modification time share one directory traversal. Looking up one
+  component no longer measures every installed component's contents.
+- Installed mods refresh after the first asynchronous scan. Resourcepack and shader
+  scans run off the UI thread; tab switches reuse pending work and ignore stale results.
+- Delayed search callbacks, worker cancellation and callbacks after page disposal no
+  longer repaint a stale page. Install/restore workers retain their original target.
+- Config and version writes merge local edits with persisted data under shared,
+  process-local file locks. Profile mutations serialize within their store. Failed writes
+  remain retryable; corrupt JSON/UTF-8 does not crash loading or discard a known-good
+  in-memory config. Version removal cannot be undone by a stale bound version saving.
+- Selecting a technical component preserves TensaCraft pack identity and restores
+  profile settings if Java selection or profile persistence fails.
+- Launch-log tail reads are limited to 256 KiB. Minecraft pre-release/snapshot identifiers
+  are preserved; normal Fabric/Quilt version parsing avoids a remote catalog request.
+- Installed-version detection reads only the requested local manifest, without a shared
+  five-minute cache. Integrity checks follow MLL's inherited metadata/JAR selection and
+  include inherited libraries, rejecting missing or cyclic parents without network fallback.
+- Build command logging redacts certificate passwords, including failed-command errors.
+- The obsolete `setuptools<81` and `pkg_resources` build requirement is removed after a
+  successful Windows build and packaged smoke test with setuptools 84.0.0.
+- Direct dependency versions were checked against PyPI. Ruff advances to 0.16.6;
+  Flet/Flet Desktop 0.86.5 and minecraft-launcher-lib 8.0 remain unchanged. Compatible
+  transitive updates were installed locally; constraints from upstream packages remain.
+
+### Measurements
+
+Run `python .tools/benchmark_content.py --mods 200` to reproduce the fixture: 200 JARs
+with 100 small entries each, plus 20 component directories with 50 files each.
+Median milliseconds on the local Windows machine:
+
+| Operation | Before | After (two runs) |
+| --- | ---: | ---: |
+| Cold JAR metadata scan | 124 | 127-154 |
+| Repeated JAR metadata scan | 123 | 13-33 |
+| List installed components | 140 | 12-16 |
+| Look up one component | 119 | 10-11 |
+
+Cold means a new metadata service, not a cleared operating-system disk cache. These
+measurements exclude network, hash verification and UI rendering; they do not measure
+whole-launcher startup. Disk load and antivirus affect timings. No cold-scan speedup
+is claimed. Persistence locks do not provide multi-process coordination. Linux/macOS
+packaged execution requires their respective CI runners or machines.
+
+### Validation And Static Analysis
+
+- Baseline: 898 tests. Final: 1036 tests passed (138 additional regression cases).
+- Repository lint, typecheck, compilation, whitespace checks and `pip check` passed.
+- A fresh Windows EXE was built with the repository helper and passed
+  `.tools/smoke_packaged.py --target windows --artifact .build/audit/windows/TensaLauncher.exe --timeout 60`.
+  This checks packaged imports/assets/runtime, not interactive gameplay or every machine.
+- CodeQL `python-security-and-quality` completed with no security findings. The unused
+  task re-export and redundant downloader factory wrapper were removed. The remaining
+  21 findings were reviewed: six mixed-import notes in monkeypatch tests, seven Protocol
+  ellipsis notes, one async-test note, six best-effort cleanup/cancellation notes, and
+  one unreachable-code warning after `pytest.raises` (the tested path executes).
+  Cleanup notes concern an optional empty parent directory, persistence of cleanup-only
+  journal metadata, temporary probes, unsupported directory fsync, or closed task loops;
+  they do not authorize skipping failed downloads or failed profile commits.
+- The analysis is stored locally at `.codeql/results/audit-2026-09.sarif`.
+
+Dependency references checked on this date: [Flet](https://pypi.org/project/flet/),
+[Minecraft Launcher Lib](https://pypi.org/project/minecraft-launcher-lib/),
+[Ruff 0.16.6](https://github.com/astral-sh/ruff/releases/tag/0.16.6), and
+[setuptools removal of pkg_resources](https://setuptools.pypa.io/en/latest/history.html#v82-0-0).
+
+## Previous Audit
+
 Audit date: 2026-07-29
 
 ## Scope
