@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+import traceback
 import zipfile
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -616,6 +617,9 @@ class BaseLoader(ABC):
                 return
             except Exception as exc:
                 if attempt >= self.MOD_LOADER_INSTALL_ATTEMPTS or not self._is_retryable_mod_loader_install_error(exc):
+                    Logger.error(
+                        f"{loader_name} {loader_version} installation failed:\n{traceback.format_exc()}"
+                    )
                     raise RuntimeError(self._format_mod_loader_install_error(exc)) from exc
 
                 if repair_managed_java and self._is_java_runtime_process_failure(exc):
@@ -647,7 +651,8 @@ class BaseLoader(ABC):
 
     @staticmethod
     def _uses_captured_neoforge_installer(mod_loader: Any, loader_name: str) -> bool:
-        return loader_name == "neoforge" and hasattr(mod_loader, "get_installer_url")
+        provider = getattr(mod_loader, "_base", mod_loader)
+        return loader_name == "neoforge" and callable(getattr(provider, "get_installer_url", None))
 
     @classmethod
     def _installer_artifact(cls, provider: Any, mc_version: str, loader_version: str) -> _InstallerArtifact:
@@ -842,7 +847,8 @@ class BaseLoader(ABC):
         operation: OperationHandle | None = None,
     ) -> None:
         callback = cast(CallbackDict, self._install_callbacks(operation) or {})
-        artifact = self._installer_artifact(mod_loader, mc_version, loader_version)
+        provider = getattr(mod_loader, "_base", mod_loader)
+        artifact = self._installer_artifact(provider, mc_version, loader_version)
         installed_version = self._validated_version_id(
             mod_loader.get_installed_version(mc_version, loader_version),
             label="NeoForge installed version id",
@@ -871,6 +877,7 @@ class BaseLoader(ABC):
                 attempts=self.MINECRAFT_INSTALL_ATTEMPTS,
             )
 
+            minecraft_launcher_lib.vanilla_launcher.ensure_vanilla_launcher_profiles_exists(self.minecraft_dir)
             callback.get("setStatus", empty)("Running installer")
             command = [
                 java_path or "java",

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import requests
+from minecraft_launcher_lib.mod_loader import _neoforge, get_mod_loader
 
 import launcher.core.integrity as integrity_module
 from launcher.application.java_runtime import JavaRuntimeService
@@ -416,10 +417,14 @@ def test_fabric_quilt_installer_command_uses_managed_java_path(tmp_path):
     assert command[1] == "-jar"
 
 
+@pytest.mark.parametrize("catalog_status", [200, 503])
+@pytest.mark.parametrize("existing_profiles", [False, True])
 def test_neoforge_installer_prefetches_libraries_and_uses_isolated_java_env(
     fake_app,
     monkeypatch,
     tmp_path,
+    catalog_status,
+    existing_profiles,
 ):
     minecraft_dir = tmp_path / "minecraft"
     games_dir = tmp_path / "games"
@@ -432,6 +437,11 @@ def test_neoforge_installer_prefetches_libraries_and_uses_isolated_java_env(
     monkeypatch.setattr("launcher.core.loaders.base.util.games_path", str(games_dir))
     monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Djavax.net.ssl.trustStore=NUL")
     monkeypatch.setenv("_JAVA_OPTIONS", "-Dbroken=true")
+    (minecraft_dir / "versions" / "1.21.1").mkdir(parents=True)
+    profiles_path = minecraft_dir / "launcher_profiles.json"
+    profiles = {"profiles": {"personal": {"name": "Keep me"}}, "version": 3}
+    if existing_profiles:
+        _write_json(profiles_path, json.dumps(profiles))
 
     library = {
         "name": "cpw.mods:bootstraplauncher:2.0.2",
@@ -469,18 +479,17 @@ def test_neoforge_installer_prefetches_libraries_and_uses_isolated_java_env(
     installer_bytes = installer_buffer.getvalue()
     installer_sha256 = hashlib.sha256(installer_bytes).hexdigest()
 
-    class FakeModLoader:
-        def get_installer_url(self, _mc_version, _loader_version):
-            return "https://example.invalid/neoforge-installer.jar"
+    mod_loader = get_mod_loader("neoforge")
+    response = requests.Response()
+    response.status_code = catalog_status
+    response._content = b"" if catalog_status == 200 else b"<html>Service unavailable</html>"
+    catalog_calls = []
 
-        def get_installer_metadata(self, _mc_version, _loader_version):
-            return {"hashes": {"sha256": installer_sha256}}
+    def unavailable_catalog(url):
+        catalog_calls.append(url)
+        return response
 
-        def get_installed_version(self, _mc_version, _loader_version):
-            return "neoforge-21.1.232"
-
-        def install(self, **_kwargs):
-            raise AssertionError("real NeoForge must use the controlled installer path")
+    monkeypatch.setattr(_neoforge, "get_requests_response_cache", unavailable_catalog)
 
     def fake_download(_url, path, **_kwargs):
         Path(path).write_bytes(installer_bytes)
@@ -496,18 +505,23 @@ def test_neoforge_installer_prefetches_libraries_and_uses_isolated_java_env(
         install_calls.append((version_id, Path(minecraft_directory), kwargs))
 
     def fake_run(command, **kwargs):
+        assert profiles_path.is_file()
         run_calls.append((command, kwargs))
         return subprocess.CompletedProcess(command, 0)
 
     loader = NeoForgeLoader(app=fake_app)
     loader.install_callback = lambda *_args, **_kwargs: {}
+    monkeypatch.setattr(
+        "launcher.core.loaders.base.BaseLoader._download_installer_checksum",
+        lambda _url: (installer_sha256, "sha256"),
+    )
     monkeypatch.setattr("launcher.core.loaders.base.download_file", fake_download)
     monkeypatch.setattr("launcher.core.loaders.base.install_libraries", fake_install_libraries)
     monkeypatch.setattr("launcher.core.loaders.base.install_minecraft_version_with_retries", fake_install_minecraft)
     monkeypatch.setattr("launcher.core.loaders.base.subprocess.run", fake_run)
 
     loader._run_mod_loader_install(
-        FakeModLoader(),
+        mod_loader,
         mc_version="1.21.1",
         loader_name="neoforge",
         loader_version="21.1.232",
@@ -537,6 +551,39 @@ def test_neoforge_installer_prefetches_libraries_and_uses_isolated_java_env(
     version_dir = minecraft_dir / "versions" / "neoforge-21.1.232"
     assert (version_dir / ".tensalauncher-installed").is_file()
     assert not (version_dir / ".tensalauncher-installing").exists()
+    assert catalog_calls == []
+    saved_profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+    assert saved_profiles == (profiles if existing_profiles else {"profiles": {}, "settings": {}, "version": 3})
+
+
+def test_loader_install_failure_logs_traceback_without_retrying_invalid_local_json(fake_app, monkeypatch):
+    errors = []
+    calls = []
+
+    class BrokenLoader:
+        def install(self, **_kwargs):
+            calls.append(True)
+            json.loads("")
+
+    loader = NeoForgeLoader(app=fake_app)
+    loader.install_callback = lambda *_args: {}
+    monkeypatch.setattr("launcher.core.loaders.base.Logger.error", errors.append)
+
+    with pytest.raises(RuntimeError, match="JSONDecodeError") as caught:
+        loader._run_mod_loader_install(
+            BrokenLoader(),
+            mc_version="1.21.1",
+            loader_name="neoforge",
+            loader_version="21.1.250",
+            java_path=None,
+        )
+
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+    assert calls == [True]
+    assert len(errors) == 1
+    assert "neoforge 21.1.250" in errors[0]
+    assert "Traceback (most recent call last)" in errors[0]
+    assert "JSONDecodeError" in errors[0]
 
 
 def test_fabric_installer_uses_python_profile_after_pkix_without_keytool_trust_store(
