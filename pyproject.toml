@@ -28,9 +28,9 @@ build = [
 ]
 dev = [
     "pillow==12.3.0",
-    "pyright==1.1.411",
+    "pyright==1.1.414",
     "pytest==9.1.1",
-    "ruff==0.16.6",
+    "ruff==0.16.7",
 ]
 
 [project.scripts]
