@@ -52,8 +52,10 @@ def find_iscc() -> Path:
         Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
         Path(r"C:\Program Files\Inno Setup 6\ISCC.exe"),
     ]
+    if local_app_data := os.environ.get("LOCALAPPDATA"):
+        candidates.append(Path(local_app_data) / "Programs" / "Inno Setup 6" / "ISCC.exe")
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return candidate
 
     raise FileNotFoundError("Inno Setup compiler (ISCC.exe) not found.")
@@ -62,7 +64,6 @@ def find_iscc() -> Path:
 def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name: str) -> str:
     exe_src = str(exe_path).replace("/", "\\")
     icon_src = str(icon_path).replace("/", "\\")
-    icon_name = icon_path.name
     out_dir = str(output_dir).replace("/", "\\")
 
     return textwrap.dedent(
@@ -72,7 +73,6 @@ def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name
         #define MyAppPublisher "Tensa"
         #define MyAppURL "https://tensa.co.ua/"
         #define MyAppExeName "{exe_path.name}"
-        #define MyAppIconName "{icon_name}"
         #define MyAppAssocName MyAppName + " File"
         #define MyAppAssocExt ".myp"
         #define MyAppAssocKey StringChange(MyAppAssocName, " ", "") + MyAppAssocExt
@@ -96,6 +96,7 @@ def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name
         SolidCompression=yes
         WizardStyle=modern
         SetupIconFile={icon_src}
+        UninstallDisplayIcon={{app}}\\{{#MyAppExeName}}
 
         [Languages]
         Name: "ukrainian"; MessagesFile: "compiler:Languages\\Ukrainian.isl"
@@ -105,7 +106,6 @@ def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name
 
         [Files]
         Source: "{exe_src}"; DestDir: "{{app}}"; Flags: ignoreversion
-        Source: "{icon_src}"; DestDir: "{{app}}"; Flags: ignoreversion
 
         [Registry]
         Root: HKA; Subkey: "Software\\Classes\\{{#MyAppAssocExt}}\\OpenWithProgids"; ValueType: string; ValueName: "{{#MyAppAssocKey}}"; ValueData: ""; Flags: uninsdeletevalue
@@ -115,8 +115,8 @@ def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name
         Root: HKA; Subkey: "Software\\Classes\\Applications\\{{#MyAppExeName}}\\SupportedTypes"; ValueType: string; ValueName: ".myp"; ValueData: ""
 
         [Icons]
-        Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; IconFilename: "{{app}}\\{{#MyAppIconName}}"
-        Name: "{{autodesktop}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; Tasks: desktopicon; IconFilename: "{{app}}\\{{#MyAppIconName}}"
+        Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; IconFilename: "{{app}}\\{{#MyAppExeName}}"
+        Name: "{{autodesktop}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; Tasks: desktopicon; IconFilename: "{{app}}\\{{#MyAppExeName}}"
 
         [Run]
         Filename: "{{app}}\\{{#MyAppExeName}}"; Description: "{{cm:LaunchProgram,{{#StringChange(MyAppName, '&', '&&')}}}}"; Flags: nowait postinstall skipifsilent runasoriginaluser

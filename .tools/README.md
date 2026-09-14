@@ -38,7 +38,34 @@ Common rules:
 - `tl clean` removes generated caches and legacy root runtime leftovers;
 - use `--no-cleanup` to keep temporary files for debugging.
 
-Local validation:
+## Launcher Icons
+
+`launcher/assets/logo.png` is the shared artwork source. Keep it high resolution
+(at least 1024 pixels), transparent, and tightly framed. The sidebar displays this PNG directly.
+
+After replacing the source, regenerate the bundled native icons:
+
+```bash
+python .tools/icon_assets.py
+```
+
+This updates `launcher/assets/logo.ico` (Windows window icon) and `launcher/assets/icon.icns`
+(macOS native asset). Builds also generate platform icons directly from `logo.png` through the
+same helper: a multi-resolution Windows ICO (16-256 pixels), macOS ICNS (up to 1024 pixels),
+and a transparent 512-pixel Linux PNG. The generator fits the artwork without adding an inset,
+stretching, cropping, or a colored background. Non-square sources are centered on a square canvas
+with their aspect ratio preserved. Regression tests compare bundled icons with the source.
+
+Windows EXE and installer resources use the generated ICO. Installed shortcuts and the
+uninstall entry use the EXE's embedded icon, so replacing the EXE does not leave them pointing
+at a stale sidecar icon. Reinstall to refresh shortcuts created by an older installer; pinned
+shortcuts and the desktop shell may retain cached artwork until refreshed.
+
+The macOS app bundle uses ICNS; Linux AppImage uses the PNG for its desktop entry and `.DirIcon`.
+Native app/taskbar rendering must be verified on each platform with its packaged build, not just
+by running the Python source. Rebuild existing packages after changing the artwork.
+
+## Validation
 
 ```bash
 python .tools/run_tests.py

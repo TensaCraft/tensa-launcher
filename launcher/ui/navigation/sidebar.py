@@ -88,7 +88,7 @@ class Sidebar:
     def _create_header(self):
         theme = current_theme()
         collapsed = self.is_collapsed()
-        logo_path = self.app.util.get_resource_path("logo.ico")
+        logo_path = self.app.util.get_resource_path("logo.png")
         logo_widget = (
             Image(src=str(logo_path), width=40, height=40, fit=ft.BoxFit.CONTAIN)
             if logo_path
