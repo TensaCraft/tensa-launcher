@@ -174,6 +174,17 @@ def test_navigation_shell_builds(fake_app):
     assert isinstance(fake_app.navigation.view(), ft.Container)
 
 
+@pytest.mark.parametrize("compact", ["yes", "no"])
+def test_sidebar_uses_png_logo(fake_app, compact):
+    fake_app.config.set("compact_sidebar", compact)
+    logo = Path(__file__).resolve().parents[1] / "launcher" / "assets" / "logo.png"
+    fake_app.util.get_resource_path = lambda name: logo if name == "logo.png" else None
+
+    images = [control for control in _flatten_controls(fake_app.navigation.view()) if isinstance(control, ft.Image)]
+
+    assert any(image.src == str(logo) and image.fit == ft.BoxFit.CONTAIN for image in images)
+
+
 def test_sidebar_collapsed_mode_uses_icon_only_nav_with_tooltips(fake_app):
     fake_app.config.set("compact_sidebar", "yes")
     fake_app.navigation.set_destinations(

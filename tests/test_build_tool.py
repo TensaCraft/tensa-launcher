@@ -320,7 +320,9 @@ def test_build_icon_resolver_generates_platform_specific_icons(tmp_path):
     ctx.build_dir = tmp_path / "build"
     ctx.assets_dir.mkdir(parents=True)
     ctx.build_dir.mkdir()
-    Image.new("RGBA", (256, 256), (0, 200, 160, 255)).save(ctx.assets_dir / "logo.png")
+    source = Image.new("RGBA", (1024, 1024))
+    source.paste((0, 200, 160, 255), (0, 256, 1024, 768))
+    source.save(ctx.assets_dir / "logo.png")
 
     windows_icon = icon_assets.resolve_pack_icon(ctx, "windows")
     linux_icon = icon_assets.resolve_pack_icon(ctx, "linux")
@@ -332,6 +334,103 @@ def test_build_icon_resolver_generates_platform_specific_icons(tmp_path):
     assert linux_icon.is_file()
     assert macos_icon.name == "TensaLauncher.icns"
     assert macos_icon.is_file()
+
+    with Image.open(windows_icon) as icon:
+        assert icon.ico.sizes() == set(icon_assets.WINDOWS_ICO_SIZES)
+        for size in icon.ico.sizes():
+            frame = icon.ico.getimage(size).convert("RGBA")
+            assert frame.size == size
+            assert frame.getchannel("A").getextrema() == (0, 255)
+            assert frame.getpixel((0, 0))[3] == 0
+            assert frame.getpixel((0, size[1] // 2))[3] == 255
+            assert frame.getpixel((size[0] - 1, size[1] // 2))[3] == 255
+    with Image.open(linux_icon) as icon:
+        assert icon.size == (512, 512)
+        assert icon.mode == "RGBA"
+        assert icon.getpixel((0, 0))[3] == 0
+        assert icon.getpixel((0, 256))[3] == 255
+        assert icon.getpixel((511, 256))[3] == 255
+    with Image.open(macos_icon) as icon:
+        assert icon.size == (1024, 1024)
+        assert {size[:2] for size in icon.info["sizes"]} >= {(16, 16), (128, 128), (512, 512)}
+        assert icon.convert("RGBA").getpixel((0, 0))[3] == 0
+        assert icon.convert("RGBA").getpixel((0, 512))[3] == 255
+        assert icon.convert("RGBA").getpixel((1023, 512))[3] == 255
+
+
+def test_icon_generator_preserves_non_square_source_proportions(tmp_path):
+    from PIL import Image
+
+    icon_assets = _load_module("icon_assets_aspect_test", ROOT_DIR / ".tools" / "icon_assets.py")
+    source = tmp_path / "logo.png"
+    Image.new("RGBA", (1024, 512), (10, 170, 120, 255)).save(source)
+
+    icon = icon_assets._contained_image(source, (256, 256))
+
+    assert icon.size == (256, 256)
+    assert icon.getchannel("A").getbbox() == (0, 64, 256, 192)
+
+
+@pytest.mark.parametrize("target,filename", [("windows", "logo.ico"), ("macos", "icon.icns")])
+def test_bundled_icons_match_logo_source(tmp_path, target, filename):
+    from PIL import Image
+
+    icon_assets = _load_module("icon_assets_source_test", ROOT_DIR / ".tools" / "icon_assets.py")
+    ctx = _build_context(_load_build_tool(), target=target)
+    ctx.build_dir = tmp_path
+    generated = icon_assets.resolve_pack_icon(ctx, target)
+
+    with Image.open(ctx.assets_dir / filename) as bundled, Image.open(generated) as expected:
+        if target == "windows":
+            assert bundled.ico.sizes() == expected.ico.sizes()
+            frames = [(bundled.ico.getimage(size), expected.ico.getimage(size)) for size in expected.ico.sizes()]
+        else:
+            assert bundled.info["sizes"] == expected.info["sizes"]
+            frames = [(bundled.icns.getimage(size), expected.icns.getimage(size)) for size in expected.info["sizes"]]
+        for actual, reference in frames:
+            assert actual.size == reference.size
+            assert actual.convert("RGBA").tobytes() == reference.convert("RGBA").tobytes()
+
+
+def test_icon_regeneration_keeps_png_source_unchanged(tmp_path):
+    from PIL import Image
+
+    icon_assets = _load_module("icon_assets_regenerate_test", ROOT_DIR / ".tools" / "icon_assets.py")
+    source = tmp_path / "logo.png"
+    Image.new("RGBA", (1024, 1024), (10, 170, 120, 255)).save(source)
+    original = source.read_bytes()
+
+    icon_assets.update_bundled_icons(tmp_path)
+
+    assert source.read_bytes() == original
+    assert (tmp_path / "logo.ico").is_file()
+    assert (tmp_path / "icon.icns").is_file()
+
+
+def test_windows_installer_finds_per_user_inno_setup(monkeypatch, tmp_path):
+    windows_builder = _load_module("build_windows_inno_test", ROOT_DIR / ".tools" / "build_windows.py")
+    compiler = tmp_path / "Programs" / "Inno Setup 6" / "ISCC.exe"
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(windows_builder.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: path == compiler)
+
+    assert windows_builder.find_iscc() == compiler
+
+
+def test_windows_installer_shortcuts_follow_executable_icon(tmp_path):
+    windows_builder = _load_module("build_windows_icon_test", ROOT_DIR / ".tools" / "build_windows.py")
+    script = windows_builder.render_iss(
+        exe_path=tmp_path / "TensaLauncher.exe",
+        icon_path=tmp_path / "TensaLauncher.ico",
+        output_dir=tmp_path,
+        output_name="TensaLauncherInstaller",
+    )
+
+    assert "SetupIconFile=" in script
+    assert r"UninstallDisplayIcon={app}\{#MyAppExeName}" in script
+    assert script.count(r'IconFilename: "{app}\{#MyAppExeName}"') == 2
+    assert "MyAppIconName" not in script
+    assert '.ico"; DestDir:' not in script
 
 
 def test_windows_build_emits_base_executable(tmp_path):
@@ -623,6 +722,12 @@ def test_linux_appimage_apprun_does_not_force_sidecar_app_base(tmp_path):
         captured["app_run"] = app_run.read_text(encoding="utf-8")
         desktop_entry = ctx.target_output_dir / f"{ctx.app_name}.AppDir" / f"{ctx.app_name}.desktop"
         captured["desktop_entry"] = desktop_entry.read_text(encoding="utf-8")
+        app_dir = desktop_entry.parent
+        icon = app_dir / f"{ctx.app_name}.png"
+        assert icon.read_bytes() == (app_dir / ".DirIcon").read_bytes()
+        with Image.open(icon) as image:
+            assert image.size == (512, 512)
+            assert image.getpixel((0, 0))[3] == 0
         (ctx.target_output_dir / f"{ctx.executable_name}-x86_64.AppImage").write_text("artifact", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -634,3 +739,4 @@ def test_linux_appimage_apprun_does_not_force_sidecar_app_base(tmp_path):
     assert "TENSALAUNCHER_APP_BASE" not in captured["app_run"]
     assert "Name=TensaLauncher" in captured["desktop_entry"]
     assert "X-AppImage-Name=TensaLauncher" in captured["desktop_entry"]
+    assert "Icon=TensaLauncher" in captured["desktop_entry"]
