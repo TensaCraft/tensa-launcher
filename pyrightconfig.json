@@ -24,7 +24,6 @@
     "launcher/domain",
     "launcher/models",
     "launcher/platform",
-    "launcher/shared",
     "launcher/storage",
     "launcher/pages/setup_wizard.py",
     "launcher/ui/controls/button.py",

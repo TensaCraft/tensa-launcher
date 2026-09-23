@@ -334,7 +334,8 @@ def _shared_bundle_options(
     ]
     if target == "macos":
         options.extend(["--hidden-import", "AVFoundation"])
-    options.extend(_flet_desktop_bundle_options(ctx, target=target))
+    # Flet's pack hook bundles the patched client and its fingerprint together.
+    # An explicit stock archive here takes precedence over that hook's data.
     return options
 
 
@@ -344,12 +345,6 @@ def _resolve_flet_desktop_release(ctx: BuildContext) -> tuple[str, str]:
 
 def resolve_flet_desktop_client_archive(ctx: BuildContext) -> Path:
     return flet_client.resolve_flet_desktop_client_archive(ctx)
-
-
-def _flet_desktop_bundle_options(ctx: BuildContext, *, target: str) -> list[str]:
-    data_sep = ";" if target == "windows" else ":"
-    client_archive = resolve_flet_desktop_client_archive(ctx)
-    return ["--add-data", f"{client_archive}{data_sep}flet_desktop/app"]
 
 
 def _flet_pack_metadata_options(ctx: BuildContext) -> list[str]:

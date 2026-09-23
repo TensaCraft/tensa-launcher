@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import plistlib
+import runpy
 import subprocess
 import sys
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -254,9 +257,10 @@ def test_build_base_artifact_uses_internal_pack_name(tmp_path):
     assert artifact == ctx.dist_dir / "TensaLauncher"
 
 
-def test_linux_build_bundles_flet_desktop_client_archive(tmp_path):
+@pytest.mark.parametrize("target", ["windows", "linux", "macos"])
+def test_flet_pack_does_not_override_patched_runtime_with_stock_archive(tmp_path, target):
     build_tool = _load_build_tool()
-    ctx = _build_context(build_tool, target="linux")
+    ctx = _build_context(build_tool, target=target)
     ctx.dist_dir = tmp_path / "dist"
     ctx.build_dir = tmp_path / "build"
     ctx.dist_dir.mkdir()
@@ -271,16 +275,71 @@ def test_linux_build_bundles_flet_desktop_client_archive(tmp_path):
     def fake_run(cmd, **_kwargs):
         commands.append(cmd)
         if "pack" in cmd:
-            (ctx.dist_dir / ctx.app_name).write_text("binary", encoding="utf-8")
+            artifact = build_tool._resolve_built_artifact_path(ctx, target=target)
+            if target == "macos":
+                artifact.mkdir()
+            else:
+                artifact.write_text("binary", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     ctx.run = fake_run
 
-    build_tool.build_base_artifact(ctx, target="linux", lang_path=tmp_path)
+    build_tool.build_base_artifact(ctx, target=target, lang_path=tmp_path)
 
     pack_command = commands[0]
-    assert "--add-data" in pack_command
-    assert f"{client_archive}:flet_desktop/app" in pack_command
+    data_sep = ";" if target == "windows" else ":"
+    data_entries = [pack_command[index + 1] for index, option in enumerate(pack_command) if option == "--add-data"]
+    assert data_entries == [
+        f"{ctx.assets_dir}{data_sep}launcher/assets",
+        f"{tmp_path}{data_sep}transliterate/contrib/languages",
+    ]
+
+
+def test_flet_hook_keeps_patched_archive_and_matching_fingerprint(tmp_path, monkeypatch):
+    hooks = pytest.importorskip("PyInstaller.utils.hooks")
+    toc_utils = pytest.importorskip("PyInstaller.building.datastruct")
+    build_utils = pytest.importorskip("PyInstaller.building.utils")
+    hook_config = pytest.importorskip("flet_cli.__pyinstaller.config")
+    hook_utils = pytest.importorskip("flet_cli.__pyinstaller.utils")
+
+    patched_dir = tmp_path / "patched"
+    patched_dir.mkdir()
+    patched_archive = patched_dir / "flet-windows.zip"
+    with zipfile.ZipFile(patched_archive, "w") as archive:
+        archive.writestr("flet/flet.exe", b"client with launcher icon and metadata")
+    payload = patched_archive.read_bytes()
+    fingerprint = f"{hashlib.sha256(payload).hexdigest()} {len(payload)}"
+    patched_archive.with_suffix(".zip.sha256").write_text(fingerprint, encoding="ascii")
+    stock_archive = tmp_path / "flet-windows.zip"
+    with zipfile.ZipFile(stock_archive, "w") as archive:
+        archive.writestr("flet/flet.exe", b"stock client")
+
+    build_tool = _load_build_tool()
+    ctx = _build_context(build_tool, target="windows")
+    ctx.assets_dir = tmp_path / "assets"
+    ctx.assets_dir.mkdir()
+    languages = tmp_path / "languages"
+    languages.mkdir()
+    monkeypatch.setattr(build_tool, "resolve_pack_icon", lambda *_args: tmp_path / "icon.ico")
+    monkeypatch.setattr(build_tool, "resolve_flet_desktop_client_archive", lambda _ctx: stock_archive)
+    monkeypatch.setattr(hook_config, "temp_bin_dir", str(patched_dir))
+    monkeypatch.setattr(hooks, "collect_data_files", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(hook_utils, "get_flet_bin_path", lambda: pytest.fail("Patched client must be bundled"))
+    hook = runpy.run_path(str(Path(hook_config.__file__).with_name("hook-flet.py")))
+
+    options = build_tool._shared_bundle_options(ctx, target="windows", lang_path=languages)
+    cli_data = [options[index + 1].rsplit(";", 1) for index, option in enumerate(options) if option == "--add-data"]
+    # Analysis appends hook data after explicit CLI data, then keeps the first destination.
+    toc = [
+        (destination, source, "DATA")
+        for data in (cli_data, hook["datas"])
+        for destination, source in build_utils.format_binaries_and_datas(data)
+    ]
+    bundled = {Path(destination).as_posix(): Path(source) for destination, source, _ in toc_utils.normalize_toc(toc)}
+
+    assert bundled["flet_desktop/app/flet-windows.zip"] == patched_archive
+    assert bundled["flet_desktop/app/flet-windows.zip"].read_bytes() == payload
+    assert bundled["flet_desktop/app/flet-windows.zip.sha256"].read_text(encoding="ascii") == fingerprint
 
 
 def test_flet_desktop_release_uses_public_artifact_api():
@@ -568,7 +627,7 @@ def test_build_base_artifact_packs_root_bootstrap(tmp_path):
 
     assert commands
     assert commands[0][2] == str(ROOT_DIR / "launcher" / "main.py")
-    assert f"{client_archive};flet_desktop/app" in commands[0]
+    assert not any("flet_desktop/app" in option for option in commands[0])
 
 
 def test_build_base_artifact_macos_uses_flet_pack(tmp_path):
@@ -602,7 +661,7 @@ def test_build_base_artifact_macos_uses_flet_pack(tmp_path):
     assert "--product-name" in commands[0]
     assert "--hidden-import" in commands[0]
     assert "AVFoundation" in commands[0]
-    assert f"{client_archive}:flet_desktop/app" in commands[0]
+    assert not any("flet_desktop/app" in option for option in commands[0])
 
 
 def test_platform_builders_emit_release_artifact_names(tmp_path):
