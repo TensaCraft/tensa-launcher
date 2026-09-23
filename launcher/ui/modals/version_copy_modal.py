@@ -15,6 +15,7 @@ from ..controls.text import Text
 from ..core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
 from ..feedback.alert_dialog import AlertDialog
 from ..forms.field_specs import FieldSpec, build_field
+from ..forms.form_dialog import dialog_content_width
 from ..layout.column import Column
 
 
@@ -23,7 +24,7 @@ class VersionCopyModal:
         self.app = app
         self.page = app.page
         self.source_version = source_version
-        self.content_width = self.app.theme.modal_width
+        self.content_width = dialog_content_width(app)
         self.version_name = build_field(
             self.app,
             FieldSpec(
@@ -68,6 +69,7 @@ class VersionCopyModal:
                 width=self.content_width,
                 height=self.app.theme.modal_height,
                 spacing=self.app.theme.spacing_md,
+                scroll=ft.ScrollMode.AUTO,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             actions=[

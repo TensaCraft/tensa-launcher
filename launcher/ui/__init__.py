@@ -47,8 +47,9 @@ from .modals import (
     VersionCopyModal,
     VersionInstallModal,
 )
-from .navigation import Footer, Header, Sidebar
+from .navigation import Footer, Header, Sidebar, TabBar, TabButton
 from .patterns import VersionCard
+from .patterns.context_menu import ContextMenu
 from .theme import (
     UiPalette,
     UiScale,
@@ -68,6 +69,7 @@ __all__ = [
     "Checkbox",
     "Column",
     "Container",
+    "ContextMenu",
     "CurseForgeImportModal",
     "configured_font_family",
     "configured_page_fonts",
@@ -96,6 +98,8 @@ __all__ = [
     "Sidebar",
     "SnackBar",
     "Switch",
+    "TabBar",
+    "TabButton",
     "Text",
     "TextField",
     "TextWithTooltip",

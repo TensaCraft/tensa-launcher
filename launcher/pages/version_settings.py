@@ -213,6 +213,7 @@ class VersionSettingsPage:
             variant="outline",
             tone="neutral",
             width=None,
+            height=self.app.theme.input_height,
             on_click=lambda _event: self.component_modal.show(),
         )
         self.component_modal = ui.VersionComponentModal(
@@ -360,6 +361,8 @@ class VersionSettingsPage:
         self.file_picker_button = ui.FileInputTrigger(
             text=self.selected_file_text,
             icon=ft.Icons.IMAGE,
+            variant="outline",
+            tone="neutral",
             on_click=lambda _: self.file_picker.pick_files(
                 allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE
             ),
@@ -464,7 +467,6 @@ class VersionSettingsPage:
     def _build_content(self) -> ft.Control:
         self.version_tabs = self._build_tab_bar()
         self.tab_content = ui.Container(
-            expand=True,
             content=self._build_active_tab_content(),
         )
         controls: list[ft.Control] = [self.version_tabs, self.tab_content]
@@ -519,14 +521,19 @@ class VersionSettingsPage:
         )
 
     def _build_general_tab(self) -> ft.Control:
+        identity_controls = ui.Column(
+            [self.name, self._build_icon_picker()],
+            spacing=self.app.theme.spacing_sm,
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
         return self._tab_body(
             self._section(
                 title=self.app.trans("version_section_general"),
                 description=self.app.trans("version_section_general_desc"),
                 controls=[
-                    self.layout.wrap_control(self.name, {"sm": 12, "md": 6, "lg": 6}),
+                    self.layout.wrap_control(identity_controls, {"sm": 12, "md": 6, "lg": 6}),
                     self.layout.wrap_control(self.loader_control, {"sm": 12, "md": 6, "lg": 6}),
-                    self.layout.wrap_control(self._build_icon_picker(), {"sm": 12, "md": 6, "lg": 4}),
                 ],
             ),
             self._section(
@@ -545,8 +552,8 @@ class VersionSettingsPage:
                 title=self.app.trans("version_section_runtime"),
                 description=self.app.trans("version_section_runtime_desc"),
                 controls=[
-                    self.layout.wrap_control(self.java_select, {"sm": 12, "md": 4, "lg": 4}),
-                    self.layout.wrap_control(self.gpu_mode_select, {"sm": 12, "md": 8, "lg": 8}),
+                    self.layout.wrap_control(self.java_select, {"sm": 12, "md": 6, "lg": 6}),
+                    self.layout.wrap_control(self.gpu_mode_select, {"sm": 12, "md": 6, "lg": 6}),
                     self.layout.wrap_control(self.java_path_display, {"sm": 12}),
                     self.layout.wrap_control(self.java_help_text, {"sm": 12}),
                     self.layout.wrap_control(self.max_ram, {"sm": 12}),
@@ -572,14 +579,15 @@ class VersionSettingsPage:
                 self.file_picker_button,
                 ui.Text(
                     self.app.trans("version_icon_hint"),
-                    color=self.app.theme.text_color,
-                    size=12,
+                    color=self.app.theme.text_secondary,
+                    size=self.app.theme.text_size_xs,
                 ),
             ],
             spacing=8,
             alignment=ft.MainAxisAlignment.START,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            tight=True,
         )
-        icon_column.expand = True
         return icon_column
 
     def _build_diagnostics_tab(self) -> ft.Control:
@@ -625,6 +633,7 @@ class VersionSettingsPage:
         )
 
     def _build_memory_slider(self, *, label: str, value_label: ft.Text, slider: ft.Slider) -> ft.Control:
+        value_label.text_align = ft.TextAlign.END
         return ui.Container(
             content=ui.Column(
                 controls=[
@@ -634,6 +643,7 @@ class VersionSettingsPage:
                                 label,
                                 size=self.app.theme.text_size_sm,
                                 weight=self.app.theme.font_weight_semibold,
+                                expand=True,
                             ),
                             value_label,
                         ],
@@ -793,7 +803,7 @@ class VersionSettingsPage:
             label=self.app.trans("report_contact_label"),
             hint_text=self.app.trans("report_contact_hint"),
             value=str(self.app.config.get("report_contact", "")),
-            width=560,
+            width=None,
         )
         self.version_report_message = ui.TextField(
             label=self.app.trans("version_report_message_label"),
@@ -802,7 +812,7 @@ class VersionSettingsPage:
             min_lines=5,
             max_lines=8,
             height=180,
-            width=560,
+            width=None,
         )
         self.version_report_send_button = ui.Button(
             text=self.app.trans("version_report_submit"),
@@ -811,6 +821,7 @@ class VersionSettingsPage:
         )
         self.version_report_dialog = ui.AlertDialog(
             modal=True,
+            scrollable=True,
             title=ui.Text(
                 self.app.trans("version_report_title", version=self.version.name or self.version.version_id),
                 size=self.app.theme.text_size_xl,
@@ -830,6 +841,7 @@ class VersionSettingsPage:
                     ],
                     spacing=12,
                     tight=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 ),
             ),
             actions=[

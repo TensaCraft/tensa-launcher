@@ -311,6 +311,11 @@ class SettingsPage:
             width=self.app.theme.input_height,
             height=self.app.theme.input_height,
         )
+        self.custom_java_path_picker = ui.Row(
+            controls=[self.custom_java_path, self.custom_java_browse],
+            spacing=self.app.theme.spacing_sm,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
         self.custom_java_add = ui.Button(
             text=self.trans("custom_java_add"),
             icon=ft.Icons.ADD,
@@ -325,7 +330,12 @@ class SettingsPage:
             width=None,
             height=self.app.theme.input_height,
         )
-        self.custom_java_list = ui.Column(controls=self._build_custom_java_rows(), spacing=8, tight=True)
+        self.custom_java_list = ui.Column(
+            controls=self._build_custom_java_rows(),
+            spacing=8,
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
 
     def _expand_controls(self) -> None:
         self.layout.expand_controls(
@@ -338,6 +348,7 @@ class SettingsPage:
             self.gpu_mode_select,
             self.report_contact,
             self.beta_updates_toggle,
+            self.check_updates_button,
             self.compact_sidebar_toggle,
             self.ui_click_sound_toggle,
             self.ui_click_sound_select,
@@ -356,7 +367,6 @@ class SettingsPage:
     def _build_content(self) -> ft.Control:
         self.settings_tabs = self._build_tab_bar()
         self.tab_content = ui.Container(
-            expand=True,
             content=self._build_active_tab_content(),
         )
 
@@ -375,23 +385,17 @@ class SettingsPage:
         )
 
     def _build_tab_bar(self) -> ft.Control:
-        return ui.Row(
-            controls=self._build_tab_buttons(),
-            spacing=8,
-            scroll=ft.ScrollMode.AUTO,
-        )
+        return ui.TabBar(self._build_tab_buttons())
 
     def _build_tab_buttons(self) -> list[ft.Control]:
         buttons: list[ft.Control] = []
         for key, label_key, icon in self.TABS:
             selected = key == self.active_tab
             buttons.append(
-                ui.Button(
+                ui.TabButton(
                     text=self.trans(label_key),
                     icon=icon,
-                    variant="filled" if selected else "ghost",
-                    tone="primary" if selected else "neutral",
-                    size="sm",
+                    selected=selected,
                     on_click=lambda _e, tab_key=key: self.show_tab(tab_key),
                 )
             )
@@ -497,8 +501,8 @@ class SettingsPage:
             title=self.trans("world_backups"),
             description=self.trans("world_backups_desc"),
             controls=[
-                self.layout.wrap_control(self.world_backups_toggle, {"sm": 12, "md": 6, "lg": 4}),
-                self.layout.wrap_control(self.world_backups_keep_count, {"sm": 12, "md": 6, "lg": 4}),
+                self.layout.wrap_control(self.world_backups_toggle, {"sm": 12, "md": 6, "lg": 6}),
+                self.layout.wrap_control(self.world_backups_keep_count, {"sm": 12, "md": 6, "lg": 6}),
                 self.layout.wrap_control(self.world_backups_dir, {"sm": 12, "md": 8, "lg": 8}),
                 self.layout.wrap_control(self.world_backups_dir_browse, {"sm": 12, "md": 4, "lg": 4}),
             ],
@@ -510,11 +514,10 @@ class SettingsPage:
                 title=self.trans("custom_java_section"),
                 description=self.trans("custom_java_section_desc"),
                 controls=[
-                    self.layout.wrap_control(self.custom_java_name, {"sm": 12, "md": 4, "lg": 4}),
-                    self.layout.wrap_control(self.custom_java_path, {"sm": 12, "md": 8, "lg": 5}),
-                    self.layout.wrap_control(self.custom_java_browse, {"sm": 12, "md": 6, "lg": 1}),
-                    self.layout.wrap_control(self.custom_java_add, {"sm": 12, "md": 6, "lg": 2}),
-                    self.layout.wrap_control(self.custom_java_scan, {"sm": 12}),
+                    self.layout.wrap_control(self.custom_java_name, {"sm": 12, "md": 4, "lg": 3}),
+                    self.layout.wrap_control(self.custom_java_path_picker, {"sm": 12, "md": 8, "lg": 6}),
+                    self.layout.wrap_control(self.custom_java_add, {"sm": 12, "md": 6, "lg": 3}),
+                    self.layout.wrap_control(self.custom_java_scan, {"sm": 12, "md": 6, "lg": 12}),
                     self.layout.wrap_control(self.custom_java_list, {"sm": 12}),
                 ],
             ),
@@ -535,7 +538,7 @@ class SettingsPage:
         if self.active_tab == "activity" and next_tab != "activity":
             self.activity_panel.before_hide()
         self.active_tab = next_tab
-        self.settings_tabs.controls = self._build_tab_buttons()
+        self.settings_tabs.content.controls = self._build_tab_buttons()
         self.tab_content.content = self._build_active_tab_content()
         if self.active_tab == "activity":
             self.activity_panel.after_show()
@@ -577,6 +580,7 @@ class SettingsPage:
         )
 
     def _build_memory_slider(self, *, label: str, value_label: ft.Text, slider: ft.Slider) -> ft.Control:
+        value_label.text_align = ft.TextAlign.END
         return ui.Container(
             content=ui.Column(
                 controls=[
@@ -586,6 +590,7 @@ class SettingsPage:
                                 label,
                                 size=self.app.theme.text_size_sm,
                                 weight=self.app.theme.font_weight_semibold,
+                                expand=True,
                             ),
                             value_label,
                         ],

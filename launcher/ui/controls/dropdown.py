@@ -78,6 +78,8 @@ def Dropdown(
         merged["filled"] = False
         merged["bgcolor"] = ft.Colors.TRANSPARENT
         merged["fill_color"] = ft.Colors.TRANSPARENT
+    if height is None and any(merged.get(key) is not None for key in ("helper_text", "error_text")):
+        merged["height"] = None
     return ft.Dropdown(**filter_control_kwargs(ft.Dropdown, merged))
 
 

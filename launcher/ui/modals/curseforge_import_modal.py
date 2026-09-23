@@ -13,6 +13,7 @@ from ..core.page_runtime import close_dialog, run_blocking, run_task, schedule_u
 from ..feedback.alert_dialog import AlertDialog
 from ..forms.field_specs import FieldSpec, build_field
 from ..forms.file_picker import FilePicker
+from ..forms.form_dialog import dialog_content_width
 from ..layout.column import Column
 
 
@@ -24,7 +25,7 @@ class CurseForgeImportModal:
         self.selected_source_path: str | None = None
         self.source_kind: str | None = None
         self.manifest_data: dict | None = None
-        self.content_width = self.app.theme.modal_width
+        self.content_width = dialog_content_width(app)
         self.name_input = build_field(
             self.app,
             FieldSpec(
@@ -56,6 +57,7 @@ class CurseForgeImportModal:
                 width=self.content_width,
                 height=self.app.theme.modal_height,
                 spacing=self.app.theme.spacing_md,
+                scroll=ft.ScrollMode.AUTO,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             actions=[

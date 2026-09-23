@@ -22,9 +22,11 @@ class FormSection:
                 control.expand = True
 
     def wrap_control(self, control, col: dict[str, int] | None = None):
+        if isinstance(control, ft.Button) and control.height == current_theme().button_height:
+            control.height = current_theme().input_height
         return Container(
             content=control,
-            col=col or {"sm": 12},
+            col={"xs": 12, **(col or {"sm": 12})},
             padding=ft.Padding.only(top=4, bottom=4),
         )
 

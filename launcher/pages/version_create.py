@@ -524,13 +524,18 @@ class VersionCreatePage:
         return " • ".join(parts)
 
     def _loader_build_selector(self, option: VersionCreateOption) -> ft.Control | None:
-        return build_loader_build_dropdown(
+        selector = build_loader_build_dropdown(
             self.app,
             option,
             self.selected_loader_builds,
             self._set_loader_build,
             width=self.app.theme.modal_width,
         )
+        if isinstance(selector, ft.Dropdown):
+            selector.width = None
+            selector.height = self.app.theme.input_height
+            selector.content_padding = self.app.theme.field_padding()
+        return selector
 
     def _set_loader_build(self, option: VersionCreateOption, event) -> None:
         update_selected_loader_version(option, self.selected_loader_builds, event)
@@ -558,7 +563,7 @@ class VersionCreatePage:
             value=self._install_name(option),
             label=self.trans("version_name_label"),
             autofocus=True,
-            width=theme.modal_width,
+            width=None,
         )
         build_selector = self._loader_build_selector(option)
         self.install_loader_build = build_selector if isinstance(build_selector, ft.Dropdown) else None
@@ -574,7 +579,6 @@ class VersionCreatePage:
             details.append(
                 ui.Container(
                     content=ui.Text(description, color=theme.text_secondary, size=theme.text_size_sm),
-                    width=theme.modal_width,
                     padding=theme.padding_md,
                     border=ft.Border.all(1, theme.border_color),
                     border_radius=theme.radius_md,
@@ -588,11 +592,13 @@ class VersionCreatePage:
                 weight=theme.font_weight_bold,
             ),
             modal=True,
+            scrollable=True,
             content=ui.Column(
                 details,
                 width=theme.modal_width,
                 spacing=theme.spacing_md,
                 tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             actions=[
                 ui.Button(text=self.trans("install"), on_click=lambda _e: self._confirm_install_dialog()),

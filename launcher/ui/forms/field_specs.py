@@ -8,7 +8,6 @@ import flet as ft
 from ..controls.checkbox import Checkbox
 from ..controls.dropdown import Dropdown
 from ..controls.text_field import TextField
-from ..theme import current_theme
 
 
 @dataclass(slots=True)
@@ -40,13 +39,12 @@ def _dropdown_options(raw_options: list[Any]) -> list[ft.dropdown.Option]:
 
 
 def build_field(app, spec: FieldSpec, *, on_change=None):
-    theme = current_theme()
     width = spec.width
     height = spec.height
     common = {
         "key": spec.key,
         "width": width,
-        "height": height if height is not None else theme.input_height,
+        "height": height,
         "expand": spec.expand,
         **spec.props,
     }

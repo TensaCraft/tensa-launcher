@@ -14,6 +14,7 @@ from ..controls.text import Text
 from ..core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
 from ..feedback.alert_dialog import AlertDialog
 from ..forms.field_specs import FieldSpec, build_field
+from ..forms.form_dialog import dialog_content_width
 from ..layout.column import Column
 
 
@@ -39,7 +40,7 @@ class VersionComponentModal:
         self._install_pending = False
         self._closed = True
         self._disposed = False
-        width = self.app.theme.modal_width
+        width = dialog_content_width(app)
 
         self.loader_select = build_field(
             app,
@@ -101,6 +102,7 @@ class VersionComponentModal:
                 weight=app.theme.font_weight_bold,
             ),
             modal=True,
+            scrollable=True,
             content=Column(
                 [
                     Text(

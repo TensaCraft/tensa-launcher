@@ -111,8 +111,8 @@ def TextField(
         "on_submit": on_submit,
         "on_focus": on_focus,
         "on_blur": on_blur,
-        "text_vertical_align": ft.VerticalAlignment.CENTER,
-        "fit_parent_size": kwargs.pop("fit_parent_size", True),
+        "text_vertical_align": ft.VerticalAlignment.START if multiline else ft.VerticalAlignment.CENTER,
+        "fit_parent_size": kwargs.get("fit_parent_size", True),
         **kwargs,
     }
     if variant == "ghost":
@@ -129,9 +129,19 @@ def TextField(
         merged["error"] = error_text
     if merged.get("counter") is None and counter_text is not None:
         merged["counter"] = counter_text
+    needs_natural_height = bool(multiline or max_length is not None or any(
+        merged.get(key) is not None for key in ("helper", "error", "counter")
+    ))
+    if needs_natural_height:
+        merged["fit_parent_size"] = kwargs.get("fit_parent_size", False)
+        if height is None:
+            merged["height"] = None
+        merged.setdefault("size_constraints", ft.BoxConstraints(min_height=actual_height))
     if content_padding is not None:
         merged["content_padding"] = content_padding
-    elif not merged.get("multiline"):
+    elif multiline:
+        merged["content_padding"] = ft.Padding.symmetric(horizontal=12, vertical=theme.padding_sm)
+    else:
         merged["content_padding"] = calc_input_padding(actual_height, actual_text_size)
     return ft.TextField(**filter_control_kwargs(ft.TextField, merged))
 

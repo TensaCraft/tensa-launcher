@@ -14,6 +14,17 @@ from ..theme import current_theme
 from .field_specs import FieldSpec, apply_field_width, build_field
 
 
+def dialog_content_width(app, width: int | float | None = None) -> int | float:
+    theme = current_theme()
+    preferred = theme.modal_width if width is None else width
+    page_width = getattr(app.page, "width", None)
+    if not isinstance(page_width, (int, float)) or page_width <= 0:
+        return preferred
+    # Match the themed dialog insets and Material's existing 24px content padding.
+    available = page_width - 2 * (theme.padding_xl + 24)
+    return min(preferred, max(1, available))
+
+
 class FormDialog:
     def __init__(self, app, title, fields, on_submit, on_close=None, **kwargs):
         self.app = app
@@ -23,7 +34,7 @@ class FormDialog:
         self.fields = [field if isinstance(field, FieldSpec) else FieldSpec(**field) for field in fields]
         self.inputs = {}
         theme = current_theme()
-        self.content_width = kwargs.get("modal_width", theme.modal_width)
+        self.content_width = dialog_content_width(app, kwargs.get("modal_width", theme.modal_width))
         self.content = self.generate_inputs()
         self.modal = AlertDialog(
             modal=True,
@@ -37,6 +48,7 @@ class FormDialog:
                 width=self.content_width,
                 height=kwargs.get("modal_height", theme.modal_height // 2),
                 spacing=theme.spacing_md,
+                scroll=ft.ScrollMode.AUTO,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
         )
@@ -84,4 +96,4 @@ class FormDialog:
             self.on_close()
 
 
-__all__ = ["FormDialog"]
+__all__ = ["FormDialog", "dialog_content_width"]

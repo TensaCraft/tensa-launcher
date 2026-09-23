@@ -13,6 +13,7 @@ from ..controls.text import Text
 from ..core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
 from ..feedback.alert_dialog import AlertDialog
 from ..forms.field_specs import FieldSpec, build_field
+from ..forms.form_dialog import dialog_content_width
 from ..layout.column import Column
 from ..layout.container import Container
 
@@ -30,7 +31,7 @@ class ModpackInstallModal:
         self._load_scheduled = False
         self._closed = False
         self._install_pending = False
-        self.content_width = self.app.theme.modal_width
+        self.content_width = dialog_content_width(app)
         self.modal = AlertDialog(
             title=Text(title or self.trans("modpack_details_title"), color=self.app.theme.text_color),
             modal=True,

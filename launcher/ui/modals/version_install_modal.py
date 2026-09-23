@@ -16,6 +16,7 @@ from ..controls.text import Text
 from ..core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
 from ..feedback.alert_dialog import AlertDialog
 from ..forms.field_specs import FieldSpec, build_field
+from ..forms.form_dialog import dialog_content_width
 from ..layout.column import Column
 from ..layout.container import Container
 from ..patterns.loader_builds import selected_loader_version, update_selected_loader_version
@@ -26,7 +27,7 @@ class VersionInstallModal:
         self.app = app
         self.page = app.page
         self._install_pending = False
-        self.content_width = self.app.theme.modal_width
+        self.content_width = dialog_content_width(app)
         self.tensacraft_packs: dict[str, dict] = {}
         self.catalog = VersionCreationCatalogService()
         self.loader_options_by_version: dict[str, VersionCreateOption] = {}
@@ -110,6 +111,7 @@ class VersionInstallModal:
                 ],
                 spacing=self.app.theme.spacing_sm,
                 tight=True,
+                scroll=ft.ScrollMode.AUTO,
             ),
             width=self.content_width,
             height=max(108, self.app.theme.input_height * 3),
@@ -132,6 +134,7 @@ class VersionInstallModal:
                 width=self.content_width,
                 height=self.app.theme.modal_height,
                 spacing=self.app.theme.spacing_md,
+                scroll=ft.ScrollMode.AUTO,
                 horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             actions=[
