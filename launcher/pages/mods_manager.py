@@ -381,17 +381,7 @@ class ModsManagerPage(
         )
 
     def _build_tab_bar(self):
-        self.tab_buttons = ui.Container(
-            content=ui.Row(
-                [self._create_tab_button(tab_data) for tab_data in self.content_tabs_data],
-                spacing=0,
-                expand=True,
-            ),
-            padding=2,
-            bgcolor=ft.Colors.with_opacity(0.08, self.app.theme.bg_header_footer),
-            border=ft.Border.all(1, ft.Colors.with_opacity(0.18, self.app.theme.text_tertiary)),
-            border_radius=ft.BorderRadius.all(self.app.theme.radius_sm),
-        )
+        self.tab_buttons = ui.TabBar([self._create_tab_button(tab_data) for tab_data in self.content_tabs_data])
 
     def _build_inner_tabs(self):
         self.inner_tab_buttons = ui.Row(
@@ -636,8 +626,12 @@ class ModsManagerPage(
         self._ensure_tab_loaded(self.current_content_key, update=False)
         if self.current_content_key not in self.content_configs:
             return self.installed_containers[self.current_content_key]
+        controls = [self.installed_search_bar]
+        if self.current_content_key == "mods":
+            controls.append(self.build_installed_updates_toolbar())
+        controls.append(self.installed_containers[self.current_content_key])
         return ui.Column(
-            [self.installed_search_bar, self.installed_containers[self.current_content_key]],
+            controls,
             spacing=8,
             expand=True,
         )
@@ -1038,58 +1032,66 @@ class ModsManagerPage(
         backups_toggle = self.delete_backups_toggle
         if directory_toggle is None or backups_toggle is None:
             raise RuntimeError("Delete controls were not initialised")
-        warning_color = "#FFC107"
+        theme = self.app.theme
         return ui.ListView(
             [
                 ui.Container(
-                    ui.Row(
+                    ui.Column(
                         [
-                            ui.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=24, color=warning_color),
-                            ui.Column(
+                            ui.Row(
                                 [
-                                    ui.Text(
-                                        self.trans("version_delete_warning_title"),
-                                        size=self.app.theme.text_size_medium,
-                                        weight=ft.FontWeight.W_600,
-                                        color=self.app.theme.text_color,
-                                    ),
-                                    ui.Text(
-                                        self.trans("version_delete_warning_desc"),
-                                        size=self.app.theme.text_size_sm,
-                                        color=self.app.theme.text_secondary,
+                                    ui.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=24, color=theme.error),
+                                    ui.Column(
+                                        [
+                                            ui.Text(
+                                                self.trans("version_delete_warning_title"),
+                                                size=theme.text_size_xl,
+                                                weight=theme.font_weight_bold,
+                                                color=theme.text_color,
+                                            ),
+                                            ui.Text(
+                                                self.trans("version_delete_warning_desc"),
+                                                size=theme.text_size_sm,
+                                                color=theme.text_secondary,
+                                            ),
+                                        ],
+                                        spacing=theme.spacing_sm,
+                                        tight=True,
+                                        expand=True,
                                     ),
                                 ],
-                                spacing=4,
-                                tight=True,
-                                expand=True,
+                                spacing=theme.spacing_md,
+                                vertical_alignment=ft.CrossAxisAlignment.START,
+                            ),
+                            ft.Divider(height=1, color=theme.border_color),
+                            directory_toggle,
+                            ft.Divider(height=1, color=theme.border_color),
+                            backups_toggle,
+                            ft.Divider(height=1, color=theme.border_color),
+                            ui.Row(
+                                [
+                                    ui.Button(
+                                        text=self.trans("delete_version_action"),
+                                        icon=ft.Icons.DELETE_OUTLINE,
+                                        height=theme.input_height,
+                                        bgcolor=theme.error,
+                                        color=theme.color_white,
+                                        icon_color=theme.color_white,
+                                        on_click=self._delete_version,
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.END,
+                                wrap=True,
                             ),
                         ],
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
+                        spacing=theme.spacing_md,
+                        tight=True,
+                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     ),
-                    bgcolor=ft.Colors.with_opacity(0.08, warning_color),
-                    border=ft.Border.all(1, ft.Colors.with_opacity(0.35, warning_color)),
-                    border_radius=ft.BorderRadius.all(self.app.theme.radius_sm),
-                    padding=self.app.theme.padding_md,
-                ),
-                directory_toggle,
-                backups_toggle,
-                ui.Container(
-                    content=ui.Row(
-                        [
-                            ui.Button(
-                                text=self.trans("delete_version_action"),
-                                icon=ft.Icons.DELETE_OUTLINE,
-                                size="sm",
-                                bgcolor=self.app.theme.error,
-                                color=self.app.theme.color_white,
-                                icon_color=self.app.theme.color_white,
-                                on_click=self._delete_version,
-                            ),
-                        ],
-                        alignment=ft.MainAxisAlignment.END,
-                    ),
-                    padding=ft.Padding.only(top=self.app.theme.padding_sm),
+                    bgcolor=theme.bg_list,
+                    border=ft.Border.all(1, theme.border_color),
+                    border_radius=theme.radius(md=True),
+                    padding=theme.section_padding,
                 ),
             ],
             spacing=8,
@@ -1127,7 +1129,7 @@ class ModsManagerPage(
                             ),
                             ui.Text(
                                 self.trans(description_key),
-                                size=self.app.theme.text_size_xs,
+                                size=self.app.theme.text_size_sm,
                                 color=self.app.theme.text_secondary,
                             ),
                         ],
@@ -1135,16 +1137,13 @@ class ModsManagerPage(
                         tight=True,
                         expand=True,
                     ),
-                    ui.Switch(value=value),
+                    ui.Switch(value=value, tooltip=self.trans(label_key)),
                 ],
                 spacing=12,
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            bgcolor=self.app.theme.bg_list,
-            border=ft.Border.all(1, self.app.theme.border_color),
-            border_radius=ft.BorderRadius.all(self.app.theme.radius_sm),
-            padding=self.app.theme.padding_md,
+            padding=ft.Padding.symmetric(vertical=self.app.theme.padding_sm),
         )
 
     def _delete_version(self, _e=None) -> None:

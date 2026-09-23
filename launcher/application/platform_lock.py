@@ -171,18 +171,10 @@ def _open_lock_file(path: Path) -> BinaryIO:
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
     try:
         os.set_inheritable(descriptor, False)
-        handle = cast(BinaryIO, os.fdopen(descriptor, "r+b", buffering=0))
+        # Windows can lock past EOF; only the lock owner may initialize byte zero.
+        return cast(BinaryIO, os.fdopen(descriptor, "r+b", buffering=0))
     except BaseException:
         os.close(descriptor)
-        raise
-    try:
-        if os.fstat(descriptor).st_size == 0:
-            handle.write(_LOCK_SENTINEL)
-            handle.flush()
-        handle.seek(0)
-        return handle
-    except BaseException:
-        handle.close()
         raise
 
 

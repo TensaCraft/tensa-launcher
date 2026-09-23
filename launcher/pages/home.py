@@ -3,18 +3,16 @@ import flet as ft
 from launcher import ui
 from launcher.application.tensacraft_catalog import TensaCraftCatalogService
 from launcher.application.tensacraft_install_state import mark_pending, pending_pack_ids, unmark_pending
-from launcher.core.game import Game
 from launcher.core.versions import Version
 from launcher.pages.launch_feedback import handle_launch_response
-from launcher.pages.launch_profiles import launch_start_kwargs, launch_task_args, show_launch_profile_selector
+from launcher.pages.launch_profiles import show_launch_profile_selector
+from launcher.pages.version_actions import VersionActions
 from launcher.ui.core.page_runtime import close_dialog, run_blocking, run_task, schedule_update, show_dialog
 
 
-class Home:
+class Home(VersionActions):
     def __init__(self, app):
-        self.app = app
-        self.page = app.page
-        self.trans = self.app.trans
+        super().__init__(app)
         self.catalog = TensaCraftCatalogService()
         self.cards_data = []
         self.grid = None
@@ -45,7 +43,12 @@ class Home:
         if self._should_show_tensacraft():
             self._load_tensacraft_versions_async()
 
-        return self.grid
+        return self._context_menu(self.grid, self._build_navigation_menu_items(), expand=True)
+
+    def before_hide(self):
+        super().before_hide()
+        if self._tensacraft_install_dialog is not None:
+            self._close_tensacraft_install_dialog()
 
     def create_card(self, version: Version):
         """Створює картку версії використовуючи VersionCard компонент."""
@@ -62,10 +65,15 @@ class Home:
             action_icon=ft.Icons.DOWNLOAD_ROUNDED if is_remote else ft.Icons.PLAY_ARROW_ROUNDED,
         )
         if is_remote:
+            items = [self._menu_item("install", self.trans("install"), ft.Icons.DOWNLOAD, lambda: self.start_version(version))]
+        else:
+            items = self._build_version_menu_items(version)
+        context = self._context_menu(card, items)
+        if is_remote:
             pack_id = getattr(version, "remote_pack_id", None) or version.id or version.version
             if pack_id:
-                card.key = self._remote_card_key(pack_id)
-        return card
+                context.key = self._remote_card_key(pack_id)
+        return context
 
     def start_version(
         self,
@@ -75,58 +83,13 @@ class Home:
         profile_key: str | None = None,
     ):
         """Запускає версію Minecraft."""
+        if not self._session_open():
+            return
         if getattr(version, "is_remote", False):
             self._install_and_launch_tensacraft(version)
             return
 
-        if self.app.feedback.is_busy():
-            self.app.feedback.info(self.trans("installation_already_running"))
-            return
-
-        if not allow_duplicate and self._confirm_duplicate_launch(version):
-            return
-
-        if profile_key is None and show_launch_profile_selector(
-            self.app,
-            version,
-            lambda selected_key: self.start_version(
-                version,
-                allow_duplicate=allow_duplicate,
-                profile_key=selected_key,
-            ),
-        ):
-            return
-
-        try:
-            args = launch_task_args(version, allow_duplicate, profile_key)
-            run_task(self.page, self._start_version_async, *args)
-        except Exception:
-            self.app.feedback.info(self.trans("installation_already_running"))
-            raise
-
-    def _confirm_duplicate_launch(self, version: Version) -> bool:
-        if not Game.is_game_dir_active(Game.version_game_dir(version)):
-            return False
-
-        def handle_response(response: bool) -> None:
-            if response:
-                self.start_version(version, allow_duplicate=True)
-
-        self.app.feedback.confirm(
-            self.trans("version_already_running_confirm_title", version=version.name),
-            self.trans("version_already_running_confirm_message", version=version.name),
-            handle_response,
-        )
-        return True
-
-    async def _start_version_async(
-        self,
-        version: Version,
-        allow_duplicate: bool = False,
-        profile_key: str | None = None,
-    ) -> None:
-        resp = await run_blocking(version.start, **launch_start_kwargs(allow_duplicate, profile_key))
-        handle_launch_response(self.app, resp)
+        self.handle_play(version, allow_duplicate=allow_duplicate, profile_key=profile_key)
 
     def _should_show_tensacraft(self) -> bool:
         return self.app.config.get("show_tensacraft_versions", "yes") == "yes"
@@ -135,7 +98,7 @@ class Home:
         run_task(self.page, self._load_tensacraft_versions)
 
     async def _load_tensacraft_versions(self) -> None:
-        if not self.grid:
+        if not self._session_open() or not self.grid:
             return
         try:
             packs = await run_blocking(self.app.tensa_api.list_versions)
@@ -143,6 +106,8 @@ class Home:
             self.app.log.error(f"Failed to fetch TensaCraft versions: {exc}")
             return
 
+        if not self._session_open():
+            return
         local_ids = self.catalog.local_pack_ids(self.app.versions.all())
         excluded_ids = local_ids | set(pending_pack_ids(self.app))
 
@@ -165,6 +130,8 @@ class Home:
         return self.catalog.find_local(self.app.versions.all(), pack_id)
 
     def _install_and_launch_tensacraft(self, version: Version) -> None:
+        if not self._session_open():
+            return
         if self.app.feedback.is_busy():
             self.app.feedback.info(self.trans("installation_already_running"))
             return
@@ -264,7 +231,7 @@ class Home:
 
     def _confirm_tensacraft_install(self, _e) -> None:
         target = self._tensacraft_install_target
-        if not target:
+        if not self._session_open() or not target:
             return
         version_name = target["version_name"]
         pack_id = target["pack_id"]
@@ -279,6 +246,8 @@ class Home:
         schedule_update(self.page)
 
     def _start_tensacraft_install(self, version_name: str, pack_id: str) -> None:
+        if not self._session_open():
+            return
         self.app.feedback.info(
             self.trans("version_not_installed_message", version=version_name)
         )
@@ -306,7 +275,7 @@ class Home:
 
     def hide_pending_tensacraft_pack(self, pack_id: str) -> None:
         mark_pending(self.app, pack_id)
-        if not self.grid:
+        if not self._session_open() or not self.grid:
             return
         card_key = self._remote_card_key(pack_id)
         self.grid.controls = [control for control in self.grid.controls if getattr(control, "key", None) != card_key]
@@ -325,17 +294,18 @@ class Home:
                 version=version_name,
                 error=str(exc),
             )
-            self.app.feedback.warning(
-                final_message,
-                report_title=f"TensaCraft install failed: {version_name}",
-                report_metadata={
-                    "screen": "Home",
-                    "action": "tensacraft_install",
-                    "pack_id": pack_id,
-                    "version_name": version_name,
-                    "exception": repr(exc),
-                },
-            )
+            if self._session_open():
+                self.app.feedback.warning(
+                    final_message,
+                    report_title=f"TensaCraft install failed: {version_name}",
+                    report_metadata={
+                        "screen": "Home",
+                        "action": "tensacraft_install",
+                        "pack_id": pack_id,
+                        "version_name": version_name,
+                        "exception": repr(exc),
+                    },
+                )
             operation.fail(final_message, notify=False)
             return
         finally:
@@ -343,6 +313,8 @@ class Home:
 
         operation.finish(final_message, show_success=False)
 
+        if not self._session_open():
+            return
         if show_launch_profile_selector(
             self.app,
             installed,
@@ -351,7 +323,8 @@ class Home:
             return
 
         resp = await run_blocking(installed.start)
-        handle_launch_response(self.app, resp)
+        if self._session_open():
+            handle_launch_response(self.app, resp)
 
     def _install_tensacraft_version(self, version_name: str, pack_id: str) -> Version:
         new_version = self.app.versions.prepare(

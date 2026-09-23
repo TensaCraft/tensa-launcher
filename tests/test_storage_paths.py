@@ -23,6 +23,11 @@ Logger = logger_module.Logger
 UtilService = util_module.UtilService
 
 
+@pytest.fixture(autouse=True)
+def isolated_instance_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr("launcher.main.instance_directory", lambda: tmp_path / "ipc")
+
+
 def _windows_default_app_state_dir(local_app_data: Path) -> Path:
     return local_app_data / "TensaLauncher"
 
@@ -650,7 +655,9 @@ def test_main_starts_app_when_startup_connection_check_fails(monkeypatch):
     monkeypatch.setattr(launcher_main.util, "check_connection", lambda: False)
     monkeypatch.setattr(launcher_main, "App", FakeApp)
 
-    launcher_main.main(page)
+    import asyncio
+
+    asyncio.run(launcher_main.main(page))
 
     assert started == [page]
     assert page.added == []
@@ -676,7 +683,8 @@ def test_launch_passes_assets_dir_to_flet(monkeypatch, tmp_path: Path):
 
     launch()
 
-    assert captured["target"] is main
+    assert captured["target"].func is main
+    assert captured["target"].keywords["instance"].closed
     assert captured["assets_dir"] == str(assets_dir)
     assert captured["view"] == ft.AppView.FLET_APP_HIDDEN
 

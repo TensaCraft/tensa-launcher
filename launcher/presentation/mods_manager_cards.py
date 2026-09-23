@@ -19,6 +19,7 @@ class ModsManagerCards:
         on_click,
         tooltip: str,
         color: str,
+        disabled: bool = False,
     ) -> ft.FloatingActionButton:
         return ui.FloatingActionButton(
             icon=icon,
@@ -27,58 +28,18 @@ class ModsManagerCards:
             mini=True,
             bgcolor=self.app.theme.bg_primary,
             foreground_color=color,
+            disabled=disabled,
         )
 
     def _toggle_action_color(self, enabled: bool) -> str:
         return self.app.theme.success if enabled else self.app.theme.text_disabled
 
     def tab_button(self, tab_data: dict[str, Any], *, is_active: bool, on_click) -> ui.Container:
-        indicator = ui.Container(
-            height=2,
-            border_radius=ft.BorderRadius.all(2),
-            bgcolor=self.app.theme.primary if is_active else ft.Colors.TRANSPARENT,
-        )
-        return ui.Container(
-            ui.Column(
-                controls=[
-                    ui.Container(
-                        content=ui.Row(
-                            [
-                                ui.Icon(
-                                    tab_data["icon"],
-                                    size=16,
-                                    color=self.app.theme.primary if is_active else self.app.theme.text_secondary,
-                                ),
-                                ui.Text(
-                                    tab_data["text"],
-                                    size=self.app.theme.text_size_xs,
-                                    text_align=ft.TextAlign.CENTER,
-                                    weight=ft.FontWeight.W_500,
-                                    color=self.app.theme.text_color if is_active else self.app.theme.text_secondary,
-                                ),
-                            ],
-                            alignment=ft.MainAxisAlignment.CENTER,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            spacing=8,
-                        ),
-                        expand=True,
-                        alignment=ft.Alignment.CENTER,
-                    ),
-                    indicator,
-                ],
-                spacing=4,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                expand=True,
-            ),
-            alignment=ft.Alignment.CENTER,
-            expand=1,
-            height=self.app.theme.tab_height,
-            padding=ft.Padding.only(left=12, top=5, right=12, bottom=4),
-            bgcolor=ft.Colors.with_opacity(0.10, self.app.theme.primary) if is_active else ft.Colors.TRANSPARENT,
-            border_radius=ft.BorderRadius.all(self.app.theme.radius_sm - 2),
+        return ui.TabButton(
+            text=tab_data["text"],
+            icon=tab_data["icon"],
+            selected=is_active,
             on_click=on_click,
-            ink=False,
-            animate=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
         )
 
     def resourcepack_card(self, resourcepack: dict[str, Any], *, on_toggle, on_open_folder, on_delete) -> ui.Container:
@@ -231,10 +192,13 @@ class ModsManagerCards:
         on_restore,
         on_toggle,
         on_delete,
+        on_open_site=None,
     ) -> ui.Container:
         mod_name = mod.get("name") or mod["filename"]
-        mod_version = mod.get("version", "")
+        mod_version = mod.get("modrinth_version_number") or mod.get("version", "")
         mod_description = mod.get("description", "")
+        update_available = bool(mod.get("update_available"))
+        update_disabled = not mod["enabled"] or str(mod.get("path", "")).endswith(".disabled")
         status_icon = ft.Icons.CHECK_CIRCLE if mod["enabled"] else ft.Icons.CANCEL
         status_color = self.app.theme.success if mod["enabled"] else self.app.theme.text_disabled
         size_mb = mod["size"] / (1024 * 1024)
@@ -264,6 +228,8 @@ class ModsManagerCards:
                     mod_description[:100] + ("..." if len(mod_description) > 100 else ""),
                     size=self.app.theme.text_size_xs,
                     color=self.app.theme.text_tertiary,
+                    max_lines=2,
+                    overflow=ft.TextOverflow.ELLIPSIS,
                 )
             )
         text_column.append(
@@ -271,22 +237,37 @@ class ModsManagerCards:
                 f"{mod['filename']} • {size_mb:.1f} MB",
                 size=self.app.theme.text_size_xs,
                 color=self.app.theme.text_disabled,
+                max_lines=1,
+                overflow=ft.TextOverflow.ELLIPSIS,
             )
         )
 
         actions = [
             self._action_button(
                 icon=ft.Icons.UPDATE,
-                on_click=on_update,
-                tooltip=self.trans("update_mod"),
+                on_click=None if update_disabled else on_update,
+                tooltip=(
+                    self.trans("installed_mod_update_disabled") if update_disabled else
+                    self.trans("update_mod") + ": " + self.trans(
+                        "installed_mod_update_versions", current=mod_version or "?",
+                        new=(mod.get("latest_version") or {}).get("version_number") or "?",
+                    )
+                ),
                 color=self.app.theme.info,
-            ) if mod.get("update_available") else None,
+                disabled=update_disabled,
+            ) if update_available else None,
             self._action_button(
                 icon=ft.Icons.RESTORE,
                 on_click=on_restore,
                 tooltip=self.trans("restore_backup"),
                 color=self.app.theme.primary,
             ) if has_backup else None,
+            self._action_button(
+                icon=ft.Icons.OPEN_IN_NEW_ROUNDED,
+                on_click=on_open_site,
+                tooltip=self.trans("open_on_site"),
+                color=self.app.theme.text_secondary,
+            ) if on_open_site else None,
             self._action_button(
                 icon=ft.Icons.POWER_SETTINGS_NEW if mod["enabled"] else ft.Icons.PLAY_ARROW,
                 on_click=on_toggle,

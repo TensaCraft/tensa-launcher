@@ -235,7 +235,7 @@ def test_settings_page_builds(fake_app):
     assert page.custom_java_browse.tooltip is None
     assert not hasattr(page, "activity_list")
     assert page.active_tab == "launcher"
-    assert [tab.content for tab in page.settings_tabs.controls] == [
+    assert _flatten_text_values(page.settings_tabs) == [
         "settings_tab_launcher",
         "settings_tab_backups",
         "settings_tab_java_performance",
@@ -582,7 +582,8 @@ def test_versions_page_builds(fake_app):
         "add_version",
         "minecraft_components_nav",
     ]
-    first_card = view.controls[0]
+    assert isinstance(view.controls[0], ft.ContextMenu)
+    first_card = view.controls[0].content.content
     action_row = first_card.content.controls[1]
     assert [action.icon for action in action_row.controls] == [
         ft.Icons.PLAY_ARROW,
@@ -618,7 +619,7 @@ def test_versions_page_card_opens_version_workspace(fake_app):
     page = VersionsPage(fake_app)
     view = page.view()
 
-    view.controls[0].on_click(None)
+    view.controls[0].content.content.on_click(None)
 
     assert opened == [fake_app.versions.all()[0]]
 
@@ -631,7 +632,7 @@ def test_versions_page_confirms_before_launching_duplicate_game_dir(fake_app, mo
 
     monkeypatch.setattr("launcher.core.game.Game.is_game_dir_active", classmethod(lambda cls, _path: True))
     monkeypatch.setattr(
-        "launcher.pages.versions.run_task",
+        "launcher.pages.version_actions.run_task",
         lambda _page, task, *args, **_kwargs: scheduled.append((task, args)),
     )
     fake_app.feedback.confirm = lambda title, question, callback: confirms.append((title, question)) or callback(True)
@@ -1666,8 +1667,9 @@ def test_profiles_page_builds(fake_app):
     page = ProfilesPage(fake_app)
     view = page.view()
 
-    assert isinstance(view, ft.ListView)
-    assert len(view.controls) >= 1
+    assert isinstance(view, ft.ContextMenu)
+    assert isinstance(view.content.content, ft.ListView)
+    assert len(view.content.content.controls) >= 1
     assert fake_app.header.actions is not None
     assert len(fake_app.header.actions) == 2
     assert all(action.height == fake_app.theme.shell_action_height for action in fake_app.header.actions)
@@ -1722,18 +1724,7 @@ def test_profiles_page_uses_local_reauth_state_after_default_switch(fake_app):
     page.view()
     checked_profiles.clear()
 
-    event = type(
-        "Event",
-        (),
-        {
-            "control": type(
-                "Control",
-                (),
-                {"value": True, "key": "two", "data": {"name": "Two"}},
-            )()
-        },
-    )()
-    page.on_switch_change(event)
+    page.set_default_profile("two")
 
     assert checked_profiles
     assert all(not profile["access_token"].startswith("enc::") for profile in checked_profiles)
@@ -1745,9 +1736,11 @@ def test_home_page_builds(fake_app, monkeypatch):
     monkeypatch.setattr(page, "_load_tensacraft_versions_async", lambda: None)
     view = page.view()
 
-    assert isinstance(view, ft.GridView)
-    assert view.child_aspect_ratio == 0.84
-    assert len(view.controls) == 1
+    assert isinstance(view, ft.ContextMenu)
+    grid = view.content.content
+    assert isinstance(grid, ft.GridView)
+    assert grid.child_aspect_ratio == 0.84
+    assert len(grid.controls) == 1
 
 
 def test_home_page_confirms_before_launching_duplicate_game_dir(fake_app, monkeypatch):
@@ -1758,7 +1751,7 @@ def test_home_page_confirms_before_launching_duplicate_game_dir(fake_app, monkey
 
     monkeypatch.setattr("launcher.core.game.Game.is_game_dir_active", classmethod(lambda cls, _path: True))
     monkeypatch.setattr(
-        "launcher.pages.home.run_task",
+        "launcher.pages.version_actions.run_task",
         lambda _page, task, *args, **_kwargs: scheduled.append((task, args)),
     )
     fake_app.feedback.confirm = lambda title, question, callback: confirms.append((title, question)) or callback(True)
@@ -1771,7 +1764,7 @@ def test_home_page_confirms_before_launching_duplicate_game_dir(fake_app, monkey
             "version_already_running_confirm_message (version=Vanilla 1.20.1)",
         )
     ]
-    assert scheduled == [(page._start_version_async, (version, True))]
+    assert scheduled == [(page._handle_play_async, (version, True))]
 
 
 def test_home_page_prompts_for_launch_profile_when_enabled(fake_app, monkeypatch):
@@ -1782,11 +1775,11 @@ def test_home_page_prompts_for_launch_profile_when_enabled(fake_app, monkeypatch
     scheduled = []
 
     monkeypatch.setattr(
-        "launcher.pages.home.show_launch_profile_selector",
+        "launcher.pages.version_actions.show_launch_profile_selector",
         lambda _app, _version, callback: prompts.append(callback) or True,
     )
     monkeypatch.setattr(
-        "launcher.pages.home.run_task",
+        "launcher.pages.version_actions.run_task",
         lambda _page, task, *args, **_kwargs: scheduled.append((task, args)),
     )
 
@@ -1797,7 +1790,7 @@ def test_home_page_prompts_for_launch_profile_when_enabled(fake_app, monkeypatch
 
     prompts[0]("second")
 
-    assert scheduled == [(page._start_version_async, (version, False, "second"))]
+    assert scheduled == [(page._handle_play_async, (version, False, "second"))]
 
 
 def test_launch_profile_selector_builds_profile_dialog(fake_app, monkeypatch):
@@ -2070,7 +2063,10 @@ def test_mods_manager_delete_tab_shows_warning_and_options(fake_app, monkeypatch
     assert page.delete_directory_toggle.content.controls[1].value is True
     assert page.delete_backups_toggle.content.controls[1].value is False
     delete_panel = page.tab_content.content.content
-    delete_button = delete_panel.controls[3].content.controls[0]
+    delete_button = next(
+        control for control in _flatten_controls(delete_panel)
+        if isinstance(control, ft.Button) and control.icon == ft.Icons.DELETE_OUTLINE
+    )
     assert delete_button.style.color[ft.ControlState.DEFAULT] == fake_app.theme.color_white
     assert delete_button.style.icon_color[ft.ControlState.DEFAULT] == fake_app.theme.color_white
 
@@ -2926,6 +2922,9 @@ def test_mods_manager_modrinth_optional_dependency_checkbox_installs_selected_op
         version_id="main-version",
     )
     fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(main, optional=[optional])
+    fake_app.modrinth_mods.resolve_optional_dependencies = (
+        lambda *_args, **_kwargs: _modrinth_plan(main, install=[optional])
+    )
 
     downloads = []
     opened_urls = []
@@ -3510,9 +3509,14 @@ def test_mods_manager_update_mod_records_latest_modrinth_metadata(fake_app, monk
 
     page = ModsManagerPage(fake_app, version)
     page.after_show()
-    operation = SimpleNamespace(fail=lambda *_args, **_kwargs: None, finish=lambda *_args, **_kwargs: None)
+    candidate = _modrinth_candidate(
+        "main-project", "Main", "main.jar", action="replace", version_id="new-version",
+        version_number="2.0.0", installed_item=mod,
+    )
+    candidate.install_file.file_hash = hashlib.sha512(b"new").hexdigest()
+    fake_app.modrinth_mods.build_dependency_plan = lambda *_args, **_kwargs: _modrinth_plan(candidate)
 
-    asyncio.run(page._update_mod_async(mod, operation))
+    asyncio.run(page._install_mod_async(project))
 
     updated = fake_app.content.apply_modrinth_metadata(version, fake_app.content.scan_installed_mods(mods_dir))[0]
     assert updated["modrinth_version_id"] == "new-version"
@@ -3520,7 +3524,7 @@ def test_mods_manager_update_mod_records_latest_modrinth_metadata(fake_app, monk
     assert old_path.read_bytes() == b"new"
 
 
-def test_mods_manager_installed_tab_does_not_auto_check_mod_updates(fake_app, monkeypatch):
+def test_mods_manager_headless_tab_does_not_auto_check_mod_updates(fake_app, monkeypatch):
     version = fake_app.versions.all()[0]
     version.client = "fabric"
     version.loader = "fabric"
@@ -3535,7 +3539,7 @@ def test_mods_manager_installed_tab_does_not_auto_check_mod_updates(fake_app, mo
     monkeypatch.setattr("launcher.core.util.minecraft_dir", str(fake_app.util.minecraft_dir))
     monkeypatch.setattr(
         fake_app.modrinth_mods,
-        "find_update",
+        "check_installed_updates",
         lambda *args, **kwargs: update_checks.append((args, kwargs)),
     )
 

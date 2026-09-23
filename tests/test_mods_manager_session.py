@@ -490,7 +490,7 @@ def test_completed_content_install_refreshes_visible_search_cards_once(fake_app,
     plan = SimpleNamespace(
         can_install=True,
         main=SimpleNamespace(title="Main", version_number="1"),
-        install_order_with_optional=lambda _optional: [],
+        install_order=[],
     )
 
     asyncio.run(page._install_modrinth_plan_async(plan, page._content_context()))

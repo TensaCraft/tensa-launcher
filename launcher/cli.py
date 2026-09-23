@@ -36,11 +36,11 @@ def _run(cmd: list[str]) -> int:
     return completed.returncode
 
 
-def cmd_run(_args: argparse.Namespace) -> int:
+def cmd_run(args: argparse.Namespace) -> int:
     from launcher.main import launch
 
-    launch()
-    return 0
+    argv = [f"--launch-version={args.launch_version}"] if args.launch_version is not None else []
+    return launch(argv)
 
 
 def cmd_test(_args: argparse.Namespace) -> int:
@@ -117,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Launch the desktop app.")
+    run_parser.add_argument("--launch-version", help="Launch the build with this exact version ID.")
     run_parser.set_defaults(func=cmd_run)
 
     test_parser = subparsers.add_parser("test", help="Run the test suite.")

@@ -15,6 +15,8 @@ from ..theme import current_theme
 
 
 class Sidebar:
+    SUPPORT_URL = "https://discord.com/invite/mftAjQA4Pp"
+
     def __init__(self, app) -> None:
         self.app = app
         self.selected_index = 0
@@ -171,6 +173,34 @@ class Sidebar:
             on_click=lambda _e: self.app.show_profiles_page(),
         )
 
+    def _open_support(self, _event=None) -> None:
+        if not self.app.auth.device_ui.open_url(self.SUPPORT_URL):
+            self.app.feedback.warning(self.app.trans("support_open_failed"))
+
+    def _create_support_button(self):
+        theme = current_theme()
+        label = self.app.trans("discord_support")
+        collapsed = self.is_collapsed()
+        controls: list[ft.Control] = [Icon(ft.Icons.SUPPORT_AGENT, size=24, color=theme.primary)]
+        if not collapsed:
+            controls.append(Text(label, size=theme.text_size_sm, color=theme.text_color, expand=True))
+        return Container(
+            content=Container(
+                content=Row(
+                    controls=controls,
+                    spacing=0 if collapsed else 12,
+                    alignment=ft.MainAxisAlignment.CENTER if collapsed else ft.MainAxisAlignment.START,
+                ),
+                padding=ft.Padding.all(12),
+                border_radius=theme.radius(),
+                bgcolor=ft.Colors.TRANSPARENT,
+                tooltip=label,
+                ink=True,
+                on_click=self._open_support,
+            ),
+            padding=ft.Padding.symmetric(horizontal=12, vertical=4),
+        )
+
     def view(self):
         theme = current_theme()
         all_controls: list[ft.Control] = [self._create_header()]
@@ -185,6 +215,7 @@ class Sidebar:
                 )
             )
         all_controls.append(Container(expand=True))
+        all_controls.append(self._create_support_button())
         all_controls.append(
             Container(
                 content=self._create_user_block(),

@@ -1567,7 +1567,7 @@ def test_home_start_version_schedules_local_launch_without_blocking_ui(fake_app,
     )
 
     monkeypatch.setattr(
-        "launcher.pages.home.run_task",
+        "launcher.pages.version_actions.run_task",
         lambda _page, task, *args, **_kwargs: scheduled.append((task, args)),
     )
 

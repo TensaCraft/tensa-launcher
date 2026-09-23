@@ -1,4 +1,6 @@
 {
+    "launcher_instance_unavailable": "Could not contact the running launcher. Wait for it to finish starting or closing, then try again. If the problem persists, close the launcher and reopen it.",
+    "launcher_shortcut_failed": "Could not launch the instance from the shortcut. Try launching it from the instance list.",
   "language": "Language",
   "custom_client_name": "Recommend",
   "select_language": "Select Language",
@@ -604,5 +606,24 @@
   "minecraft_game_dir_unavailable": "The configured Minecraft directory is unavailable: {path}. Fix it in Settings or version launch and installation will fail.",
   "invalid_directory_path": "Invalid directory path",
   "directory_create_failed": "Failed to create directory",
-  "version_delete_failed": "Failed to delete build"
+  "version_delete_failed": "Failed to delete build",
+  "discord_support": "Discord support",
+  "support_open_failed": "Could not open Discord support in your browser.",
+  "modrinth_dependency_version_conflict": "The selected mods require different versions of {name}.",
+  "create_desktop_shortcut": "Create desktop shortcut",
+  "desktop_shortcut_created": "Desktop shortcut created.",
+  "desktop_shortcut_failed": "Could not create desktop shortcut.",
+  "installed_updates_idle": "Mod updates have not been checked yet",
+  "installed_updates_checking": "Checking mod updates...",
+  "installed_updates_available": "Updates available: {count}",
+  "installed_updates_current": "All checked mods are up to date",
+  "installed_updates_unchecked": "Mods not verified on Modrinth: {count}",
+  "installed_updates_no_enabled": "No enabled mods to check",
+  "installed_updates_failed": "Could not check updates. Try again later.",
+  "installed_mod_update_versions": "{current} → {new}",
+  "installed_mod_update_disabled": "Enable the mod before updating it",
+  "profile_active": "Active",
+  "profile_use": "Use account",
+  "profile_sign_in_again": "Sign in again",
+  "profiles_empty": "No accounts yet"
 }

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
+import locale
 import os
 import sys
 import time
 import traceback
+from functools import partial
 from pathlib import Path
 
 import flet as ft
@@ -14,8 +18,11 @@ from launcher.app import App
 from launcher.core import util
 from launcher.core.pending_update import resume_pending_update_if_needed
 from launcher.models.logger import Logger
+from launcher.models.translator import Translator
+from launcher.platform.instance_shortcuts import validate_version_id
 from launcher.platform.paths import LauncherPaths, is_frozen
 from launcher.platform.resources import PACKAGE_ASSETS_DIR
+from launcher.platform.single_instance import SingleInstance, instance_directory
 
 FLET_CLIENT_CACHE_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
@@ -96,10 +103,15 @@ def _format_flet_client_cache_error(exc: BaseException) -> str:
     )
 
 
-def run_flet_with_client_cache_retries() -> bool:
+def run_flet_with_client_cache_retries(
+    *, launch_version: str | None = None, instance: SingleInstance | None = None
+) -> bool:
+    target = partial(main, launch_version=launch_version, instance=instance) if instance is not None else (
+        partial(main, launch_version=launch_version) if launch_version is not None else main
+    )
     for attempt, delay in enumerate((*FLET_CLIENT_CACHE_RETRY_DELAYS, None), start=1):
         try:
-            ft.run(main, assets_dir=str(PACKAGE_ASSETS_DIR), view=ft.AppView.FLET_APP_HIDDEN)
+            ft.run(target, assets_dir=str(PACKAGE_ASSETS_DIR), view=ft.AppView.FLET_APP_HIDDEN)
             return True
         except (FileExistsError, PermissionError) as exc:
             if not is_flet_client_cache_error(exc):
@@ -165,32 +177,78 @@ def run_packaged_smoke_test() -> int:
     return 0
 
 
-def main(page: "ft.Page") -> None:
-    if util.check_connection():
+async def handle_instance_requests(app: App, instance: SingleInstance) -> None:
+    while not instance.closed and not app._terminating:
+        for version_id in instance.pending_requests():
+            if app._terminating:
+                return
+            try:
+                await app.handle_external_launch(version_id)
+            except Exception:
+                if app._terminating:
+                    return
+                Logger.error("Unable to handle launcher shortcut:\n" + traceback.format_exc())
+                app.feedback.warning(app.trans("launcher_shortcut_failed"))
+        await asyncio.sleep(0.2)
+
+
+async def main(
+    page: "ft.Page", *, launch_version: str | None = None, instance: SingleInstance | None = None
+) -> None:
+    if await asyncio.to_thread(util.check_connection):
         Logger.info("Internet connection available, starting app")
     else:
         Logger.warning("Startup internet check failed, starting app anyway")
 
-    app = App(page)
+    app = App(page, on_shutdown=instance.stop_accepting) if instance is not None else App(page)
     app.run()
+    if instance is not None:
+        # This listener survives in-app restarts, unlike one-shot startup tasks.
+        page.run_task(handle_instance_requests, app, instance)
+    elif launch_version is not None:
+        app._track_startup_task(page.run_task(app.launch_version_by_id, launch_version))
 
 
 def launch(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(prog=APP_NAME, allow_abbrev=False)
+    parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--launch-version", type=validate_version_id)
+    args, _unknown = parser.parse_known_args(argv)
+    if args.smoke_test:
+        return _launch_runtime(smoke_test=True)
+
+    with SingleInstance(instance_directory()) as instance:
+        try:
+            primary = instance.start_or_forward(args.launch_version)
+        except (OSError, ValueError):
+            Logger.error("Unable to route launcher startup:\n" + traceback.format_exc())
+            language = locale.getlocale()[0] or "en_US"
+            translator = Translator("uk_UA" if language.lower().startswith("uk") else "en_US")
+            show_startup_error_message(APP_NAME, translator.get("launcher_instance_unavailable"))
+            return 1
+        if not primary:
+            return 0
+        return _launch_runtime(launch_version=args.launch_version, instance=instance)
+
+
+def _launch_runtime(
+    *, smoke_test: bool = False, launch_version: str | None = None, instance: SingleInstance | None = None
+) -> int:
     prepare_process_workdir()
     setup_logging()
     if os.environ.get("TENSALAUNCHER_CLEAR_LOG_ON_START") == "1":
         Logger.clear()
     normalize_linux_frozen_runtime_env()
 
-    if "--smoke-test" in argv:
+    if smoke_test:
         return run_packaged_smoke_test()
 
     if resume_pending_update_if_needed(Logger):
         return 0
 
     try:
-        if not run_flet_with_client_cache_retries():
+        if not run_flet_with_client_cache_retries(launch_version=launch_version, instance=instance):
             return 1
     except Exception:
         Logger.error("Fatal startup error:\n" + traceback.format_exc())

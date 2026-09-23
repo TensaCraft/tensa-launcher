@@ -4,6 +4,7 @@ import inspect
 import os
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from time import sleep
 
@@ -21,7 +22,7 @@ from launcher.pages.minecraft_components import MinecraftComponentsPage
 from launcher.pages.modpacks import ModpacksPage
 from launcher.pages.profiles import ProfilesPage
 from launcher.pages.settings import SettingsPage
-from launcher.pages.setup_wizard import maybe_show_setup_wizard
+from launcher.pages.setup_wizard import SetupWizardPage, maybe_show_setup_wizard
 from launcher.pages.version_create import VersionCreatePage
 from launcher.pages.version_settings import VersionSettingsPage
 from launcher.pages.versions import VersionsPage
@@ -31,13 +32,14 @@ from launcher.state import StateStore
 class App:
     JAVA_VERSIONS_TTL_SEC = 24 * 60 * 60
 
-    def __init__(self, page: ft.Page):
+    def __init__(self, page: ft.Page, *, on_shutdown: Callable[[], None] | None = None):
         self.page = page
         self.page.data = self
         self.mll = minecraft_launcher_lib
         self.log = Logger()
         self.sleep = sleep
         self._terminating = False
+        self._on_shutdown = on_shutdown
         self._startup_tasks: list[object] = []
 
         self._bootstrap_state()
@@ -268,6 +270,9 @@ class App:
     def _begin_shutdown(self) -> bool:
         if self._terminating:
             return False
+        on_shutdown = getattr(self, "_on_shutdown", None)
+        if on_shutdown is not None:
+            on_shutdown()
         self._terminating = True
         try:
             self._clear_install_session_state()
@@ -423,9 +428,9 @@ class App:
         self.navigation.set_selected_index(1)
         self.show_page(MinecraftComponentsPage(self))
 
-    def show_version_settings_page(self, version_key: str):
+    def show_version_settings_page(self, version_key: str, *, initial_tab: str = "general"):
         # Залишаємо вибраний індекс незмінним (версії залишаються виділеними)
-        self.show_page(VersionSettingsPage(self, version_key))
+        self.show_page(VersionSettingsPage(self, version_key, initial_tab=initial_tab))
 
     def show_profiles_page(self, initial_action: str | None = None):
         self.navigation.set_selected_index(-1)  # Не виділяємо жоден пункт у sidebar
@@ -438,9 +443,46 @@ class App:
     def show_activity_page(self):
         self.show_settings_page(initial_tab="activity")
 
-    def show_mods_manager_page(self, version):
+    def show_mods_manager_page(
+        self, version, *, initial_tab: str = "mods", settings_tab: str | None = None, inner_tab: str | None = None
+    ):
         from launcher.pages.mods_manager import ModsManagerPage
-        self.show_page(ModsManagerPage(self, version))
+
+        workspace = ModsManagerPage(self, version)
+        allowed_tabs = {key for key, *_rest in workspace.CONTENT_TABS}
+        workspace._switch_content_tab(initial_tab if initial_tab in allowed_tabs else "mods")
+        if settings_tab is not None and workspace.current_content_key == "settings":
+            if workspace.version_settings_page is not None:
+                workspace.version_settings_page.show_tab(settings_tab)
+        if inner_tab is not None:
+            workspace._switch_inner_tab(inner_tab)
+        self.navigation.set_selected_index(1)
+        self.show_page(workspace)
+
+    async def handle_external_launch(self, version_id: str | None) -> None:
+        if self._terminating:
+            return
+        try:
+            self.page.window.visible = True
+            self.page.window.minimized = False
+            self.page.update()
+            await self.page.window.to_front()
+        except Exception as exc:
+            self.log.debug(f"Unable to focus launcher window: {exc!r}")
+        if not self._terminating and version_id is not None:
+            await self.launch_version_by_id(version_id)
+
+    async def launch_version_by_id(self, version_id: str) -> None:
+        if self._terminating or isinstance(getattr(self, "current_page", None), SetupWizardPage):
+            return
+        version = self.versions.get(version_id)
+        # Store.get also accepts legacy aliases. Shortcuts must never select by an alias.
+        if version is None or version.version_id != version_id:
+            self.feedback.warning(self.trans("version_not_found"))
+            return
+        self.show_versions_page()
+        if isinstance(self.current_page, VersionsPage):
+            self.current_page.handle_play(version)
 
     def run(self):
         self.page.update()

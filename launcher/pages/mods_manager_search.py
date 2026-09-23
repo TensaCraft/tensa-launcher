@@ -221,14 +221,7 @@ class ModsManagerSearchMixin:
                 self.app.feedback.warning(self.trans("content_directory_unavailable"))
                 return
 
-            plan = await run_blocking(
-                self.app.modrinth_mods.build_dependency_plan,
-                mod,
-                context["version"],
-                project_type=context["project_type"],
-                game_version=context["game_version"],
-                installed_items=context["installed_items"],
-            )
+            plan = await run_blocking(self._plan_modrinth_install, mod, context)
             if context["version"] is not self.version:
                 return
             if plan.main is None:
@@ -249,6 +242,33 @@ class ModsManagerSearchMixin:
         finally:
             self.content_installing = False
 
+    def _plan_modrinth_install(self, project: Dict, context: dict) -> ModrinthDependencyPlan:
+        return self.app.modrinth_mods.build_dependency_plan(
+            project, context["version"],
+            project_type=context["project_type"],
+            game_version=context["game_version"],
+            installed_items=self._scan_modrinth_inventory(context),
+        )
+
+    def _scan_modrinth_inventory(self, context: dict) -> list[Dict]:
+        version = context["version"]
+        directory = context["directory"]
+        if context["key"] == "mods":
+            items = self.app.content.scan_installed_mods(directory)
+        elif context["key"] == "resourcepacks":
+            items = self.app.content.scan_installed_resourcepacks(directory)
+        else:
+            items = self.app.content.scan_installed_shaderpacks(directory)
+        return self.app.content.apply_modrinth_metadata(version, items)
+
+    def _resolve_optional_install(self, plan, selected, context) -> ModrinthDependencyPlan:
+        return self.app.modrinth_mods.resolve_optional_dependencies(
+            plan, selected, context["version"],
+            project_type=context["project_type"],
+            game_version=context["game_version"],
+            installed_items=self._scan_modrinth_inventory(context),
+        )
+
     async def _install_modrinth_plan_async(
         self,
         plan: ModrinthDependencyPlan,
@@ -261,6 +281,23 @@ class ModsManagerSearchMixin:
         if not plan.can_install:
             self._warn_modrinth_plan_failure(plan)
             return
+
+        if selected_optional_dependencies:
+            approved = {
+                (item.project_id, item.version_id, item.action)
+                for item in plan.install_order_with_optional(selected_optional_dependencies)
+                if item.action != "satisfied"
+            }
+            plan = await run_blocking(self._resolve_optional_install, plan, selected_optional_dependencies, context)
+            if context["version"] is not self.version:
+                return
+            changes = {
+                (item.project_id, item.version_id, item.action)
+                for item in plan.install_order if item.action != "satisfied"
+            }
+            if not plan.can_install or not changes <= approved:
+                invoke_on_ui(self.page, self._show_modrinth_dependency_plan_dialog, plan, context)
+                return
 
         main = plan.main
         if main is None:
@@ -275,7 +312,7 @@ class ModsManagerSearchMixin:
         )
 
         await self._install_modrinth_candidates_transaction(
-            plan.install_order_with_optional(selected_optional_dependencies),
+            plan.install_order,
             context,
         )
         if context["version"] is not self.version:
@@ -371,6 +408,8 @@ class ModsManagerSearchMixin:
             return self.trans("modrinth_dependency_project_mismatch_issue", name=name)
         if issue.code == "dependency_no_file":
             return self.trans("modrinth_dependency_no_file_issue", name=name)
+        if issue.code == "dependency_version_conflict":
+            return self.trans("modrinth_dependency_version_conflict", name=name)
         return self.trans(
             "modrinth_dependency_resolution_failed",
             name=name,

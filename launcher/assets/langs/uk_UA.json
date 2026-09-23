@@ -1,4 +1,6 @@
 {
+    "launcher_instance_unavailable": "Не вдалося зв'язатися із запущеним лаунчером. Дочекайтеся завершення його запуску або закриття та спробуйте ще раз. Якщо проблема повторюється, закрийте лаунчер і відкрийте його знову.",
+    "launcher_shortcut_failed": "Не вдалося запустити збірку з ярлика. Спробуйте запустити її зі списку збірок.",
   "language": "Мова",
   "custom_client_name": "Recommend",
   "select_language": "Оберіть мову",
@@ -604,5 +606,24 @@
   "minecraft_game_dir_unavailable": "Вибраний каталог Minecraft недоступний: {path}. Виправте шлях у налаштуваннях, інакше запуск та встановлення збірок не працюватимуть.",
   "invalid_directory_path": "Некоректний шлях до каталогу",
   "directory_create_failed": "Не вдалося створити каталог",
-  "version_delete_failed": "Не вдалося видалити збірку"
+  "version_delete_failed": "Не вдалося видалити збірку",
+  "discord_support": "Підтримка в Discord",
+  "support_open_failed": "Не вдалося відкрити підтримку Discord у браузері.",
+  "modrinth_dependency_version_conflict": "Вибрані моди вимагають різних версій {name}.",
+  "create_desktop_shortcut": "Створити ярлик на робочому столі",
+  "desktop_shortcut_created": "Ярлик на робочому столі створено.",
+  "desktop_shortcut_failed": "Не вдалося створити ярлик на робочому столі.",
+  "installed_updates_idle": "Оновлення модів ще не перевірено",
+  "installed_updates_checking": "Перевіряємо оновлення модів...",
+  "installed_updates_available": "Доступні оновлення: {count}",
+  "installed_updates_current": "Усі перевірені моди актуальні",
+  "installed_updates_unchecked": "Не вдалося перевірити через Modrinth: {count}",
+  "installed_updates_no_enabled": "Немає увімкнених модів для перевірки",
+  "installed_updates_failed": "Не вдалося перевірити оновлення. Спробуйте пізніше.",
+  "installed_mod_update_versions": "{current} → {new}",
+  "installed_mod_update_disabled": "Увімкніть мод перед його оновленням",
+  "profile_active": "Активний",
+  "profile_use": "Вибрати",
+  "profile_sign_in_again": "Увійти повторно",
+  "profiles_empty": "Ще немає акаунтів"
 }
