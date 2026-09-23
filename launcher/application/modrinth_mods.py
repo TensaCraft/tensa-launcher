@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import string
-from dataclasses import dataclass, field
+from collections import deque
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from launcher.application.mod_identity import ModIdentityService, ModMatch
+from launcher.application import modrinth_inventory
+from launcher.application.mod_identity import ModIdentityService, ModMatch, ModMatchKind
 from launcher.core.api.modrinth import ModrinthAPI
 
 
@@ -90,6 +93,8 @@ class ModrinthDependencyPlan:
     skipped_embedded: list[ModrinthDependencyIssue]
     blocking_issues: list[ModrinthDependencyIssue]
     optional_dependency_issues: list[ModrinthDependencyIssue] = field(default_factory=list)
+    include_implicit_dependencies: bool = False
+    selected_optional_dependencies: list[ModrinthInstallCandidate] = field(default_factory=list)
 
     @property
     def requires_confirmation(self) -> bool:
@@ -117,6 +122,8 @@ class ModrinthDependencyPlan:
             return []
         selected = [candidate for candidate in selected_optional_dependencies or [] if candidate.action != "satisfied"]
         required_ids = {candidate.project_id for candidate in self.dependencies_to_replace + self.dependencies_to_install}
+        required_ids.update(candidate.project_id for candidate in self.already_satisfied if candidate.dependency_type != "optional")
+        required_ids.add(self.main.project_id)
         unique_optional = [candidate for candidate in selected if candidate.project_id not in required_ids]
         return [*self.dependencies_to_replace, *self.dependencies_to_install, *unique_optional, self.main]
 
@@ -127,6 +134,47 @@ class ModrinthModsService:
 
     def __init__(self, identity: ModIdentityService | None = None) -> None:
         self.identity = identity or ModIdentityService()
+
+    def identify_installed_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return modrinth_inventory.identify_installed_items(items)
+
+    def check_installed_updates(self, installed_items: list[dict[str, Any]], version) -> list[dict[str, Any]]:
+        identified = self.identify_installed_items(installed_items)
+        loader = self.get_loader_name(version)
+        game_version = getattr(version, "version", None)
+        eligible = [
+            item for item in identified
+            if item.get("enabled", True)
+            and item.get("modrinth_hash_algorithm") == "sha512"
+            and self.owns_installed_item(item, str(item.get("modrinth_project_id") or ""))
+        ]
+        updates = ModrinthAPI.get_updates_by_hashes(
+            [item["modrinth_file_hash"] for item in eligible],
+            game_versions=[game_version] if game_version else [],
+            loaders=[loader] if loader else [],
+        ) if eligible else {}
+        for item in identified:
+            item["update_available"] = False
+            item["update_checked"] = False
+            item.pop("latest_version", None)
+        for item in eligible:
+            candidate = updates.get(item["modrinth_file_hash"])
+            item["update_checked"] = candidate is not None
+            if not candidate or candidate.get("id") == item.get("modrinth_version_id"):
+                continue
+            if candidate.get("project_id") != item.get("modrinth_project_id"):
+                raise ValueError("Modrinth returned an update for a different project")
+            current = item.get("modrinth_version_data")
+            if not isinstance(current, dict):
+                current = ModrinthAPI.get_version_by_id(item["modrinth_version_id"])
+            if (
+                self.filter_compatible_versions([candidate], version)
+                and self.select_primary_file(candidate) is not None
+                and self._version_date(candidate) > self._version_date(current)
+            ):
+                item["update_available"] = True
+                item["latest_version"] = candidate
+        return identified
 
     @staticmethod
     def get_loader_name(version) -> str | None:
@@ -203,7 +251,7 @@ class ModrinthModsService:
         installed_items: list[dict[str, Any]] | None = None,
         include_implicit_dependencies: bool = True,
     ) -> ModrinthDependencyPlan:
-        installed = installed_items or []
+        installed = self.identify_installed_items(installed_items or [])
         normalized_project = self._normalize_project_payload(project)
         project_id = str(normalized_project.get("project_id") or "")
         main_version = self.find_latest_version(
@@ -242,6 +290,9 @@ class ModrinthModsService:
             game_version=game_version,
             dependency_type="selected",
         )
+        ambiguity = self._ambiguous_installation_issue(main_candidate)
+        if ambiguity is not None:
+            return self._empty_dependency_plan(ambiguity)
         if project_type != "mod":
             return ModrinthDependencyPlan(main_candidate, [], [], [], [], [], [])
 
@@ -254,20 +305,55 @@ class ModrinthModsService:
             include_implicit_dependencies=include_implicit_dependencies,
         )
 
-    def find_update(self, installed_mod: dict[str, Any], version) -> dict[str, Any] | None:
-        mod_id = installed_mod.get("id")
-        if not mod_id or not installed_mod.get("enabled", True):
-            return None
-
-        latest_version = self.find_latest_version(mod_id, version)
-        if latest_version is None:
-            return None
-
-        current_version = installed_mod.get("version", "")
-        latest_version_number = latest_version.get("version_number", "")
-        if current_version and latest_version_number and current_version != latest_version_number:
-            return latest_version
-        return None
+    def resolve_optional_dependencies(
+        self,
+        plan: ModrinthDependencyPlan,
+        selected: list[ModrinthInstallCandidate],
+        version,
+        *,
+        installed_items: list[dict[str, Any]],
+        project_type: str = "mod",
+        game_version: str | None = None,
+        include_implicit_dependencies: bool | None = None,
+    ) -> ModrinthDependencyPlan:
+        """Replan the original main plus prior and new exact optional selections."""
+        if plan.main is None:
+            return replace(plan)
+        installed = self.identify_installed_items(installed_items)
+        main = self._candidate_for(
+            plan.main.project, plan.main.version_data, plan.main.install_file, installed, version,
+            project_type=project_type, game_version=game_version, dependency_type="selected",
+            exact_version=True,
+        )
+        ambiguity = self._ambiguous_installation_issue(main)
+        if ambiguity is not None:
+            return self._empty_dependency_plan(ambiguity)
+        if project_type != "mod":
+            return ModrinthDependencyPlan(main, [], [], [], [], [], [])
+        roots: dict[tuple[str, str], ModrinthInstallCandidate] = {}
+        for candidate in [*plan.selected_optional_dependencies, *selected]:
+            roots.setdefault((candidate.project_id, candidate.version_id), candidate)
+        selected_roots = list(roots.values())
+        implicit = plan.include_implicit_dependencies if include_implicit_dependencies is None else include_implicit_dependencies
+        for candidate in selected_roots:
+            if not candidate.project_id or not candidate.version_id:
+                return ModrinthDependencyPlan(main, [], [], [], [], [], [
+                    ModrinthDependencyIssue(
+                        "dependency_resolution_failed", "Selected dependency has no exact version.",
+                        project_id=candidate.project_id or None,
+                    ),
+                ], include_implicit_dependencies=implicit, selected_optional_dependencies=selected_roots)
+        implicit_candidate = next((
+            candidate for candidate in plan.dependencies_to_install + plan.dependencies_to_replace + plan.already_satisfied
+            if candidate.project_id == self.FABRIC_API_PROJECT_ID and candidate.dependency_type != "optional"
+        ), None)
+        return self._resolve_required_dependencies(
+            main, version, project_type=project_type, game_version=game_version,
+            installed_items=installed,
+            include_implicit_dependencies=implicit,
+            selected_optional_dependencies=selected_roots,
+            implicit_candidate=implicit_candidate,
+        )
 
     @staticmethod
     def select_primary_file(version_data: dict[str, Any] | None) -> ModInstallFile | None:
@@ -355,7 +441,18 @@ class ModrinthModsService:
         installed_items: list[dict[str, Any]],
         project: dict[str, Any],
     ) -> ModMatch:
+        project_id = str(project.get("project_id") or project.get("id") or "").strip()
+        enabled_owned = [
+            item for item in installed_items
+            if self.identity.owns_item(item, project_id) and self._installed_item_enabled(item)
+        ]
+        if len(enabled_owned) == 1:
+            return self.identity.match_project(enabled_owned, project)
         return self.identity.match_project(installed_items, project)
+
+    @staticmethod
+    def _installed_item_enabled(item: Mapping[str, Any]) -> bool:
+        return bool(item.get("enabled", True)) and not str(item.get("path") or "").lower().endswith(".disabled")
 
     @staticmethod
     def owns_installed_item(installed_item: dict[str, Any] | None, project_id: str) -> bool:
@@ -400,151 +497,142 @@ class ModrinthModsService:
         game_version: str | None,
         installed_items: list[dict[str, Any]],
         include_implicit_dependencies: bool,
+        selected_optional_dependencies: list[ModrinthInstallCandidate] | None = None,
+        implicit_candidate: ModrinthInstallCandidate | None = None,
     ) -> ModrinthDependencyPlan:
-        resolved: dict[str, ModrinthInstallCandidate] = {}
-        optional: dict[str, ModrinthInstallCandidate] = {}
-        optional_satisfied: list[ModrinthInstallCandidate] = []
-        optional_issues: list[ModrinthDependencyIssue] = []
-        embedded: list[ModrinthDependencyIssue] = []
-        issues: list[ModrinthDependencyIssue] = []
-        incompatible_dependencies: list[tuple[dict[str, Any], tuple[str, ...]]] = []
-        processed_versions: set[tuple[str, str]] = {(main_candidate.project_id, main_candidate.version_id)}
-        queue: list[tuple[ModrinthInstallCandidate, dict[str, Any]]] = [
-            (main_candidate, dependency)
-            for dependency in main_candidate.version_data.get("dependencies", [])
+        selected = selected_optional_dependencies or []
+        selected_ids = {candidate.project_id for candidate in selected}
+        root_dependencies = [
+            dependency for dependency in main_candidate.version_data.get("dependencies", [])
             if isinstance(dependency, dict)
+        ] + [
+            {"project_id": candidate.project_id, "version_id": candidate.version_id, "dependency_type": "required"}
+            for candidate in selected
         ]
+        cache: dict[tuple[str, ...], tuple[ModrinthInstallCandidate | None, list[ModrinthDependencyIssue]]] = {}
 
-        while queue:
-            source, dependency = queue.pop(0)
-            dependency_type = str(dependency.get("dependency_type") or "required").lower()
-            requested_by = (*source.requested_by, source.title)
-
-            if dependency_type == "optional":
+        def resolve(dependency, requested_by, issues, *, optional=False):
+            key = tuple(str(dependency.get(name) or "") for name in ("project_id", "version_id", "file_name")) + (str(optional),)
+            if key not in cache:
+                errors: list[ModrinthDependencyIssue] = []
                 candidate = self._resolve_dependency_candidate(
-                    dependency,
-                    version,
-                    project_type=project_type,
-                    game_version=game_version,
-                    installed_items=installed_items,
-                    requested_by=requested_by,
-                    issues=optional_issues,
-                    dependency_kind="optional",
-                    blocking=False,
+                    dependency, version, project_type=project_type, game_version=game_version,
+                    installed_items=installed_items, requested_by=(), issues=errors,
+                    dependency_kind="optional" if optional else "required", blocking=not optional,
+                    known_candidate=(
+                        implicit_candidate if dependency.get("project_id") == self.FABRIC_API_PROJECT_ID
+                        and not dependency.get("version_id") else None
+                    ),
                 )
-                if candidate is None or candidate.project_id == main_candidate.project_id:
+                cache[key] = candidate, errors
+            candidate, errors = cache[key]
+            issues.extend(replace(issue, requested_by=requested_by) for issue in errors)
+            return replace(candidate, requested_by=requested_by) if candidate is not None else None
+
+        previous: dict[str, ModrinthInstallCandidate] = {}
+        seen: set[tuple[tuple[str, str], ...]] = {()}
+        while True:
+            # Only the currently reachable versions contribute constraints on each pass.
+            resolved: dict[str, ModrinthInstallCandidate] = {}
+            pinned = {main_candidate.project_id: main_candidate.version_id}
+            optional: dict[str, ModrinthInstallCandidate] = {}
+            optional_satisfied: list[ModrinthInstallCandidate] = []
+            optional_issues: list[ModrinthDependencyIssue] = []
+            embedded: list[ModrinthDependencyIssue] = []
+            issues: list[ModrinthDependencyIssue] = []
+            incompatible: list[tuple[dict[str, Any], tuple[str, ...]]] = []
+            traversed = {main_candidate.project_id}
+            queue = deque((main_candidate, dependency) for dependency in root_dependencies)
+            implicit_checked = not (
+                include_implicit_dependencies and project_type == "mod"
+                and self.get_loader_name(version) == "fabric"
+                and main_candidate.project_id != self.FABRIC_API_PROJECT_ID
+            )
+
+            while queue or not implicit_checked:
+                if not queue:
+                    implicit_checked = True
+                    if self.FABRIC_API_PROJECT_ID in resolved:
+                        break
+                    queue.append((main_candidate, {"project_id": self.FABRIC_API_PROJECT_ID, "dependency_type": "required"}))
+                source, dependency = queue.popleft()
+                kind = str(dependency.get("dependency_type") or "required").lower()
+                requested_by = (*source.requested_by, source.title)
+                if kind == "optional":
+                    if str(dependency.get("project_id") or "") in selected_ids:
+                        continue
+                    candidate = resolve(dependency, requested_by, optional_issues, optional=True)
+                    if candidate is None or candidate.project_id == main_candidate.project_id or candidate.project_id in selected_ids:
+                        continue
+                    if candidate.action == "satisfied":
+                        optional_satisfied.append(candidate)
+                    else:
+                        existing = optional.get(candidate.project_id)
+                        if existing is None or self._is_version_newer(candidate.version_data, existing.version_data):
+                            optional[candidate.project_id] = candidate
                     continue
-                if candidate.action == "satisfied":
-                    optional_satisfied.append(candidate)
-                else:
-                    existing_optional = optional.get(candidate.project_id)
-                    if existing_optional is None or self._is_version_newer(candidate.version_data, existing_optional.version_data):
-                        optional[candidate.project_id] = candidate
-                continue
-            if dependency_type == "embedded":
-                embedded.append(self._issue_for_dependency("embedded_dependency", dependency, requested_by, blocking=False))
-                continue
-            if dependency_type == "incompatible":
-                incompatible_dependencies.append((dependency, requested_by))
-                continue
-            if dependency_type != "required":
-                optional_issues.append(
-                    self._issue_for_dependency("unsupported_dependency_type", dependency, requested_by, blocking=False)
-                )
-                continue
+                if kind == "embedded":
+                    embedded.append(self._issue_for_dependency("embedded_dependency", dependency, requested_by, blocking=False))
+                    continue
+                if kind == "incompatible":
+                    incompatible.append((dependency, requested_by))
+                    continue
+                if kind != "required":
+                    optional_issues.append(self._issue_for_dependency("unsupported_dependency_type", dependency, requested_by, blocking=False))
+                    continue
 
-            candidate = self._resolve_dependency_candidate(
-                dependency,
-                version,
-                project_type=project_type,
-                game_version=game_version,
-                installed_items=installed_items,
-                requested_by=requested_by,
-                issues=issues,
-                dependency_kind="required",
-                blocking=True,
+                candidate = resolve(dependency, requested_by, issues)
+                if candidate is None:
+                    continue
+                exact_id = str(dependency.get("version_id") or "")
+                pinned_id = pinned.get(candidate.project_id)
+                if exact_id and pinned_id and exact_id != pinned_id:
+                    issues.append(self._issue_for_dependency(
+                        "dependency_version_conflict", dependency, requested_by, project_id=candidate.project_id,
+                    ))
+                    continue
+                if candidate.project_id == main_candidate.project_id:
+                    continue
+                if exact_id:
+                    pinned[candidate.project_id] = exact_id
+                existing = resolved.get(candidate.project_id)
+                if existing is None or exact_id or (
+                    not pinned_id and self._is_version_newer(candidate.version_data, existing.version_data)
+                ):
+                    resolved[candidate.project_id] = candidate
+                if candidate.project_id in traversed:
+                    continue
+                traversed.add(candidate.project_id)
+                chosen = replace(previous.get(candidate.project_id, candidate), requested_by=requested_by)
+                for child in chosen.version_data.get("dependencies", []):
+                    if isinstance(child, dict):
+                        queue.append((chosen, child))
+
+            signature = tuple(sorted((key, candidate.version_id) for key, candidate in resolved.items()))
+            old_signature = tuple(sorted((key, candidate.version_id) for key, candidate in previous.items()))
+            if signature != old_signature:
+                if signature not in seen:
+                    seen.add(signature)
+                    previous = resolved
+                    continue
+                issues.append(ModrinthDependencyIssue(
+                    "dependency_version_conflict", "Dependency version selections do not converge.",
+                    project_id=main_candidate.project_id,
+                ))
+            self._append_incompatible_issues(incompatible, main_candidate, resolved, installed_items, issues)
+            candidates = list(resolved.values())
+            return ModrinthDependencyPlan(
+                main=main_candidate,
+                dependencies_to_install=[candidate for candidate in candidates if candidate.action == "install"],
+                dependencies_to_replace=[candidate for candidate in candidates if candidate.action == "replace"],
+                already_satisfied=[candidate for candidate in candidates if candidate.action == "satisfied"] + [
+                    candidate for candidate in optional_satisfied if candidate.project_id not in resolved
+                ],
+                optional_dependencies=list(optional.values()), skipped_embedded=embedded,
+                blocking_issues=issues, optional_dependency_issues=optional_issues,
+                include_implicit_dependencies=include_implicit_dependencies,
+                selected_optional_dependencies=list(selected),
             )
-            if candidate is None or candidate.project_id == main_candidate.project_id:
-                continue
-
-            existing = resolved.get(candidate.project_id)
-            if existing is None or self._is_version_newer(candidate.version_data, existing.version_data):
-                resolved[candidate.project_id] = candidate
-                candidate_for_traversal = candidate
-            else:
-                candidate_for_traversal = existing
-
-            version_key = (candidate_for_traversal.project_id, candidate_for_traversal.version_id)
-            if version_key in processed_versions:
-                continue
-            processed_versions.add(version_key)
-            for child_dependency in candidate_for_traversal.version_data.get("dependencies", []):
-                if isinstance(child_dependency, dict):
-                    queue.append((candidate_for_traversal, child_dependency))
-
-        if include_implicit_dependencies:
-            self._append_implicit_dependencies(
-                main_candidate,
-                resolved,
-                version,
-                project_type=project_type,
-                game_version=game_version,
-                installed_items=installed_items,
-                issues=issues,
-            )
-
-        self._append_incompatible_issues(
-            incompatible_dependencies,
-            main_candidate,
-            resolved,
-            installed_items,
-            issues,
-        )
-
-        candidates = list(resolved.values())
-        return ModrinthDependencyPlan(
-            main=main_candidate,
-            dependencies_to_install=[candidate for candidate in candidates if candidate.action == "install"],
-            dependencies_to_replace=[candidate for candidate in candidates if candidate.action == "replace"],
-            already_satisfied=[candidate for candidate in candidates if candidate.action == "satisfied"] + optional_satisfied,
-            optional_dependencies=list(optional.values()),
-            skipped_embedded=embedded,
-            blocking_issues=issues,
-            optional_dependency_issues=optional_issues,
-        )
-
-    def _append_implicit_dependencies(
-        self,
-        main_candidate: ModrinthInstallCandidate,
-        resolved: dict[str, ModrinthInstallCandidate],
-        version,
-        *,
-        project_type: str,
-        game_version: str | None,
-        installed_items: list[dict[str, Any]],
-        issues: list[ModrinthDependencyIssue],
-    ) -> None:
-        if project_type != "mod" or self.get_loader_name(version) != "fabric":
-            return
-        if main_candidate.project_id == self.FABRIC_API_PROJECT_ID:
-            return
-        if self.FABRIC_API_PROJECT_ID in resolved:
-            return
-
-        candidate = self._resolve_dependency_candidate(
-            {"project_id": self.FABRIC_API_PROJECT_ID, "dependency_type": "required"},
-            version,
-            project_type=project_type,
-            game_version=game_version,
-            installed_items=installed_items,
-            requested_by=(main_candidate.title,),
-            issues=issues,
-            dependency_kind="required",
-            blocking=True,
-        )
-        if candidate is None or candidate.project_id == main_candidate.project_id:
-            return
-        resolved[candidate.project_id] = candidate
 
     def _resolve_dependency_candidate(
         self,
@@ -558,6 +646,7 @@ class ModrinthModsService:
         issues: list[ModrinthDependencyIssue],
         dependency_kind: str,
         blocking: bool,
+        known_candidate: ModrinthInstallCandidate | None = None,
     ) -> ModrinthInstallCandidate | None:
         version_id = str(dependency.get("version_id") or "")
         project_id = str(dependency.get("project_id") or "")
@@ -616,13 +705,25 @@ class ModrinthModsService:
                 return None
             version_data = exact_version
         elif project_id:
-            versions = self._get_compatible_versions_safely(
-                project_id,
-                version,
-                project_type=project_type,
-                game_version=game_version,
-            )
-            version_data = self._select_newest_version(versions)
+            match = self.match_installed(installed_items, {"project_id": project_id})
+            if match.owned and match.item and self._installed_item_enabled(match.item):
+                current = self._installed_version(match.item)
+                if current and current.get("project_id") == project_id and self.filter_compatible_versions(
+                    [current], version, project_type=project_type, game_version=game_version,
+                ):
+                    version_data = current
+            if version_data is None and known_candidate is not None and self.filter_compatible_versions(
+                [known_candidate.version_data], version, project_type=project_type, game_version=game_version,
+            ):
+                version_data = known_candidate.version_data
+            if version_data is None:
+                versions = self._get_compatible_versions_safely(
+                    project_id,
+                    version,
+                    project_type=project_type,
+                    game_version=game_version,
+                )
+                version_data = self._select_newest_version(versions)
             if version_data is None:
                 issues.append(
                     self._issue_for_dependency(
@@ -674,8 +775,10 @@ class ModrinthModsService:
             )
             return None
 
-        project = self._load_project(project_id or str(version_data.get("project_id") or ""))
-        return self._candidate_for(
+        project = known_candidate.project if known_candidate is not None else self._load_project(
+            project_id or str(version_data.get("project_id") or ""),
+        )
+        candidate = self._candidate_for(
             project,
             version_data,
             install_file,
@@ -685,6 +788,32 @@ class ModrinthModsService:
             game_version=game_version,
             dependency_type=dependency_kind,
             requested_by=requested_by,
+            exact_version=bool(version_id),
+        )
+        ambiguity = self._ambiguous_installation_issue(candidate, blocking=blocking)
+        if ambiguity is not None:
+            issues.append(ambiguity)
+            return None
+        return candidate
+
+    def _ambiguous_installation_issue(
+        self, candidate: ModrinthInstallCandidate, *, blocking: bool = True,
+    ) -> ModrinthDependencyIssue | None:
+        match = candidate.installed_match
+        if (
+            match is None or match.kind != ModMatchKind.AMBIGUOUS
+            or match.reason != "duplicate_verified_modrinth_provenance"
+        ):
+            return None
+        return self._issue_for_dependency(
+            "dependency_resolution_failed",
+            {
+                "project_id": candidate.project_id,
+                "version_id": candidate.version_id,
+                "dependency_type": candidate.dependency_type,
+            },
+            candidate.requested_by,
+            blocking=blocking,
         )
 
     def _get_compatible_versions_safely(
@@ -717,6 +846,7 @@ class ModrinthModsService:
         game_version: str | None,
         dependency_type: str,
         requested_by: tuple[str, ...] = (),
+        exact_version: bool = False,
     ) -> ModrinthInstallCandidate:
         normalized_project = self._normalize_project_payload(
             project,
@@ -730,6 +860,7 @@ class ModrinthModsService:
             version,
             project_type=project_type,
             game_version=game_version,
+            exact_version=exact_version,
         )
         return ModrinthInstallCandidate(
             project=normalized_project,
@@ -750,25 +881,25 @@ class ModrinthModsService:
         *,
         project_type: str,
         game_version: str | None,
+        exact_version: bool = False,
     ) -> str:
         installed_item = installed_match.item
         if installed_item is None:
             return "install"
         if not installed_match.owned:
             return "install"
-        if not installed_item.get("enabled", True):
+        if not self._installed_item_enabled(installed_item):
             return "replace"
 
         installed_version_id = str(installed_item.get("modrinth_version_id") or "")
         candidate_version_id = str(candidate_version.get("id") or "")
         if installed_version_id and installed_version_id == candidate_version_id:
             return "satisfied"
-        if not installed_version_id:
+        if not installed_version_id or exact_version:
             return "replace"
 
-        try:
-            installed_version = ModrinthAPI.get_version_by_id(installed_version_id)
-        except Exception:
+        installed_version = self._installed_version(installed_item)
+        if installed_version is None:
             return "replace"
 
         compatible = self.filter_compatible_versions(
@@ -780,6 +911,19 @@ class ModrinthModsService:
         if compatible and not self._is_version_newer(candidate_version, installed_version):
             return "satisfied"
         return "replace"
+
+    @staticmethod
+    def _installed_version(item: Mapping[str, Any]) -> dict[str, Any] | None:
+        version_id = item.get("modrinth_version_id")
+        if not version_id:
+            return None
+        data = item.get("modrinth_version_data")
+        if not isinstance(data, dict):
+            try:
+                data = ModrinthAPI.get_version_by_id(version_id)
+            except Exception:
+                return None
+        return data if isinstance(data, dict) and data.get("id") == version_id else None
 
     def _append_incompatible_issues(
         self,

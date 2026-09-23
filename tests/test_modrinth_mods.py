@@ -55,24 +55,6 @@ def test_modrinth_mods_filters_compatible_versions():
     assert compatible == [{"version_number": "2.0.0", "game_versions": ["1.20.1"], "loaders": ["fabric"]}]
 
 
-def test_modrinth_mods_detects_available_update(monkeypatch):
-    monkeypatch.setattr(
-        "launcher.core.api.modrinth.ModrinthAPI.get_mod_versions",
-        lambda *_args, **_kwargs: [
-            {"version_number": "2.0.0", "game_versions": ["1.20.1"], "loaders": ["fabric"]},
-        ],
-    )
-
-    service = ModrinthModsService()
-    version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
-    installed_mod = {"id": "sodium", "enabled": True, "version": "1.0.0"}
-
-    latest = service.find_update(installed_mod, version)
-
-    assert latest is not None
-    assert latest["version_number"] == "2.0.0"
-
-
 def test_modrinth_mods_selects_primary_file():
     version_data = {
         "version_number": "1.2.3",
@@ -223,6 +205,7 @@ def _project(project_id: str) -> dict:
 
 def test_modrinth_mods_treats_sodium_extra_fuzzy_match_as_non_owning_hint(monkeypatch):
     service = ModrinthModsService()
+    monkeypatch.setattr(service, "identify_installed_items", lambda items: items)
     version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
     sodium_version = _modrinth_version(
         "sodium-project",
@@ -576,6 +559,7 @@ def test_dependency_plan_deduplicates_transitive_dependency_cycles(monkeypatch):
 
 def test_dependency_plan_treats_same_installed_dependency_version_as_satisfied(monkeypatch):
     service = ModrinthModsService()
+    monkeypatch.setattr(service, "identify_installed_items", lambda items: items)
     version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
     main_version = _modrinth_version(
         "main-project",
@@ -615,8 +599,9 @@ def test_dependency_plan_treats_same_installed_dependency_version_as_satisfied(m
     assert [candidate.project_id for candidate in plan.already_satisfied] == ["dep-project"]
 
 
-def test_dependency_plan_replaces_older_installed_dependency(monkeypatch):
+def test_dependency_plan_keeps_compatible_unpinned_installed_dependency(monkeypatch):
     service = ModrinthModsService()
+    monkeypatch.setattr(service, "identify_installed_items", lambda items: items)
     version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
     main_version = _modrinth_version(
         "main-project",
@@ -665,8 +650,33 @@ def test_dependency_plan_replaces_older_installed_dependency(monkeypatch):
     )
 
     assert plan.dependencies_to_install == []
-    assert [candidate.project_id for candidate in plan.dependencies_to_replace] == ["dep-project"]
-    assert plan.dependencies_to_replace[0].installed_item == installed_old
+    assert plan.dependencies_to_replace == []
+    assert [candidate.project_id for candidate in plan.already_satisfied] == ["dep-project"]
+    assert plan.already_satisfied[0].installed_item == installed_old
+    assert plan.already_satisfied[0].version_id == "dep-old"
+
+
+def test_dependency_plan_honors_exact_pin_even_when_installed_version_is_newer(monkeypatch):
+    service = ModrinthModsService()
+    version = SimpleNamespace(loader="forge", version="1.20.1")
+    main = _modrinth_version("main", "main-version", "main.jar", loaders=["forge"], dependencies=[
+        {"project_id": "dependency", "version_id": "old", "dependency_type": "required"},
+    ])
+    old = _modrinth_version("dependency", "old", "old.jar", loaders=["forge"])
+    new = _modrinth_version("dependency", "new", "new.jar", loaders=["forge"], date="2026-02-01T00:00:00Z")
+    installed = {
+        "modrinth_project_id": "dependency", "modrinth_version_id": "new",
+        "modrinth_hash_algorithm": "sha512", "modrinth_file_hash": "a" * 128,
+        "modrinth_provenance_authoritative": True,
+    }
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod_versions", lambda *_a, **_kw: [main])
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_version_by_id", lambda value: {"old": old, "new": new}[value])
+    monkeypatch.setattr("launcher.core.api.modrinth.ModrinthAPI.get_mod", _project)
+
+    plan = service.build_dependency_plan(_project("main"), version, installed_items=[installed])
+
+    assert [item.version_id for item in plan.dependencies_to_replace] == ["old"]
+    assert not plan.already_satisfied
 
 
 def test_dependency_plan_blocks_file_name_only_required_dependency(monkeypatch):
@@ -696,6 +706,7 @@ def test_dependency_plan_blocks_file_name_only_required_dependency(monkeypatch):
 
 def test_dependency_plan_blocks_incompatible_installed_dependency(monkeypatch):
     service = ModrinthModsService()
+    monkeypatch.setattr(service, "identify_installed_items", lambda items: items)
     version = SimpleNamespace(loader="fabric", client="fabric", version="1.20.1")
     main_version = _modrinth_version(
         "main-project",

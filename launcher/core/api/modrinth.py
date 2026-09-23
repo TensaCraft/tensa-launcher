@@ -8,6 +8,38 @@ class ModrinthAPI:
     REQUEST_TIMEOUT = (5, 20)
 
     @staticmethod
+    def get_versions_by_hashes(hashes: list[str], algorithm: str = "sha512") -> dict[str, dict]:
+        return ModrinthAPI._hash_request("version_files", hashes, algorithm)
+
+    @staticmethod
+    def get_updates_by_hashes(
+        hashes: list[str], *, game_versions: list[str], loaders: list[str], algorithm: str = "sha512",
+    ) -> dict[str, dict]:
+        return ModrinthAPI._hash_request(
+            "version_files/update", hashes, algorithm, game_versions=game_versions, loaders=loaders,
+        )
+
+    @staticmethod
+    def _hash_request(route: str, hashes: list[str], algorithm: str, **filters) -> dict[str, dict]:
+        if algorithm not in {"sha1", "sha512"}:
+            raise ValueError("Unsupported Modrinth hash algorithm")
+        unique = list(dict.fromkeys(hashes))
+        versions: dict[str, dict] = {}
+        for offset in range(0, len(unique), 100):
+            batch = unique[offset:offset + 100]
+            response = requests.post(
+                f"{ModrinthAPI.BASE_URL}/{route}",
+                json={"hashes": batch, "algorithm": algorithm, **filters},
+                timeout=ModrinthAPI.REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or any(not isinstance(value, dict) for value in data.values()):
+                raise ValueError("Invalid Modrinth file lookup response")
+            versions.update((digest, data[digest]) for digest in batch if digest in data)
+        return versions
+
+    @staticmethod
     def search_modpacks(query='', offset=0, limit=20):
         url = f"{ModrinthAPI.BASE_URL}/search"
         params = {
