@@ -5,9 +5,11 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+from threading import get_ident
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from launcher import __version__
 from launcher.core.pending_update import PENDING_UPDATE_MARKER, PENDING_UPDATE_SCHEMA, PENDING_UPDATE_STAGING_DIR
@@ -77,6 +79,173 @@ def test_updater_uses_github_releases_endpoint_and_headers():
     assert updater.GITHUB_RELEASES_URL == "https://api.github.com/repos/TensaCraft/tensa-launcher/releases"
     assert updater._session.headers["Accept"] == "application/vnd.github+json"
     assert updater._session.headers["X-GitHub-Api-Version"] == "2022-11-28"
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "appimage", "asset_name"),
+    [
+        ("windows", False, "TensaLauncher.exe"),
+        ("macos", False, "TensaLauncher.dmg"),
+        ("linux", False, "TensaLauncher"),
+        ("linux", True, "TensaLauncher-x86_64.AppImage"),
+    ],
+)
+@pytest.mark.parametrize("include_beta", ["yes", "no"])
+def test_updater_resolves_assets_missing_from_release_listing(platform_name, appimage, asset_name, include_beta):
+    updater = AutoUpdater(app_stub(version="4.5.6", include_beta_updates=include_beta))
+    updater.platform = platform_name
+    updater.appimage_path = Path("/tmp/TensaLauncher.AppImage") if appimage else None
+    release = github_release("v4.5.7", prerelease=False, assets=[])
+    release.update(id=394419856, assets_url="https://untrusted.example/assets")
+    asset = github_asset(asset_name, f"https://github.com/TensaCraft/tensa-launcher/releases/download/v4.5.7/{asset_name}")
+    calls = []
+
+    def get(url, params=None, timeout=None):
+        calls.append((url, params, timeout))
+        return GitHubResponse([release] if url == updater.GITHUB_RELEASES_URL else [asset])
+
+    updater._session.get = get
+    update = updater.check_for_updates()
+
+    assert update is not None
+    assert update["version"] == "4.5.7"
+    assert update["download_url"] == asset["browser_download_url"]
+    assert update["download_hash"] == "abcdef"
+    assert update["channel"] == "stable"
+    assert calls == [
+        (updater.GITHUB_RELEASES_URL, {"per_page": 100}, 5),
+        (f"{updater.GITHUB_RELEASES_URL}/394419856/assets", {"per_page": 100, "page": 1}, 5),
+    ]
+    assert release["assets"] == []
+
+
+@pytest.mark.parametrize("release_id", [None, True, 0, -1, "../other", 1.5])
+def test_updater_does_not_fetch_assets_for_invalid_release_id(release_id):
+    updater = AutoUpdater(app_stub(version="4.5.6"))
+    release = github_release("v4.5.7", prerelease=False, assets=[])
+    release["id"] = release_id
+    calls = []
+    updater._session.get = lambda url, **_kwargs: calls.append(url) or GitHubResponse([release])
+
+    assert updater.check_for_updates() is None
+    assert calls == [updater.GITHUB_RELEASES_URL]
+
+
+@pytest.mark.parametrize("payload", [[], {"message": "not found"}, [None, "invalid"], requests.Timeout("timed out")])
+def test_updater_handles_unavailable_release_assets(payload):
+    updater = AutoUpdater(app_stub(version="4.5.6"))
+    release = github_release("v4.5.7", prerelease=False, assets=[])
+    release["id"] = 123
+
+    def get(url, **_kwargs):
+        if url == updater.GITHUB_RELEASES_URL:
+            return GitHubResponse([release])
+        if isinstance(payload, Exception):
+            raise payload
+        return GitHubResponse(payload)
+
+    updater._session.get = get
+    assert updater.check_for_updates() is None
+
+
+@pytest.mark.parametrize(("tag", "prerelease", "draft"), [
+    ("v4.5.6", False, False), ("v4.5.8-beta.1", True, False), ("v4.5.7", False, True),
+])
+def test_updater_does_not_fetch_assets_for_ineligible_releases(tag, prerelease, draft):
+    updater = AutoUpdater(app_stub(version="4.5.6"))
+    release = github_release(tag, prerelease=prerelease, draft=draft, assets=[])
+    release["id"] = 123
+    calls = []
+    updater._session.get = lambda url, **_kwargs: calls.append(url) or GitHubResponse([release])
+
+    assert updater.check_for_updates() is None
+    assert calls == [updater.GITHUB_RELEASES_URL]
+
+
+def test_updater_fetches_next_asset_page_without_selecting_installer():
+    updater = AutoUpdater(app_stub(version="4.5.6"))
+    updater.platform = "windows"
+    release = github_release("v4.5.7", prerelease=False, assets=[])
+    release["id"] = 123
+    calls = []
+
+    def get(url, params=None, **_kwargs):
+        if url == updater.GITHUB_RELEASES_URL:
+            return GitHubResponse([release])
+        calls.append(params["page"])
+        if params["page"] == 1:
+            return GitHubResponse([github_asset("TensaLauncherInstaller.exe", "https://example.com/setup.exe")] * 100)
+        return GitHubResponse([github_asset("TensaLauncher.exe", "https://example.com/launcher.exe")])
+
+    updater._session.get = get
+    update = updater.check_for_updates()
+
+    assert update is not None
+    assert update["download_file_name"] == "TensaLauncher.exe"
+    assert calls == [1, 2]
+
+
+def test_updater_bounds_asset_pagination():
+    updater = AutoUpdater(app_stub(version="4.5.6"))
+    updater.platform = "windows"
+    release = github_release("v4.5.7", prerelease=False, assets=[])
+    release["id"] = 123
+    pages = []
+
+    def get(url, params=None, **_kwargs):
+        if url == updater.GITHUB_RELEASES_URL:
+            return GitHubResponse([release])
+        pages.append(params["page"])
+        return GitHubResponse([github_asset("TensaLauncher.dmg", "https://example.com/launcher.dmg")] * 100)
+
+    updater._session.get = get
+    assert updater.check_for_updates() is None
+    assert pages == list(range(1, updater.MAX_ASSET_PAGES + 1))
+
+
+def test_updater_retries_incomplete_asset_listing_on_next_check():
+    updater = AutoUpdater(app_stub(version="4.5.6"))
+    updater.platform = "windows"
+    release = github_release("v4.5.7", prerelease=False, assets=[
+        github_asset("TensaLauncher.dmg", "https://example.com/launcher.dmg"),
+    ])
+    release["id"] = 123
+    asset = github_asset("TensaLauncher.exe", "https://example.com/launcher.exe")
+    asset["state"] = "starter"
+
+    def get(url, **_kwargs):
+        return GitHubResponse([release] if url == updater.GITHUB_RELEASES_URL else [asset])
+
+    updater._session.get = get
+    assert updater.check_for_updates() is None
+    asset["state"] = "uploaded"
+    assert updater.check_for_updates()["download_url"] == asset["browser_download_url"]
+
+
+@pytest.mark.parametrize("terminating", [False, True])
+def test_startup_update_check_runs_off_ui_thread_and_skips_shutdown_dialog(monkeypatch, terminating):
+    app = app_stub(version="4.5.6")
+    updater = AutoUpdater(app)
+    update = {"version": "4.5.7"}
+    worker_threads = []
+    dialogs = []
+
+    def check():
+        worker_threads.append(get_ident())
+        app._terminating = terminating
+        return update
+
+    async def skip_delay(_seconds):
+        return None
+
+    monkeypatch.setattr(updater, "check_for_updates", check)
+    monkeypatch.setattr(updater, "show_update_dialog", dialogs.append)
+    monkeypatch.setattr("launcher.core.updater.asyncio.sleep", skip_delay)
+    ui_thread = get_ident()
+    asyncio.run(updater.check_for_updates_async())
+
+    assert worker_threads and worker_threads[0] != ui_thread
+    assert dialogs == ([] if terminating else [update])
 
 
 def test_updater_detects_darwin_as_macos(monkeypatch):

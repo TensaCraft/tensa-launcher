@@ -24,6 +24,7 @@ from launcher.models.logger import Logger
 class AutoUpdater:
     GITHUB_RELEASES_URL = "https://api.github.com/repos/TensaCraft/tensa-launcher/releases"
     GITHUB_API_VERSION = "2022-11-28"
+    MAX_ASSET_PAGES = 10
     _SCRIPT_ROOT = Path(__file__).resolve().parent.parent / "assets" / "updater"
     _PLATFORM_SUFFIXES = {"windows": ".exe", "macos": ".dmg"}
     DOWNLOAD_CHUNK_SIZE = 262144
@@ -149,22 +150,37 @@ class AutoUpdater:
         return self.app.config.get("include_beta_updates", "no") == "yes"
 
     def _github_releases(self) -> list[dict[str, Any]]:
+        return self._github_items(self.GITHUB_RELEASES_URL, per_page=100)
+
+    def _github_items(self, url: str, **params: int) -> list[dict[str, Any]]:
         try:
-            response = self._session.get(self.GITHUB_RELEASES_URL, params={"per_page": 100}, timeout=5)
+            response = self._session.get(url, params=params, timeout=5)
             response.raise_for_status()
             data = response.json()
-        except requests.RequestException as exc:
-            self.logger.warning(f"Failed to check for updates: {exc}")
-            return []
-        except Exception as exc:
-            self.logger.error(f"Unexpected error checking updates: {exc}")
+        except (requests.RequestException, ValueError) as exc:
+            self.logger.warning(f"Failed to read GitHub update metadata from {url}: {exc}")
             return []
 
         if not isinstance(data, list):
-            self.logger.warning("GitHub releases endpoint returned unexpected payload")
+            self.logger.warning(f"GitHub endpoint returned unexpected payload: {url}")
             return []
 
-        return [release for release in data if isinstance(release, dict)]
+        return [item for item in data if isinstance(item, dict)]
+
+    def _fetch_github_asset(self, release_id: Any) -> Optional[dict[str, Any]]:
+        if type(release_id) is not int or release_id <= 0 or not self._preferred_github_asset_names():
+            return None
+        # The release listing can omit assets that the dedicated endpoint already exposes.
+        url = f"{self.GITHUB_RELEASES_URL}/{release_id}/assets"
+        for page in range(1, self.MAX_ASSET_PAGES + 1):
+            assets = self._github_items(url, per_page=100, page=page)
+            selected = self._select_github_asset({"assets": assets})
+            if selected is not None:
+                return selected
+            if len(assets) < 100:
+                return None
+        self.logger.warning(f"GitHub release asset page limit reached: {release_id}")
+        return None
 
     def _release_allowed_for_channel(self, release: dict[str, Any]) -> bool:
         if release.get("draft"):
@@ -190,7 +206,10 @@ class AutoUpdater:
         if not isinstance(raw_assets, list):
             return None
 
-        assets = [asset for asset in raw_assets if isinstance(asset, dict)]
+        assets = [
+            asset for asset in raw_assets
+            if isinstance(asset, dict) and asset.get("state", "uploaded") == "uploaded"
+        ]
         assets_by_name = {
             str(asset.get("name") or "").lower(): asset
             for asset in assets
@@ -247,6 +266,8 @@ class AutoUpdater:
             return None
 
         asset = self._select_github_asset(release)
+        if asset is None:
+            asset = self._fetch_github_asset(release.get("id"))
         if asset is None:
             self.logger.warning(f"GitHub release {latest_version} does not provide a {self.platform} launcher asset")
             return None
@@ -358,8 +379,10 @@ class AutoUpdater:
 
     async def check_for_updates_async(self):
         await asyncio.sleep(2)
-        update_info = self.check_for_updates()
-        if update_info:
+        if getattr(self.app, "_terminating", False):
+            return
+        update_info = await asyncio.to_thread(self.check_for_updates)
+        if update_info and not getattr(self.app, "_terminating", False):
             self.show_update_dialog(update_info)
 
     @staticmethod
