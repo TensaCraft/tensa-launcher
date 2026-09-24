@@ -19,6 +19,7 @@ from launcher.core import util
 from launcher.core.pending_update import resume_pending_update_if_needed
 from launcher.models.logger import Logger
 from launcher.models.translator import Translator
+from launcher.platform.desktop import configure_desktop_identity
 from launcher.platform.instance_shortcuts import validate_version_id
 from launcher.platform.paths import LauncherPaths, is_frozen
 from launcher.platform.resources import PACKAGE_ASSETS_DIR
@@ -106,6 +107,7 @@ def _format_flet_client_cache_error(exc: BaseException) -> str:
 def run_flet_with_client_cache_retries(
     *, launch_version: str | None = None, instance: SingleInstance | None = None
 ) -> bool:
+    configure_desktop_identity()
     target = partial(main, launch_version=launch_version, instance=instance) if instance is not None else (
         partial(main, launch_version=launch_version) if launch_version is not None else main
     )

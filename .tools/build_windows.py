@@ -115,8 +115,8 @@ def render_iss(*, exe_path: Path, icon_path: Path, output_dir: Path, output_name
         Root: HKA; Subkey: "Software\\Classes\\Applications\\{{#MyAppExeName}}\\SupportedTypes"; ValueType: string; ValueName: ".myp"; ValueData: ""
 
         [Icons]
-        Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; IconFilename: "{{app}}\\{{#MyAppExeName}}"
-        Name: "{{autodesktop}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; Tasks: desktopicon; IconFilename: "{{app}}\\{{#MyAppExeName}}"
+        Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; IconFilename: "{{app}}\\{{#MyAppExeName}}"; AppUserModelID: "TensaLauncher"
+        Name: "{{autodesktop}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"; Tasks: desktopicon; IconFilename: "{{app}}\\{{#MyAppExeName}}"; AppUserModelID: "TensaLauncher"
 
         [Run]
         Filename: "{{app}}\\{{#MyAppExeName}}"; Description: "{{cm:LaunchProgram,{{#StringChange(MyAppName, '&', '&&')}}}}"; Flags: nowait postinstall skipifsilent runasoriginaluser

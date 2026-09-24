@@ -488,6 +488,7 @@ def test_windows_installer_shortcuts_follow_executable_icon(tmp_path):
     assert "SetupIconFile=" in script
     assert r"UninstallDisplayIcon={app}\{#MyAppExeName}" in script
     assert script.count(r'IconFilename: "{app}\{#MyAppExeName}"') == 2
+    assert script.count('AppUserModelID: "TensaLauncher"') == 2
     assert "MyAppIconName" not in script
     assert '.ico"; DestDir:' not in script
 
@@ -799,3 +800,4 @@ def test_linux_appimage_apprun_does_not_force_sidecar_app_base(tmp_path):
     assert "Name=TensaLauncher" in captured["desktop_entry"]
     assert "X-AppImage-Name=TensaLauncher" in captured["desktop_entry"]
     assert "Icon=TensaLauncher" in captured["desktop_entry"]
+    assert "StartupWMClass=TensaLauncher" in captured["desktop_entry"]

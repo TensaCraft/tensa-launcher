@@ -64,6 +64,7 @@ def build_appimage(ctx, binary_artifact: Path) -> Path:
         Categories=Game;
         Terminal=false
         StartupNotify=true
+        StartupWMClass={ctx.app_name}
         X-AppImage-Name={ctx.product_name}
         """
     )
