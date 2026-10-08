@@ -15,7 +15,12 @@ FULL_CODEQL_ENV = "TENSALAUNCHER_PRECOMMIT_CODEQL"
 
 def run_check(name: str, command: list[str]) -> bool:
     print(f"\n==> {name}", flush=True)
-    completed = subprocess.run(command, cwd=ROOT)
+    env = dict(os.environ)
+    if Path(command[0]).stem.lower() != "git":
+        # Nested fixture repositories must not inherit the hook's worktree/index.
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX"):
+            env.pop(key, None)
+    completed = subprocess.run(command, cwd=ROOT, env=env)
     if completed.returncode == 0:
         return True
 

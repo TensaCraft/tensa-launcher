@@ -424,6 +424,15 @@ class SettingsPage:
             self.layout.wrap_control(self.beta_updates_toggle, {"sm": 12, "md": 6, "lg": 6}),
             self.layout.wrap_control(self.check_updates_button, {"sm": 12, "md": 6, "lg": 6}),
         ]
+        migration = getattr(self.app, "gilea_migration", None)
+        if migration is not None and migration.available:
+            async def offer_migration(_event):
+                await migration.offer()
+
+            update_controls.append(self.layout.wrap_control(
+                ui.Button(text=self.trans("gilea_title"), icon=ft.Icons.UPGRADE, on_click=offer_migration),
+                {"sm": 12, "md": 6, "lg": 6},
+            ))
 
         launcher_controls = [
             self.layout.wrap_control(self.language_select, {"sm": 12}),

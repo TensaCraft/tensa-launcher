@@ -75,12 +75,20 @@ class SingleInstance:
         self._requests: Queue[str | None] = Queue(maxsize=64)
         self._seen: deque[str] = deque(maxlen=256)
         self._token = secrets.token_hex(32)
+        self._recovery = threading.Event()
 
     @property
     def closed(self) -> bool:
         return self._stopped.is_set()
 
-    def start_or_forward(self, version_id: str | None, *, timeout: float = 5.0) -> bool:
+    @property
+    def stay_on_tensa(self) -> bool:
+        return self._recovery.is_set()
+
+    def start_or_forward(self, version_id: str | None, *, timeout: float = 5.0,
+                         stay_on_tensa: bool = False) -> bool:
+        if stay_on_tensa:
+            self._recovery.set()
         if version_id is not None:
             validate_version_id(version_id)
             if len(version_id) > 512:
@@ -132,7 +140,8 @@ class SingleInstance:
             if type(port) is not int or not 0 < port < 65536 or not isinstance(token, str) or len(token) != 64:
                 return False
             with socket.create_connection(("127.0.0.1", port), timeout=_IO_TIMEOUT) as connection:
-                _send(connection, {"token": token, "id": request_id, "version_id": version_id})
+                _send(connection, {"token": token, "id": request_id, "version_id": version_id,
+                                   "stay_on_tensa": self.stay_on_tensa})
                 response = _receive(connection)
                 return response.get("id") == request_id and response.get("accepted") is True
         except (OSError, ValueError, RecursionError):
@@ -166,6 +175,8 @@ class SingleInstance:
                             return
                         if request_id not in self._seen:
                             self._requests.put_nowait(version_id)
+                            if request.get("stay_on_tensa") is True:
+                                self._recovery.set()
                             self._seen.append(request_id)
                         _send(connection, {"id": request_id, "accepted": True})
                 except (OSError, ValueError, RecursionError, Full):

@@ -27,18 +27,21 @@ from launcher.pages.version_create import VersionCreatePage
 from launcher.pages.version_settings import VersionSettingsPage
 from launcher.pages.versions import VersionsPage
 from launcher.state import StateStore
+from launcher.ui.gilea_migration import GileaMigrationController
 
 
 class App:
     JAVA_VERSIONS_TTL_SEC = 24 * 60 * 60
 
-    def __init__(self, page: ft.Page, *, on_shutdown: Callable[[], None] | None = None):
+    def __init__(self, page: ft.Page, *, on_shutdown: Callable[[], None] | None = None,
+                 stay_on_tensa: bool = False):
         self.page = page
         self.page.data = self
         self.mll = minecraft_launcher_lib
         self.log = Logger()
         self.sleep = sleep
         self._terminating = False
+        self._stay_on_tensa = stay_on_tensa
         self._on_shutdown = on_shutdown
         self._startup_tasks: list[object] = []
 
@@ -71,6 +74,7 @@ class App:
         self.profiles = self.state.profiles
         self.versions = self.state.versions
         self.updater = self.state.updater
+        self.gilea_migration = GileaMigrationController(self)
         from launcher.application.version_runtime import VersionRuntime
         from launcher.core.api import TensaCraftAPI
         from launcher.core.game import Game
@@ -151,7 +155,12 @@ class App:
 
     def _warm_up_background_tasks(self) -> None:
         auth_refresh = getattr(self.auth, "refresh_all_online_profiles", self.auth.get_default_profile_data)
-        threading.Thread(target=auth_refresh, daemon=True).start()
+        self._auth_refresh_thread = threading.Thread(target=auth_refresh, daemon=True)
+        self._auth_refresh_thread.start()
+        migration = getattr(self, "gilea_migration", None)
+        if migration is not None and migration.available and not getattr(self, "_stay_on_tensa", False):
+            App._track_startup_task(self, self.page.run_task(migration.startup))
+            return
         check_updates = self.config.get("check_updates", self.config.get("auto_update", "yes"))
         if check_updates == "yes":
             App._track_startup_task(self, self.page.run_task(self.updater.check_for_updates_async))
@@ -232,6 +241,10 @@ class App:
     def _schedule_forced_exit(self, delay_sec: float) -> None:
         def _force_exit() -> None:
             time.sleep(delay_sec)
+            migration = getattr(self, "gilea_migration", None)
+            if migration is not None:
+                migration.cancel()
+                migration.wait_for_worker()
             os._exit(0)
 
         threading.Thread(target=_force_exit, daemon=True).start()
@@ -274,6 +287,9 @@ class App:
         if on_shutdown is not None:
             on_shutdown()
         self._terminating = True
+        migration = getattr(self, "gilea_migration", None)
+        if migration is not None:
+            migration.cancel()
         try:
             self._clear_install_session_state()
         except Exception as exc:
@@ -462,6 +478,15 @@ class App:
     async def handle_external_launch(self, version_id: str | None) -> None:
         if self._terminating:
             return
+        migration = getattr(self, "gilea_migration", None)
+        if migration is not None and migration.busy:
+            return
+        if migration is not None and migration.available and not getattr(self, "_stay_on_tensa", False):
+            from launcher.application.gilea_migration.service import startup_forward
+            from launcher.ui.core.page_runtime import run_blocking
+
+            if await run_blocking(startup_forward, version_id=version_id):
+                return
         try:
             self.page.window.visible = True
             self.page.window.minimized = False
@@ -473,6 +498,8 @@ class App:
             await self.launch_version_by_id(version_id)
 
     async def launch_version_by_id(self, version_id: str) -> None:
+        if getattr(getattr(self, "gilea_migration", None), "busy", False):
+            return
         if self._terminating or isinstance(getattr(self, "current_page", None), SetupWizardPage):
             return
         version = self.versions.get(version_id)
@@ -489,6 +516,8 @@ class App:
         ui.show_window_when_ready(self.page)
 
     def restart(self):
+        if getattr(getattr(self, "gilea_migration", None), "busy", False):
+            return
         self._dispose_current_page()
         self._cancel_startup_tasks()
         self._clear_install_session_state()

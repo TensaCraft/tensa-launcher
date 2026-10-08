@@ -181,6 +181,11 @@ def run_packaged_smoke_test() -> int:
 
 async def handle_instance_requests(app: App, instance: SingleInstance) -> None:
     while not instance.closed and not app._terminating:
+        if getattr(instance, "stay_on_tensa", False):
+            app._stay_on_tensa = True
+            migration = getattr(app, "gilea_migration", None)
+            if migration is not None:
+                migration.cancel()
         for version_id in instance.pending_requests():
             if app._terminating:
                 return
@@ -202,7 +207,10 @@ async def main(
     else:
         Logger.warning("Startup internet check failed, starting app anyway")
 
-    app = App(page, on_shutdown=instance.stop_accepting) if instance is not None else App(page)
+    if instance is not None and getattr(instance, "stay_on_tensa", False):
+        app = App(page, on_shutdown=instance.stop_accepting, stay_on_tensa=True)
+    else:
+        app = App(page, on_shutdown=instance.stop_accepting) if instance is not None else App(page)
     app.run()
     if instance is not None:
         # This listener survives in-app restarts, unlike one-shot startup tasks.
@@ -216,13 +224,14 @@ def launch(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=APP_NAME, allow_abbrev=False)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--launch-version", type=validate_version_id)
+    parser.add_argument("--stay-on-tensa", action="store_true")
     args, _unknown = parser.parse_known_args(argv)
     if args.smoke_test:
         return _launch_runtime(smoke_test=True)
 
     with SingleInstance(instance_directory()) as instance:
         try:
-            primary = instance.start_or_forward(args.launch_version)
+            primary = instance.start_or_forward(args.launch_version, stay_on_tensa=args.stay_on_tensa)
         except (OSError, ValueError):
             Logger.error("Unable to route launcher startup:\n" + traceback.format_exc())
             language = locale.getlocale()[0] or "en_US"
@@ -230,6 +239,10 @@ def launch(argv: list[str] | None = None) -> int:
             show_startup_error_message(APP_NAME, translator.get("launcher_instance_unavailable"))
             return 1
         if not primary:
+            return 0
+        from launcher.application.gilea_migration.service import startup_forward
+
+        if startup_forward(version_id=args.launch_version, stay_on_tensa=args.stay_on_tensa):
             return 0
         return _launch_runtime(launch_version=args.launch_version, instance=instance)
 
